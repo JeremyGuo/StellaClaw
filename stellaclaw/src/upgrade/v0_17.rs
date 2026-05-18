@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_17};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_17, WORKDIR_VERSION_0_18};
 use crate::config::StellaclawConfig;
 
 pub struct ToolResultStructuredContentUpgrade;
@@ -18,7 +18,7 @@ impl WorkdirUpgrader for ToolResultStructuredContentUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_18
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

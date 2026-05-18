@@ -9,6 +9,7 @@ const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 30;
 const RECONNECT_DELAY_MS = 450;
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 function terminalLabel(terminal, index) {
   const numeric = String(terminal?.terminal_id || '').match(/(\d+)$/)?.[1];
@@ -22,6 +23,20 @@ function sendJson(socket, payload) {
     return true;
   }
   return false;
+}
+
+function decodeTerminalPayload(message) {
+  const data = String(message?.data || '');
+  if (!data) return new Uint8Array();
+  if (message?.encoding === 'base64') {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  }
+  return textEncoder.encode(data);
 }
 
 export function TerminalDock({ open, serverId, conversationId, fontSize = 13, onResizeHeight, onResizeList }) {
@@ -251,22 +266,29 @@ export function TerminalDock({ open, serverId, conversationId, fontSize = 13, on
           if (typeof event.data === 'string') {
             try {
               const message = JSON.parse(event.data);
-              if (message.type === 'attached') {
+              if (message.type === 'terminal.snapshot' || message.type === 'attached') {
                 setError('');
                 offsetRef.current = Number(message.replay_start_offset ?? message.next_offset ?? offsetRef.current) || 0;
                 activeRunningRef.current = Boolean(message.running);
                 updateTerminal(activeTerminalId, { running: Boolean(message.running) });
-              } else if (message.type === 'dropped') {
+              } else if (message.type === 'terminal.output') {
+                const bytes = decodeTerminalPayload(message);
+                if (!bytes.length) return;
+                offsetRef.current += bytes.byteLength;
+                terminalRef.current?.write(bytes);
+              } else if (message.type === 'terminal.dropped' || message.type === 'dropped') {
                 offsetRef.current = Math.max(offsetRef.current, Number(message.buffer_start_offset) || 0);
                 terminalRef.current?.writeln('\r\n[terminal output buffer dropped older bytes]\r\n');
-              } else if (message.type === 'exit') {
+              } else if (message.type === 'terminal.closed' || message.type === 'exit') {
                 activeRunningRef.current = false;
                 updateTerminal(activeTerminalId, { running: false });
                 setConnected(false);
+              } else if (message.type === 'terminal.heartbeat') {
+                return;
               } else if (message.type === 'detached') {
                 setConnected(false);
                 if (!disposed) reconnectTimer = window.setTimeout(connect, RECONNECT_DELAY_MS);
-              } else if (message.type === 'error') {
+              } else if (message.type === 'terminal.error' || message.type === 'error') {
                 setError(message.message || message.error || '终端连接错误');
               }
             } catch {
@@ -279,7 +301,7 @@ export function TerminalDock({ open, serverId, conversationId, fontSize = 13, on
             : new Uint8Array(event.data || []);
           if (!bytes.length) return;
           offsetRef.current += bytes.byteLength;
-          terminalRef.current?.write(bytes);
+          terminalRef.current?.write(event.data instanceof ArrayBuffer ? bytes : textDecoder.decode(bytes));
         });
         socket.addEventListener('close', () => {
           if (socketRef.current === socket) socketRef.current = null;

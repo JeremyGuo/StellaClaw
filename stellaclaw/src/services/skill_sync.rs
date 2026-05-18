@@ -12,15 +12,8 @@ use serde_json::json;
 
 use crate::{config::SkillSyncConfig, logger::StellaclawLogger};
 
-#[derive(Debug, Clone, Copy)]
-pub(super) enum SkillPersistMode {
-    Create,
-    Update,
-    Delete,
-}
-
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct SkillSyncPushResult {
+pub(crate) struct SkillSyncPushResult {
     configured: bool,
     committed: bool,
     pushes: Vec<SkillSyncPushTargetResult>,
@@ -104,7 +97,7 @@ pub(crate) fn push_configured_skill_sync_on_startup(
     results
 }
 
-pub(super) fn push_skill_sync_if_configured(
+pub(crate) fn push_skill_sync_if_configured(
     skill_sync: &[SkillSyncConfig],
     skill_name: &str,
     skill_path: &Path,
@@ -414,7 +407,7 @@ fn validate_git_branch_name(branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_skill_name(skill_name: &str) -> Result<()> {
+pub(crate) fn validate_skill_name(skill_name: &str) -> Result<()> {
     let name = skill_name.trim();
     if name.is_empty() {
         return Err(anyhow!("skill_name must not be empty"));
@@ -435,7 +428,7 @@ pub(super) fn validate_skill_name(skill_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_skill_directory(skill_path: &Path, skill_name: &str) -> Result<()> {
+pub(crate) fn validate_skill_directory(skill_path: &Path, skill_name: &str) -> Result<()> {
     if !skill_path.is_dir() {
         return Err(anyhow!(
             "staged skill directory {} does not exist",
@@ -534,7 +527,7 @@ fn unquote_yaml_scalar(value: &str) -> String {
     trimmed.to_string()
 }
 
-pub(super) fn copy_skill_atomically(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_skill_atomically(source: &Path, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent", destination.display()))?;
@@ -580,7 +573,7 @@ fn copy_skill_payload_to_repo_subdir(source: &Path, destination: &Path) -> Resul
     })
 }
 
-pub(super) fn sync_skill_to_conversation_workspaces(
+pub(crate) fn sync_skill_to_conversation_workspaces(
     workdir: &Path,
     skill_name: &str,
     source: Option<&Path>,

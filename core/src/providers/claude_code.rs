@@ -133,6 +133,13 @@ impl ClaudeCodeProvider {
 }
 
 impl ProviderBackend for ClaudeCodeProvider {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -150,6 +157,9 @@ fn build_claude_messages(
     let mut converted = Vec::new();
 
     for message in messages {
+        if matches!(message.role, ChatRole::Compaction) {
+            continue;
+        }
         let mut content = claude_content_blocks(message);
 
         if matches!(message.role, ChatRole::Assistant) {
@@ -282,6 +292,7 @@ fn claude_value_to_chat_message(
     }
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
@@ -296,6 +307,7 @@ fn claude_content_blocks(message: &ChatMessage) -> Vec<Value> {
     for item in &message.data {
         match item {
             ChatMessageItem::Reasoning(_)
+            | ChatMessageItem::Compaction(_)
             | ChatMessageItem::ToolCall(_)
             | ChatMessageItem::ToolResult(_) => {}
             ChatMessageItem::Context(context) => {
@@ -409,6 +421,7 @@ fn role_as_str(role: &ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Compaction => "user",
     }
 }
 
@@ -430,6 +443,7 @@ mod tests {
             token_max_context: 200_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 5,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -476,7 +490,7 @@ mod tests {
                     "role": "assistant",
                     "content": [
                         {"type": "text", "text": "need the file"},
-                        {"type": "tool_use", "id": "toolu_1", "name": "file_read", "input": {"path": "README.md"}}
+                        {"type": "tool_use", "id": "toolu_1", "name": "shell_exec", "input": {"command": "cat README.md"}}
                     ],
                     "usage": {
                         "input_tokens": 10,

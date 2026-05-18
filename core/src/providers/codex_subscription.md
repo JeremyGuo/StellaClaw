@@ -390,7 +390,7 @@ Input `ChatMessage`:
       "type": "tool_result",
       "payload": {
         "tool_call_id": "call_load_1",
-        "tool_name": "image_load",
+        "tool_name": "image_view",
         "result": {
           "context": {
             "text": "{\"status\":\"loaded\"}"

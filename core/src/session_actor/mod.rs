@@ -19,10 +19,10 @@ pub use actor::{
     SessionActorRequestSender, SessionActorStep,
 };
 pub use chat_message::{
-    structured_tool_value, ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem,
-    FileState, ReasoningItem, SelectionContext, SelectionLocator, SelectionRect,
-    SelectionReferenceItem, TokenUsage, TokenUsageCost, ToolCallItem, ToolResultContent,
-    ToolResultItem,
+    structured_tool_value, ChatMessage, ChatMessageItem, ChatRole, CompactionItem, CompactionKind,
+    ContextItem, FileItem, FileState, ReasoningItem, ReasoningSummaryPart, SelectionContext,
+    SelectionLocator, SelectionRect, SelectionReferenceItem, TokenUsage, TokenUsageCost,
+    ToolCallItem, ToolResultContent, ToolResultItem,
 };
 pub use chat_message::{tool_result_structured_text, tool_result_text};
 pub use compressor::{CompressionError, CompressionReport, SessionCompressor, COMPRESSION_MARKER};
@@ -34,21 +34,24 @@ pub use session_rpc::{
     SessionRpcThread, SessionType, TaskPlanItemStatus, TaskPlanItemView, TaskPlanView,
     ToolRemoteMode,
 };
-pub(crate) use system_prompt::system_prompt_for_initial;
+pub(crate) use system_prompt::system_prompt_for_initial_with_common_prompt;
 pub use token_estimator::{
     ChatTemplate, ChatTemplateError, JinjaChatTemplate, MultimodalTokenStrategy,
     RenderedChatPrompt, TokenEstimate, TokenEstimator, TokenEstimatorError, VisionDetail,
 };
 pub use tool_batch::{
-    ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse, SearchToolModels,
-    ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle,
-    ToolBatchOperation, ToolExecutionOp,
+    ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse,
+    ProviderBackedToolModels, SearchToolModels, ToolBatch, ToolBatchCompletion, ToolBatchError,
+    ToolBatchExecutor, ToolBatchHandle, ToolBatchItem, ToolBatchOperation, ToolBatchProgress,
 };
 pub use tool_binary::{ToolBinaryEnsureRequest, ToolBinaryEnsureResponse};
 pub use tool_catalog::{
-    builtin_tool_catalog, download_tool_definitions, file_tool_definitions, host_tool_definitions,
-    media_tool_definitions, process_tool_definitions, skill_tool_definitions, web_tool_definitions,
-    BuiltinToolCatalogOptions, HostToolScope, ProviderBackedToolKind, ProviderNativeToolKind,
-    ToolBackend, ToolCatalog, ToolCatalogError, ToolConcurrency, ToolDefinition, ToolExecutionMode,
+    builtin_tool_catalog, file_tool_definitions, host_tool_definitions, media_tool_definitions,
+    process_tool_definitions, skill_tool_definitions, web_tool_definitions,
+    BuiltinToolCatalogOptions, BuiltinToolSet, HostToolScope, ProviderBackedToolKind,
+    ProviderNativeToolKind, ToolBackend, ToolCatalog, ToolCatalogError, ToolConcurrency,
+    ToolDefinition, ToolEnablementEnv, ToolExecutionMode, ToolSet,
 };
+pub(crate) use tool_catalog::{BuiltinBaseTool, ExtTool, ToolCallContext, ToolEntry};
 pub use tool_executor::LocalToolBatchExecutor;
+pub(crate) use tool_runtime::LocalToolError;

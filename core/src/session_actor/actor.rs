@@ -3,6 +3,7 @@ use std::{
     env,
     path::PathBuf,
     sync::Arc,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,23 +16,24 @@ use crate::{
     huggingface::HuggingFaceFileResolver,
     model_config::ModelConfig,
     providers::{
-        request_too_large_text, send_provider_request_with_retry, Provider, ProviderError,
-        ProviderFailureKind, ProviderRequest,
+        request_too_large_text, Provider, ProviderError, ProviderEvent, ProviderFailureKind,
+        ProviderRequestOwned, ProviderSession, ProviderStreamEvent,
     },
-    session_actor::tool_catalog::ToolBackend,
 };
 
 use super::{
     logger::SessionActorLogger,
     normalize_messages_for_model,
-    runtime_metadata::{remote_aliases_prompt_for_mode, RuntimeMetadataState},
+    runtime_metadata::{
+        remote_aliases_prompt_for_mode, RuntimeMetadataState, REMOTE_WORKSPACE_PROMPT_COMPONENT,
+    },
     session_state::{SessionActorPersistedState, SessionStateStore},
-    system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionError,
-    CompressionReport, ContextItem, ConversationBridge, ConversationBridgeRequest,
-    SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox,
-    SessionMailboxKind, SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimator,
-    ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolBatchOperation, ToolCatalog,
-    ToolExecutionOp, ToolResultContent,
+    system_prompt_for_initial_with_common_prompt, ChatMessage, ChatMessageItem, ChatRole,
+    CompressionError, CompressionReport, ContextItem, ConversationBridge,
+    ConversationBridgeRequest, SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial,
+    SessionMailbox, SessionMailboxKind, SessionRequest, TaskPlanItemStatus, TaskPlanView,
+    TokenEstimator, ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolBatchItem,
+    ToolBatchOperation, ToolBatchProgress, ToolCatalog, ToolResultContent,
 };
 
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
@@ -42,23 +44,30 @@ const SESSION_PLAN_CONTEXT_MARKER: &str = "[StellaClaw Current Task Plan]";
 const COMPRESSION_MEMORY_SCOPE_CANDIDATE_LIMIT: usize = 20;
 const COMPRESSION_MEMORY_CONTEXT_MAX_TOKENS: u64 = 4_000;
 const COMPRESSION_MEMORY_ENTRY_MAX_CHARS: usize = 640;
+const PROVIDER_SUPERSEDE_GRACE: Duration = Duration::from_millis(200);
 
 pub struct SessionActor {
     model_config: ModelConfig,
-    provider: Arc<dyn Provider + Send + Sync>,
+    provider: Arc<ProviderSession>,
     tool_executor: Arc<dyn ToolBatchExecutor + Send + Sync>,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     request_rx: Receiver<SessionRequest>,
     tool_completion_tx: Sender<ToolBatchCompletion>,
     tool_completion_rx: Receiver<ToolBatchCompletion>,
+    tool_progress_tx: Sender<ToolBatchProgress>,
+    tool_progress_rx: Receiver<ToolBatchProgress>,
+    provider_event_rx: Receiver<ProviderEvent>,
     pending_control: VecDeque<SessionRequest>,
     pending_data: VecDeque<SessionRequest>,
     pending_tool_completions: VecDeque<ToolBatchCompletion>,
+    pending_tool_progress: VecDeque<ToolBatchProgress>,
+    pending_provider_events: VecDeque<ProviderEvent>,
     event_sink: Arc<dyn SessionActorEventSink>,
     tool_catalog: ToolCatalog,
     history: Vec<ChatMessage>,
     all_messages: Vec<ChatMessage>,
     initial: Option<SessionInitial>,
+    active_provider_request: Option<ActiveProviderRequest>,
     active_tool_batch: Option<ActiveToolBatch>,
     runtime_metadata_state: RuntimeMetadataState,
     next_turn_id: u64,
@@ -86,6 +95,19 @@ struct ActiveToolBatch {
     operation_summary: String,
     started_at_ms: u128,
     interrupt: Option<ToolBatchInterrupt>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveProviderRequest {
+    request_id: String,
+    message_id: String,
+    turn_id: String,
+    turn_number: u64,
+    step_index: usize,
+    request_too_large_attempts: usize,
+    started_at_ms: u128,
+    next_stream_event_index: u64,
+    last_activity_at: Instant,
 }
 
 struct BuiltToolBatch {
@@ -130,6 +152,8 @@ pub struct SessionActorInbox {
     request_rx: Receiver<SessionRequest>,
     tool_completion_tx: Sender<ToolBatchCompletion>,
     tool_completion_rx: Receiver<ToolBatchCompletion>,
+    tool_progress_tx: Sender<ToolBatchProgress>,
+    tool_progress_rx: Receiver<ToolBatchProgress>,
 }
 
 #[derive(Clone)]
@@ -141,11 +165,14 @@ impl SessionActorInbox {
     pub fn channel() -> (Self, SessionActorRequestSender) {
         let (request_tx, request_rx) = crossbeam_channel::unbounded();
         let (tool_completion_tx, tool_completion_rx) = crossbeam_channel::unbounded();
+        let (tool_progress_tx, tool_progress_rx) = crossbeam_channel::unbounded();
         (
             Self {
                 request_rx,
                 tool_completion_tx,
                 tool_completion_rx,
+                tool_progress_tx,
+                tool_progress_rx,
             },
             SessionActorRequestSender { request_tx },
         )
@@ -181,7 +208,27 @@ impl SessionActor {
         event_sink: Arc<dyn SessionActorEventSink>,
         tool_catalog: ToolCatalog,
     ) -> Self {
+        Self::new_with_provider_session(
+            model_config,
+            ProviderSession::new(provider),
+            tool_executor,
+            inbox,
+            event_sink,
+            tool_catalog,
+        )
+    }
+
+    pub fn new_with_provider_session(
+        model_config: ModelConfig,
+        provider: ProviderSession,
+        tool_executor: Arc<dyn ToolBatchExecutor + Send + Sync>,
+        inbox: SessionActorInbox,
+        event_sink: Arc<dyn SessionActorEventSink>,
+        tool_catalog: ToolCatalog,
+    ) -> Self {
         let tool_catalog = tool_catalog.filtered_for_model_config(&model_config);
+        let provider = Arc::new(provider);
+        let provider_event_rx = provider.event_rx();
         Self {
             model_config,
             provider,
@@ -190,14 +237,20 @@ impl SessionActor {
             request_rx: inbox.request_rx,
             tool_completion_tx: inbox.tool_completion_tx,
             tool_completion_rx: inbox.tool_completion_rx,
+            tool_progress_tx: inbox.tool_progress_tx,
+            tool_progress_rx: inbox.tool_progress_rx,
+            provider_event_rx,
             pending_control: VecDeque::new(),
             pending_data: VecDeque::new(),
             pending_tool_completions: VecDeque::new(),
+            pending_tool_progress: VecDeque::new(),
+            pending_provider_events: VecDeque::new(),
             event_sink,
             tool_catalog,
             history: Vec::new(),
             all_messages: Vec::new(),
             initial: None,
+            active_provider_request: None,
             active_tool_batch: None,
             runtime_metadata_state: RuntimeMetadataState::default(),
             next_turn_id: 1,
@@ -228,14 +281,37 @@ impl SessionActor {
         &self.tool_catalog
     }
 
-    fn system_prompt_for_current_initial(&self) -> Option<String> {
-        let initial = self.initial.as_ref()?;
-        let enabled_tools = self.provider_enabled_tool_names();
-        Some(system_prompt_for_initial(
+    fn system_prompt_for_current_initial(&self) -> Result<Option<String>, SessionActorError> {
+        let initial = match self.initial.as_ref() {
+            Some(initial) => initial,
+            None => return Ok(None),
+        };
+        let started_at = Instant::now();
+        self.log_info(
+            "system_prompt_build_started",
+            serde_json::json!({
+                "provider_type": &self.model_config.provider_type,
+                "model_name": &self.model_config.model_name,
+            }),
+        );
+        let provider_common_prompt = self
+            .provider
+            .system_prompt_for_model(&self.model_config)
+            .map_err(SessionActorError::from_provider_error)?;
+        let system_prompt = system_prompt_for_initial_with_common_prompt(
             initial,
             &self.runtime_metadata_state,
-            &enabled_tools,
-        ))
+            provider_common_prompt.as_deref(),
+        );
+        self.log_info(
+            "system_prompt_build_completed",
+            serde_json::json!({
+                "elapsed_ms": started_at.elapsed().as_millis(),
+                "provider_common_prompt": provider_common_prompt.is_some(),
+                "system_prompt_chars": system_prompt.len(),
+            }),
+        );
+        Ok(Some(system_prompt))
     }
 
     fn provider_enabled_tool_names(&self) -> BTreeSet<String> {
@@ -264,6 +340,34 @@ impl SessionActor {
             return self.process_ready_step();
         }
 
+        if let Some(delay) = self.provider_supersede_grace_remaining() {
+            let grace_timer = crossbeam_channel::after(delay);
+            select! {
+                recv(self.request_rx) -> request => {
+                    let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
+                    self.enqueue_request(request);
+                }
+                recv(self.tool_completion_rx) -> completion => {
+                    let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
+                    self.pending_tool_completions.push_back(completion);
+                }
+                recv(self.tool_progress_rx) -> progress => {
+                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
+                    self.pending_tool_progress.push_back(progress);
+                }
+                recv(self.provider_event_rx) -> event => {
+                    let event = event.map_err(|_| {
+                        SessionActorError::from_provider_error(ProviderError::Subprocess(
+                            "provider event channel disconnected".to_string(),
+                        ))
+                    })?;
+                    self.pending_provider_events.push_back(event);
+                }
+                recv(grace_timer) -> _ => {}
+            }
+            return self.process_ready_step();
+        }
+
         if let Some(delay) = self.idle_compaction_delay() {
             if delay.is_zero() {
                 if self.try_run_idle_compaction()? {
@@ -272,19 +376,31 @@ impl SessionActor {
             } else {
                 let idle_timer = crossbeam_channel::after(delay);
                 select! {
-                    recv(self.request_rx) -> request => {
-                        let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
-                        self.enqueue_request(request);
+                recv(self.request_rx) -> request => {
+                    let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
+                    self.enqueue_request(request);
+                }
+                recv(self.tool_completion_rx) -> completion => {
+                    let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
+                    self.pending_tool_completions.push_back(completion);
+                }
+                recv(self.tool_progress_rx) -> progress => {
+                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
+                    self.pending_tool_progress.push_back(progress);
+                }
+                recv(self.provider_event_rx) -> event => {
+                    let event = event.map_err(|_| {
+                        SessionActorError::from_provider_error(ProviderError::Subprocess(
+                            "provider event channel disconnected".to_string(),
+                        ))
+                    })?;
+                    self.pending_provider_events.push_back(event);
+                }
+                recv(idle_timer) -> _ => {
+                    if self.try_run_idle_compaction()? {
+                        return Ok(SessionActorStep::ProcessedIdleCompaction);
                     }
-                    recv(self.tool_completion_rx) -> completion => {
-                        let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
-                        self.pending_tool_completions.push_back(completion);
-                    }
-                    recv(idle_timer) -> _ => {
-                        if self.try_run_idle_compaction()? {
-                            return Ok(SessionActorStep::ProcessedIdleCompaction);
-                        }
-                    }
+                }
                 }
             }
         } else {
@@ -296,6 +412,18 @@ impl SessionActor {
                 recv(self.tool_completion_rx) -> completion => {
                     let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
                     self.pending_tool_completions.push_back(completion);
+                }
+                recv(self.tool_progress_rx) -> progress => {
+                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
+                    self.pending_tool_progress.push_back(progress);
+                }
+                recv(self.provider_event_rx) -> event => {
+                    let event = event.map_err(|_| {
+                        SessionActorError::from_provider_error(ProviderError::Subprocess(
+                            "provider event channel disconnected".to_string(),
+                        ))
+                    })?;
+                    self.pending_provider_events.push_back(event);
                 }
             }
         }
@@ -320,12 +448,35 @@ impl SessionActor {
             });
         }
 
+        if self.active_provider_request.is_some() {
+            if !self.pending_provider_events.is_empty() {
+                return self.handle_ready_provider_event();
+            }
+            if self.has_pending_user_message() {
+                if self.provider_supersede_grace_remaining().is_none() {
+                    self.cancel_active_provider_request(
+                        "superseded_by_user_message".to_string(),
+                        false,
+                    )?;
+                } else {
+                    return Ok(SessionActorStep::WaitingProviderRequest);
+                }
+            } else {
+                return self.handle_ready_provider_event();
+            }
+        } else if !self.pending_provider_events.is_empty() {
+            self.discard_stale_provider_events();
+        }
+
         if self.active_tool_batch.is_some() {
             if self.has_pending_user_message_interrupt() {
                 self.request_active_tool_interrupt(
                     ToolBatchInterrupt::SupersededByUserMessage,
                     "newer user message arrived".to_string(),
                 )?;
+            }
+            if !self.pending_tool_progress.is_empty() {
+                return self.handle_ready_tool_progress();
             }
             return self.handle_ready_tool_completion();
         }
@@ -346,7 +497,9 @@ impl SessionActor {
             serde_json::json!({"request": session_request_kind(&data)}),
         );
         self.run_turn_from_data_request(data)?;
-        Ok(if self.active_tool_batch.is_some() {
+        Ok(if self.active_provider_request.is_some() {
+            SessionActorStep::WaitingProviderRequest
+        } else if self.active_tool_batch.is_some() {
             SessionActorStep::WaitingToolBatch
         } else {
             SessionActorStep::ProcessedData
@@ -360,6 +513,12 @@ impl SessionActor {
         while let Ok(completion) = self.tool_completion_rx.try_recv() {
             self.pending_tool_completions.push_back(completion);
         }
+        while let Ok(progress) = self.tool_progress_rx.try_recv() {
+            self.pending_tool_progress.push_back(progress);
+        }
+        while let Ok(event) = self.provider_event_rx.try_recv() {
+            self.pending_provider_events.push_back(event);
+        }
     }
 
     fn enqueue_request(&mut self, request: SessionRequest) {
@@ -372,7 +531,15 @@ impl SessionActor {
     fn has_ready_work(&self) -> bool {
         self.shutdown
             || !self.pending_control.is_empty()
-            || (!self.pending_data.is_empty() && self.active_tool_batch.is_none())
+            || (!self.pending_data.is_empty()
+                && self.active_provider_request.is_none()
+                && self.active_tool_batch.is_none())
+            || (self.active_provider_request.is_some() && !self.pending_provider_events.is_empty())
+            || (self.active_provider_request.is_some()
+                && self.has_pending_user_message()
+                && self.provider_supersede_grace_remaining().is_none())
+            || (self.active_provider_request.is_none() && !self.pending_provider_events.is_empty())
+            || (self.active_tool_batch.is_some() && !self.pending_tool_progress.is_empty())
             || (self.active_tool_batch.is_some() && !self.pending_tool_completions.is_empty())
             || (self.active_tool_batch.is_some() && self.has_pending_user_message_interrupt())
     }
@@ -381,11 +548,22 @@ impl SessionActor {
         &mut self,
         max_steps: usize,
     ) -> Result<SessionActorStep, SessionActorError> {
-        for _ in 0..max_steps {
+        let mut counted_steps = 0usize;
+        let mut provider_wait_steps = 0usize;
+        while counted_steps < max_steps {
             let step = self.step()?;
             if matches!(step, SessionActorStep::Idle | SessionActorStep::Shutdown) {
                 return Ok(step);
             }
+            if matches!(step, SessionActorStep::WaitingProviderRequest) {
+                provider_wait_steps = provider_wait_steps.saturating_add(1);
+                if provider_wait_steps > max_steps.saturating_mul(1_000).max(1_000) {
+                    return Err(SessionActorError::StepLimitExceeded(max_steps));
+                }
+                thread::yield_now();
+                continue;
+            }
+            counted_steps = counted_steps.saturating_add(1);
         }
 
         Err(SessionActorError::StepLimitExceeded(max_steps))
@@ -411,9 +589,12 @@ impl SessionActor {
                     .map_err(SessionActorError::Logging)?;
                 let state_store = SessionStateStore::open_default(&initial.session_id)
                     .map_err(SessionActorError::Persistence)?;
-                self.tool_catalog =
-                    ToolCatalog::from_model_config_and_initial(&self.model_config, &initial)
-                        .map_err(|error| SessionActorError::ToolCatalog(error.to_string()))?;
+                self.tool_catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
+                    &self.model_config,
+                    &initial,
+                    self.provider.tool_set().as_deref(),
+                )
+                .map_err(|error| SessionActorError::ToolCatalog(error.to_string()))?;
                 let active_compression_threshold_tokens =
                     active_compression_threshold_tokens(&self.model_config, &initial);
                 let token_estimator = match build_session_token_estimator(&self.model_config) {
@@ -460,6 +641,10 @@ impl SessionActor {
                                 .data_root()
                                 .map_err(SessionActorError::RuntimeMetadata)?,
                             remote_aliases_prompt_for_mode(&initial.tool_remote_mode),
+                            initial
+                                .remote_workspace_instructions
+                                .clone()
+                                .unwrap_or_default(),
                             initial.memory_enabled,
                         )
                         .map_err(SessionActorError::RuntimeMetadata)?;
@@ -546,15 +731,19 @@ impl SessionActor {
                 "all_messages_len": self.all_messages.len(),
             }),
         );
-        let system_prompt = self.system_prompt_for_current_initial();
+        let system_prompt = self.system_prompt_for_current_initial()?;
         let compression_context = self.compression_memory_context(&self.history, None);
 
-        let report = match compressor.compact_now(
+        let report = match compressor.compact_now_with_tools(
             &mut self.history,
             self.provider.as_ref(),
             &self.model_config,
             system_prompt.as_deref(),
             compression_context.as_deref(),
+            self.tool_catalog
+                .iter()
+                .map(|(_, tool)| tool)
+                .collect::<Vec<_>>(),
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -599,10 +788,63 @@ impl SessionActor {
     }
 
     fn handle_cancel_turn(&mut self, reason: Option<String>) -> Result<(), SessionActorError> {
+        if self.active_provider_request.is_some() {
+            return self.cancel_active_provider_request(
+                reason.unwrap_or_else(|| "user_cancelled".to_string()),
+                true,
+            );
+        }
         self.request_active_tool_interrupt(
             ToolBatchInterrupt::Cancel,
             reason.unwrap_or_else(|| "user_cancelled".to_string()),
         )
+    }
+
+    fn cancel_active_provider_request(
+        &mut self,
+        reason: String,
+        emit_failure: bool,
+    ) -> Result<(), SessionActorError> {
+        let Some(active) = self.active_provider_request.take() else {
+            return self.emit(SessionEvent::ControlRejected {
+                reason: "no active interruptible turn".to_string(),
+                payload: serde_json::json!({"command": "cancel_turn"}),
+            });
+        };
+        self.provider
+            .abort()
+            .map_err(SessionActorError::from_provider_error)?;
+        self.log_info(
+            "provider_request_cancelled",
+            serde_json::json!({
+                "turn_id": active.turn_id,
+                "request_id": active.request_id,
+                "step_index": active.step_index,
+                "reason": reason,
+            }),
+        );
+        self.mark_turn_returned(active.turn_number);
+        self.emit(SessionEvent::StreamError {
+            message_id: active.message_id.clone(),
+            turn_id: active.turn_id.clone(),
+            in_message_index: active.next_stream_event_index,
+            item_id: None,
+            message_index: None,
+            error: reason.clone(),
+            error_detail: SessionErrorDetail::new("session_actor.provider", "cancelled", reason),
+        })?;
+        if emit_failure {
+            self.emit_turn_failed(
+                "provider request cancelled".to_string(),
+                SessionErrorDetail::new(
+                    "session_actor.provider",
+                    "cancelled",
+                    "provider request cancelled",
+                ),
+                false,
+            )?;
+        }
+        Ok(())
     }
 
     fn request_active_tool_interrupt(
@@ -652,10 +894,37 @@ impl SessionActor {
         self.active_tool_batch
             .as_ref()
             .is_some_and(|active| active.interrupt.is_none())
-            && self
-                .pending_data
-                .iter()
-                .any(|request| matches!(request, SessionRequest::EnqueueUserMessage { .. }))
+            && self.has_pending_user_message()
+    }
+
+    fn has_pending_user_message(&self) -> bool {
+        self.pending_data
+            .iter()
+            .any(|request| matches!(request, SessionRequest::EnqueueUserMessage { .. }))
+    }
+
+    fn provider_supersede_grace_remaining(&self) -> Option<Duration> {
+        if !self.has_pending_user_message() {
+            return None;
+        }
+        let active = self.active_provider_request.as_ref()?;
+        let elapsed = active.last_activity_at.elapsed();
+        if elapsed >= PROVIDER_SUPERSEDE_GRACE {
+            None
+        } else {
+            Some(PROVIDER_SUPERSEDE_GRACE.saturating_sub(elapsed))
+        }
+    }
+
+    fn discard_stale_provider_events(&mut self) {
+        let count = self.pending_provider_events.len();
+        self.pending_provider_events.clear();
+        if count > 0 {
+            self.log_warn(
+                "stale_provider_events_discarded",
+                serde_json::json!({ "count": count }),
+            );
+        }
     }
 
     fn handle_query_session_view(
@@ -752,7 +1021,15 @@ impl SessionActor {
             "all_messages_len": self.all_messages.len(),
             "pending_control_len": self.pending_control.len(),
             "pending_data_len": self.pending_data.len(),
+            "pending_provider_event_len": self.pending_provider_events.len(),
             "pending_tool_completion_len": self.pending_tool_completions.len(),
+            "pending_tool_progress_len": self.pending_tool_progress.len(),
+            "active_provider_request": self.active_provider_request.as_ref().map(|active| serde_json::json!({
+                "turn_id": active.turn_id,
+                "request_id": active.request_id,
+                "step_index": active.step_index,
+                "started_at_ms": active.started_at_ms,
+            })),
             "active_tool_batch": self.active_tool_batch.as_ref().map(|active| serde_json::json!({
                 "turn_id": active.turn_id,
                 "batch_id": active.handle.batch_id,
@@ -783,6 +1060,12 @@ impl SessionActor {
     fn handle_continue_turn(&mut self, reason: Option<String>) -> Result<(), SessionActorError> {
         if self.initial.is_none() {
             return Err(SessionActorError::MissingInitial);
+        }
+        if self.active_provider_request.is_some() {
+            return self.emit(SessionEvent::ControlRejected {
+                reason: "cannot continue while a provider request is running".to_string(),
+                payload: serde_json::json!({"command": "continue_turn", "reason": reason}),
+            });
         }
         if self.active_tool_batch.is_some() {
             return self.emit(SessionEvent::ControlRejected {
@@ -946,212 +1229,301 @@ impl SessionActor {
         turn_number: u64,
         start_step_index: usize,
     ) -> Result<(), SessionActorError> {
-        let mut step_index = start_step_index;
+        self.start_provider_request(turn_id.to_string(), turn_number, start_step_index, 0)
+    }
+
+    fn start_provider_request(
+        &mut self,
+        turn_id: String,
+        turn_number: u64,
+        step_index: usize,
+        mut request_too_large_attempts: usize,
+    ) -> Result<(), SessionActorError> {
+        if self.active_provider_request.is_some() {
+            return Err(SessionActorError::from_provider_error(
+                ProviderError::Subprocess("provider request is already running".to_string()),
+            ));
+        }
         loop {
             self.log_info(
                 "provider_request_started",
                 serde_json::json!({
-                    "turn_id": turn_id,
+                    "turn_id": &turn_id,
                     "step_index": step_index,
                     "history_len": self.history.len(),
                     "provider_type": &self.model_config.provider_type,
                     "model_name": &self.model_config.model_name,
                 }),
             );
-            self.repair_unclosed_tool_calls_before_provider_request(turn_id, step_index)?;
+            self.repair_unclosed_tool_calls_before_provider_request(&turn_id, step_index)?;
             let system_prompt = self
-                .system_prompt_for_current_initial()
+                .system_prompt_for_current_initial()?
                 .ok_or(SessionActorError::MissingInitial)?;
-            let model_message = {
-                let mut request_too_large_attempts = 0usize;
-                loop {
-                    let normalized_history =
-                        normalize_messages_for_model(&self.history, &self.model_config);
-                    let provider_history = self
-                        .provider
-                        .normalize_messages_for_provider(&normalized_history);
-                    if let Some(estimated_tokens) =
-                        self.provider_request_exceeds_context(&provider_history)?
-                    {
-                        if request_too_large_attempts >= REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS {
-                            return Err(SessionActorError::provider_preflight(format!(
-                                "estimated provider request tokens {estimated_tokens} exceed model context {} after {REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS} prune attempts",
-                                self.model_config.token_max_context
-                            )));
-                        }
-                        request_too_large_attempts += 1;
-                        let error = format!(
-                            "estimated provider request tokens {estimated_tokens} exceed model context {}",
-                            self.model_config.token_max_context
-                        );
-                        if self.prune_history_after_request_too_large(
-                            "provider_request_preflight",
-                            Some(turn_id),
-                            Some(step_index),
-                            &error,
-                        )? {
-                            continue;
-                        }
-                        return Err(SessionActorError::provider_preflight(error));
-                    }
-
-                    let send_result = {
-                        let tools = self
-                            .tool_catalog
-                            .iter()
-                            .map(|(_, tool)| tool)
-                            .collect::<Vec<_>>();
-                        let request = ProviderRequest::new(&provider_history)
-                            .with_system_prompt(Some(system_prompt.as_str()))
-                            .with_tools(tools);
-                        let provider = Arc::clone(&self.provider);
-                        self.last_provider_request_started_at = Some(Instant::now());
-                        send_provider_request_with_retry(provider.as_ref(), request, |event| {
-                            self.log_info(
-                                "provider_request_retrying",
-                                serde_json::json!({
-                                    "turn_id": turn_id,
-                                    "step_index": step_index,
-                                    "retry": event.retry,
-                                    "max_retries": event.max_retries,
-                                    "delay_ms": event.delay.as_millis(),
-                                    "error": event.error.to_string(),
-                                }),
-                            );
-                        })
-                    };
-                    match send_result {
-                        Ok(message) => break message,
-                        Err(error)
-                            if error.is_request_too_large()
-                                && request_too_large_attempts
-                                    < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
-                        {
-                            request_too_large_attempts += 1;
-                            if self.prune_history_after_request_too_large(
-                                "provider_request",
-                                Some(turn_id),
-                                Some(step_index),
-                                &error.to_string(),
-                            )? {
-                                continue;
-                            }
-                            return Err(SessionActorError::from_provider_error(error));
-                        }
-                        Err(error) => return Err(SessionActorError::from_provider_error(error)),
-                    }
-                }
-            };
-            let mut model_message = model_message;
-            stamp_assistant_message_time(&mut model_message);
-
-            let tool_calls = collect_tool_calls(&model_message);
-            self.log_info(
-                "provider_response_received",
-                serde_json::json!({
-                    "turn_id": turn_id,
-                    "step_index": step_index,
-                    "message_items": model_message.data.len(),
-                    "tool_calls": tool_calls.iter().map(|tool| &tool.tool_name).collect::<Vec<_>>(),
-                }),
-            );
-            let model_message_index =
-                self.append_history_message("model_response", model_message.clone())?;
-            self.emit(SessionEvent::MessageAppended {
-                index: model_message_index,
-                message: model_message.clone(),
-            })?;
-
-            if tool_calls.is_empty() {
-                self.log_info(
-                    "turn_completed",
-                    serde_json::json!({
-                        "turn_id": turn_id,
-                        "final_items": model_message.data.len(),
-                    }),
-                );
-                self.clear_current_plan()?;
-                self.emit(SessionEvent::TurnCompleted {
-                    message: model_message,
-                })?;
-                self.mark_turn_returned(turn_number);
-                return Ok(());
-            }
-
-            let built_batch = self.build_tool_batch(turn_id, tool_calls)?;
-            if !built_batch.immediate_results.is_empty() {
-                let mut immediate_message = ChatMessage::new(
-                    ChatRole::Assistant,
-                    built_batch
-                        .immediate_results
-                        .into_iter()
-                        .map(ChatMessageItem::ToolResult)
-                        .collect(),
-                );
-                stamp_assistant_message_time(&mut immediate_message);
-                self.mark_loaded_skills_from_message(&immediate_message, turn_number)?;
-                let tool_message_index =
-                    self.append_history_message("tool_result", immediate_message.clone())?;
-                self.emit(SessionEvent::MessageAppended {
-                    index: tool_message_index,
-                    message: immediate_message,
-                })?;
-            }
-
-            let batch = built_batch.batch;
-            if batch.is_empty() {
-                step_index = step_index.saturating_add(1);
-                continue;
-            }
-            let batch_progress = batch.progress_summary();
-            self.log_info(
-                "tool_batch_started",
-                serde_json::json!({
-                    "turn_id": turn_id,
-                    "batch_id": &batch.batch_id,
-                    "operations": batch.operations.len(),
-                    "operation_summary": &batch_progress,
-                }),
-            );
-            self.emit(SessionEvent::Progress {
-                message: format!("running tool batch {}: {}", batch.batch_id, batch_progress),
-                plan: self.current_plan.clone(),
-            })?;
-
-            let operations = batch.operations.clone();
-            let handle = match self
-                .tool_executor
-                .start(batch, self.tool_completion_tx.clone())
+            let normalized_history =
+                normalize_messages_for_model(&self.history, &self.model_config);
+            let provider_history = self
+                .provider
+                .normalize_messages_for_provider(&normalized_history);
+            if let Some(estimated_tokens) =
+                self.provider_request_exceeds_context(&provider_history)?
             {
-                Ok(handle) => handle,
-                Err(error) => {
-                    let mut tool_message = tool_error_message_for_operations(
-                        &operations,
-                        format!("tool batch failed to start: {error}"),
-                    );
-                    stamp_assistant_message_time(&mut tool_message);
-                    let tool_message_index =
-                        self.append_history_message("tool_result", tool_message.clone())?;
-                    self.emit(SessionEvent::MessageAppended {
-                        index: tool_message_index,
-                        message: tool_message,
-                    })?;
-                    step_index = step_index.saturating_add(1);
+                if request_too_large_attempts >= REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS {
+                    return Err(SessionActorError::provider_preflight(format!(
+                        "estimated provider request tokens {estimated_tokens} exceed model context {} after {REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS} prune attempts",
+                        self.model_config.token_max_context
+                    )));
+                }
+                request_too_large_attempts += 1;
+                let error = format!(
+                    "estimated provider request tokens {estimated_tokens} exceed model context {}",
+                    self.model_config.token_max_context
+                );
+                if self.prune_history_after_request_too_large(
+                    "provider_request_preflight",
+                    Some(&turn_id),
+                    Some(step_index),
+                    &error,
+                )? {
                     continue;
                 }
+                return Err(SessionActorError::provider_preflight(error));
+            }
+
+            let request_id = format!(
+                "{}_provider_{}_{}",
+                turn_id, step_index, request_too_large_attempts
+            );
+            let message_id = message_id_for_all_messages_index(self.all_messages.len());
+            let request = ProviderRequestOwned {
+                system_prompt: Some(system_prompt),
+                messages: provider_history,
+                tools: self
+                    .tool_catalog
+                    .iter()
+                    .map(|(_, tool)| tool.clone())
+                    .collect(),
             };
-            self.active_tool_batch = Some(ActiveToolBatch {
-                turn_id: turn_id.to_string(),
+            self.provider
+                .start(request_id.clone(), request)
+                .map_err(SessionActorError::from_provider_error)?;
+            let now = Instant::now();
+            self.last_provider_request_started_at = Some(now);
+            self.active_provider_request = Some(ActiveProviderRequest {
+                request_id,
+                message_id,
+                turn_id,
                 turn_number,
                 step_index,
-                handle,
-                operations,
-                operation_summary: batch_progress,
+                request_too_large_attempts,
                 started_at_ms: current_time_millis(),
-                interrupt: None,
+                next_stream_event_index: 0,
+                last_activity_at: now,
             });
             return Ok(());
         }
+    }
+
+    fn process_provider_message(
+        &mut self,
+        active: ActiveProviderRequest,
+        mut model_message: ChatMessage,
+    ) -> Result<(), SessionActorError> {
+        model_message.message_id = active.message_id.clone();
+        stamp_assistant_message_time(&mut model_message);
+
+        let tool_calls = collect_tool_calls(&model_message);
+        self.log_info(
+            "provider_response_received",
+            serde_json::json!({
+                "turn_id": active.turn_id,
+                "step_index": active.step_index,
+                "message_items": model_message.data.len(),
+                "tool_calls": tool_calls.iter().map(|tool| &tool.tool_name).collect::<Vec<_>>(),
+            }),
+        );
+        let model_message_index =
+            self.append_history_message("model_response", model_message.clone())?;
+        self.emit(SessionEvent::MessageAppended {
+            index: model_message_index,
+            message: model_message.clone(),
+        })?;
+
+        if tool_calls.is_empty() {
+            self.log_info(
+                "turn_completed",
+                serde_json::json!({
+                    "turn_id": active.turn_id,
+                    "final_items": model_message.data.len(),
+                }),
+            );
+            self.emit(SessionEvent::TurnCompleted {
+                message: model_message,
+            })?;
+            self.mark_turn_returned(active.turn_number);
+            self.log_info(
+                "turn_completed_emitted",
+                serde_json::json!({
+                    "turn_id": active.turn_id,
+                }),
+            );
+            if let Err(error) = self.clear_current_plan() {
+                self.log_error(
+                    "clear_current_plan_after_turn_completed_failed",
+                    serde_json::json!({
+                        "turn_id": active.turn_id,
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+            return Ok(());
+        }
+
+        let built_batch = self.build_tool_batch(&active.turn_id, tool_calls)?;
+        if !built_batch.immediate_results.is_empty() {
+            let mut immediate_message = ChatMessage::new(
+                ChatRole::Assistant,
+                built_batch
+                    .immediate_results
+                    .into_iter()
+                    .map(ChatMessageItem::ToolResult)
+                    .collect(),
+            );
+            stamp_assistant_message_time(&mut immediate_message);
+            self.mark_loaded_skills_from_message(&immediate_message, active.turn_number)?;
+            let tool_message_index =
+                self.append_history_message("tool_result", immediate_message.clone())?;
+            self.emit(SessionEvent::MessageAppended {
+                index: tool_message_index,
+                message: immediate_message,
+            })?;
+        }
+
+        let batch = built_batch.batch;
+        if batch.is_empty() {
+            return self.start_provider_request(
+                active.turn_id,
+                active.turn_number,
+                active.step_index.saturating_add(1),
+                0,
+            );
+        }
+        let batch_progress = batch.progress_summary();
+        self.log_info(
+            "tool_batch_started",
+            serde_json::json!({
+                "turn_id": active.turn_id,
+                "batch_id": &batch.batch_id,
+                "operations": batch.operations.len(),
+                "operation_summary": &batch_progress,
+            }),
+        );
+        self.emit(SessionEvent::Progress {
+            message: format!("running tool batch {}: {}", batch.batch_id, batch_progress),
+            plan: self.current_plan.clone(),
+        })?;
+
+        let operations = batch.operations.clone();
+        let handle = match self.tool_executor.start(
+            batch,
+            self.tool_completion_tx.clone(),
+            self.tool_progress_tx.clone(),
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let mut tool_message = tool_error_message_for_operations(
+                    &operations,
+                    format!("tool batch failed to start: {error}"),
+                );
+                stamp_assistant_message_time(&mut tool_message);
+                let tool_message_index =
+                    self.append_history_message("tool_result", tool_message.clone())?;
+                self.emit(SessionEvent::MessageAppended {
+                    index: tool_message_index,
+                    message: tool_message,
+                })?;
+                return self.start_provider_request(
+                    active.turn_id,
+                    active.turn_number,
+                    active.step_index.saturating_add(1),
+                    0,
+                );
+            }
+        };
+        self.active_tool_batch = Some(ActiveToolBatch {
+            turn_id: active.turn_id,
+            turn_number: active.turn_number,
+            step_index: active.step_index,
+            handle,
+            operations,
+            operation_summary: batch_progress,
+            started_at_ms: current_time_millis(),
+            interrupt: None,
+        });
+        Ok(())
+    }
+
+    fn emit_provider_stream_event(
+        &mut self,
+        message_id: &str,
+        turn_id: &str,
+        in_message_index: u64,
+        event: ProviderStreamEvent,
+    ) -> Result<(), SessionActorError> {
+        let model_message_index = self.history.len();
+        match event {
+            ProviderStreamEvent::KeepAlive | ProviderStreamEvent::RawJson { .. } => {}
+            ProviderStreamEvent::OutputTextDelta { item_id, delta } => {
+                self.emit(SessionEvent::StreamAssistantMessageDelta {
+                    message_id: message_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    in_message_index,
+                    item_id,
+                    delta,
+                    message_index: Some(model_message_index),
+                })?;
+            }
+            ProviderStreamEvent::ToolCallInputDelta {
+                item_id,
+                call_id,
+                delta,
+            } => {
+                self.emit(SessionEvent::StreamToolCallDelta {
+                    message_id: message_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    in_message_index,
+                    item_id,
+                    call_id,
+                    delta,
+                })?;
+            }
+            ProviderStreamEvent::ReasoningSummaryDelta {
+                item_id,
+                delta,
+                summary_index,
+            } => {
+                self.emit(SessionEvent::StreamReasoningSummaryDelta {
+                    message_id: message_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    in_message_index,
+                    item_id,
+                    summary_index,
+                    delta,
+                })?;
+            }
+            ProviderStreamEvent::ReasoningSummaryPartAdded {
+                item_id,
+                summary_index,
+            } => {
+                self.emit(SessionEvent::StreamReasoningSummaryPartAdded {
+                    message_id: message_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    in_message_index,
+                    item_id,
+                    summary_index,
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn build_tool_batch(
@@ -1161,17 +1533,13 @@ impl SessionActor {
     ) -> Result<BuiltToolBatch, SessionActorError> {
         let batch_id = self.allocate_batch_id(turn_id);
         let mut operations = Vec::with_capacity(tool_calls.len());
-        let mut immediate_results = Vec::new();
+        let immediate_results = Vec::new();
         let provider_enabled_tool_names = self.provider_enabled_tool_names();
 
         for tool_call in tool_calls {
-            if tool_call.tool_name == "update_plan" {
-                immediate_results.push(self.handle_update_plan_tool_call(tool_call)?);
-                continue;
-            }
             if !provider_enabled_tool_names.contains(&tool_call.tool_name) {
                 operations.push(
-                    ToolExecutionOp::UnsupportedTool {
+                    ToolBatchItem::UnsupportedTool {
                         reason: format!("{} is disabled for this provider", tool_call.tool_name),
                         tool_call,
                     }
@@ -1181,31 +1549,27 @@ impl SessionActor {
             }
             let scheduled = match self.tool_catalog.get(&tool_call.tool_name) {
                 Some(definition) => {
-                    let operation = match &definition.backend {
-                        ToolBackend::ConversationBridge { action } => {
-                            ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
-                                request_id: format!("{}_{}", batch_id, tool_call.tool_call_id),
-                                tool_call_id: tool_call.tool_call_id.clone(),
-                                tool_name: tool_call.tool_name.clone(),
-                                action: action.clone(),
-                                payload: parse_tool_arguments(&tool_call.arguments.text),
-                            })
+                    let operation = if self
+                        .tool_catalog
+                        .should_execute_registered(&tool_call.tool_name)
+                    {
+                        ToolBatchItem::RegisteredTool(tool_call)
+                    } else {
+                        ToolBatchItem::UnsupportedTool {
+                            reason: format!(
+                                "{} is not executable through the local tool batch executor",
+                                tool_call.tool_name
+                            ),
+                            tool_call,
                         }
-                        ToolBackend::Local if tool_call.tool_name == "skill_load" => self
-                            .build_skill_load_operation(tool_call.clone())
-                            .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
-                        ToolBackend::ProviderBacked { kind } => self
-                            .build_provider_backed_operation(tool_call.clone(), *kind)
-                            .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
-                        ToolBackend::ProviderNative { .. } => ToolExecutionOp::LocalTool(tool_call),
-                        ToolBackend::Local if tool_call.tool_name == "web_search" => self
-                            .build_web_search_operation(tool_call.clone())
-                            .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
-                        ToolBackend::Local => ToolExecutionOp::LocalTool(tool_call),
                     };
                     ToolBatchOperation::new(operation, definition.concurrency)
                 }
-                None => ToolExecutionOp::LocalTool(tool_call).into(),
+                None => ToolBatchItem::UnsupportedTool {
+                    reason: format!("{} is not registered in this session", tool_call.tool_name),
+                    tool_call,
+                }
+                .into(),
             };
             operations.push(scheduled);
         }
@@ -1260,45 +1624,6 @@ impl SessionActor {
         })
     }
 
-    fn build_web_search_operation(
-        &self,
-        tool_call: super::ToolCallItem,
-    ) -> Option<ToolExecutionOp> {
-        let initial = self.initial.as_ref()?;
-        Some(ToolExecutionOp::WebSearch {
-            tool_call,
-            models: super::SearchToolModels {
-                web: initial.search_tool_model.clone(),
-                image: initial.search_image_tool_model.clone(),
-                video: initial.search_video_tool_model.clone(),
-                news: initial.search_news_tool_model.clone(),
-            },
-        })
-    }
-
-    fn handle_update_plan_tool_call(
-        &mut self,
-        tool_call: super::ToolCallItem,
-    ) -> Result<super::ToolResultItem, SessionActorError> {
-        let payload = parse_tool_arguments(&tool_call.arguments.text);
-        let result = match parse_task_plan_view(payload) {
-            Ok(plan) => {
-                self.current_plan = Some(plan.clone());
-                self.emit(SessionEvent::PlanUpdated { plan: Some(plan) })?;
-                serde_json::json!({"updated": true})
-            }
-            Err(error) => serde_json::json!({
-                "updated": false,
-                "error": error,
-            }),
-        };
-        Ok(super::ToolResultItem {
-            tool_call_id: tool_call.tool_call_id,
-            tool_name: tool_call.tool_name,
-            result: ToolResultContent::from_json(result),
-        })
-    }
-
     fn clear_current_plan(&mut self) -> Result<(), SessionActorError> {
         self.history
             .retain(|message| !is_task_plan_context_message(message));
@@ -1309,40 +1634,165 @@ impl SessionActor {
         Ok(())
     }
 
-    fn build_provider_backed_operation(
-        &self,
-        tool_call: super::ToolCallItem,
-        kind: super::ProviderBackedToolKind,
-    ) -> Option<ToolExecutionOp> {
-        let initial = self.initial.as_ref()?;
-        let model_config = match kind {
-            super::ProviderBackedToolKind::ImageAnalysis => initial.image_tool_model.clone()?,
-            super::ProviderBackedToolKind::PdfAnalysis => initial.pdf_tool_model.clone()?,
-            super::ProviderBackedToolKind::AudioAnalysis => initial.audio_tool_model.clone()?,
-            super::ProviderBackedToolKind::ImageGeneration => initial
-                .image_generation_tool_model
-                .clone()
-                .unwrap_or_else(|| self.model_config.clone()),
+    fn handle_ready_provider_event(&mut self) -> Result<SessionActorStep, SessionActorError> {
+        let Some(active_request_id) = self
+            .active_provider_request
+            .as_ref()
+            .map(|active| active.request_id.clone())
+        else {
+            return Ok(SessionActorStep::Idle);
         };
-        Some(ToolExecutionOp::ProviderBacked {
-            tool_call,
-            kind,
-            model_config,
-        })
+        let Some(event) = self.pending_provider_events.pop_front() else {
+            return Ok(SessionActorStep::WaitingProviderRequest);
+        };
+        match event {
+            ProviderEvent::Stream { request_id, event } => {
+                if request_id == active_request_id && provider_stream_event_is_renderable(&event) {
+                    let Some(active) = self.active_provider_request.as_mut() else {
+                        return Ok(SessionActorStep::Idle);
+                    };
+                    let turn_id = active.turn_id.clone();
+                    let message_id = active.message_id.clone();
+                    let in_message_index = active.next_stream_event_index;
+                    active.next_stream_event_index =
+                        active.next_stream_event_index.saturating_add(1);
+                    active.last_activity_at = Instant::now();
+                    self.emit_provider_stream_event(
+                        &message_id,
+                        &turn_id,
+                        in_message_index,
+                        event,
+                    )?;
+                }
+                Ok(SessionActorStep::WaitingProviderRequest)
+            }
+            ProviderEvent::Retry {
+                request_id,
+                retry,
+                max_retries,
+                delay_ms,
+                error,
+            } => {
+                if request_id == active_request_id {
+                    let Some(active) = self.active_provider_request.as_ref() else {
+                        return Ok(SessionActorStep::Idle);
+                    };
+                    self.log_info(
+                        "provider_request_retrying",
+                        serde_json::json!({
+                            "turn_id": active.turn_id,
+                            "step_index": active.step_index,
+                            "retry": retry,
+                            "max_retries": max_retries,
+                            "delay_ms": delay_ms,
+                            "error": error,
+                        }),
+                    );
+                }
+                Ok(SessionActorStep::WaitingProviderRequest)
+            }
+            ProviderEvent::Result { request_id, result } => {
+                if request_id != active_request_id {
+                    self.log_warn(
+                        "stale_provider_request_completion_ignored",
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "active_request_id": active_request_id,
+                        }),
+                    );
+                    return Ok(SessionActorStep::WaitingProviderRequest);
+                }
+                let active = self
+                    .active_provider_request
+                    .take()
+                    .expect("active provider request should still exist");
+                match result {
+                    Ok(message) => {
+                        self.process_provider_message(active, message)?;
+                    }
+                    Err(error)
+                        if error.is_request_too_large()
+                            && active.request_too_large_attempts
+                                < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
+                    {
+                        let next_attempt = active.request_too_large_attempts.saturating_add(1);
+                        if self.prune_history_after_request_too_large(
+                            "provider_request",
+                            Some(&active.turn_id),
+                            Some(active.step_index),
+                            &error.to_string(),
+                        )? {
+                            self.start_provider_request(
+                                active.turn_id,
+                                active.turn_number,
+                                active.step_index,
+                                next_attempt,
+                            )?;
+                        } else {
+                            self.finish_turn_error(
+                                &active.turn_id,
+                                SessionActorError::from_provider_error(error),
+                                Some(PendingContinuation::CurrentHistory),
+                            )?;
+                        }
+                    }
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        self.emit(SessionEvent::StreamError {
+                            message_id: active.message_id.clone(),
+                            turn_id: active.turn_id.clone(),
+                            in_message_index: active.next_stream_event_index,
+                            item_id: None,
+                            message_index: None,
+                            error: error_text.clone(),
+                            error_detail: SessionErrorDetail::new(
+                                "session_actor.provider",
+                                "provider_error",
+                                error_text,
+                            ),
+                        })?;
+                        self.finish_turn_error(
+                            &active.turn_id,
+                            SessionActorError::from_provider_error(error),
+                            Some(PendingContinuation::CurrentHistory),
+                        )?;
+                    }
+                }
+                Ok(if self.active_provider_request.is_some() {
+                    SessionActorStep::WaitingProviderRequest
+                } else if self.active_tool_batch.is_some() {
+                    SessionActorStep::WaitingToolBatch
+                } else {
+                    SessionActorStep::ProcessedData
+                })
+            }
+        }
     }
 
-    fn build_skill_load_operation(
-        &self,
-        tool_call: super::ToolCallItem,
-    ) -> Option<ToolExecutionOp> {
-        let arguments =
-            serde_json::from_str::<serde_json::Value>(&tool_call.arguments.text).ok()?;
-        let skill_name = arguments
-            .get("skill_name")
-            .or_else(|| arguments.get("name"))
-            .and_then(serde_json::Value::as_str)?;
-        let skill = self.runtime_metadata_state.skill_observation(skill_name)?;
-        Some(ToolExecutionOp::SkillLoad { tool_call, skill })
+    fn handle_ready_tool_progress(&mut self) -> Result<SessionActorStep, SessionActorError> {
+        let Some(active) = self.active_tool_batch.as_ref() else {
+            self.pending_tool_progress.clear();
+            return Ok(SessionActorStep::Idle);
+        };
+        let Some(progress) = self.pending_tool_progress.pop_front() else {
+            return Ok(SessionActorStep::WaitingToolBatch);
+        };
+        if progress.batch_id != active.handle.batch_id {
+            self.log_warn(
+                "stale_tool_batch_progress_ignored",
+                serde_json::json!({
+                    "batch_id": progress.batch_id,
+                    "active_batch_id": active.handle.batch_id,
+                }),
+            );
+            return Ok(SessionActorStep::WaitingToolBatch);
+        }
+        self.emit(SessionEvent::StreamToolResultDone {
+            turn_id: active.turn_id.clone(),
+            batch_id: progress.batch_id,
+            tool_result: progress.result,
+        })?;
+        Ok(SessionActorStep::WaitingToolBatch)
     }
 
     fn handle_ready_tool_completion(&mut self) -> Result<SessionActorStep, SessionActorError> {
@@ -1393,13 +1843,72 @@ impl SessionActor {
                 "result_items": tool_message.data.len(),
             }),
         );
-        self.mark_loaded_skills_from_message(&tool_message, active.turn_number)?;
+        let mark_started_at = Instant::now();
+        self.log_info(
+            "tool_result_mark_skills_started",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "turn_number": active.turn_number,
+                "result_items": tool_message.data.len(),
+            }),
+        );
+        let marked_skill_count =
+            self.mark_loaded_skills_from_message(&tool_message, active.turn_number)?;
+        self.log_info(
+            "tool_result_mark_skills_completed",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "marked_skill_count": marked_skill_count,
+                "elapsed_ms": mark_started_at.elapsed().as_millis(),
+            }),
+        );
+        let append_started_at = Instant::now();
+        self.log_info(
+            "tool_result_append_started",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
         let tool_message_index =
             self.append_history_message("tool_result", tool_message.clone())?;
+        self.log_info(
+            "tool_result_append_completed",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "message_index": tool_message_index,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "elapsed_ms": append_started_at.elapsed().as_millis(),
+            }),
+        );
+        let emit_started_at = Instant::now();
+        self.log_info(
+            "tool_result_emit_started",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "message_index": tool_message_index,
+            }),
+        );
         self.emit(SessionEvent::MessageAppended {
             index: tool_message_index,
             message: tool_message,
         })?;
+        self.log_info(
+            "tool_result_emit_completed",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "message_index": tool_message_index,
+                "elapsed_ms": emit_started_at.elapsed().as_millis(),
+            }),
+        );
         if active.interrupt == Some(ToolBatchInterrupt::SupersededByUserMessage) {
             self.log_info(
                 "tool_batch_superseded_by_user_message",
@@ -1422,6 +1931,8 @@ impl SessionActor {
         }
         Ok(if self.active_tool_batch.is_some() {
             SessionActorStep::WaitingToolBatch
+        } else if self.active_provider_request.is_some() {
+            SessionActorStep::WaitingProviderRequest
         } else {
             SessionActorStep::ProcessedData
         })
@@ -1461,36 +1972,129 @@ impl SessionActor {
     fn append_history_message(
         &mut self,
         phase: &str,
-        message: ChatMessage,
+        mut message: ChatMessage,
     ) -> Result<usize, SessionActorError> {
+        let append_started_at = Instant::now();
         let index = self.all_messages.len();
+        if !message_id_has_all_messages_index(&message.message_id) {
+            message.message_id = message_id_for_all_messages_index(index);
+        }
+        self.log_info(
+            "append_history_message_started",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "message_role": message.role,
+                "message_items": message.data.len(),
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "has_compressor": self.compressor.is_some(),
+            }),
+        );
         let Some(compressor) = self.compressor.clone() else {
             self.all_messages.push(message.clone());
             self.history.push(message);
             self.persist_state_if_history_closed(phase)?;
+            self.log_info(
+                "append_history_message_completed",
+                serde_json::json!({
+                    "phase": phase,
+                    "index": index,
+                    "mode": "no_compressor",
+                    "history_len": self.history.len(),
+                    "all_messages_len": self.all_messages.len(),
+                    "elapsed_ms": append_started_at.elapsed().as_millis(),
+                }),
+            );
             return Ok(index);
         };
 
         self.all_messages.push(message.clone());
-        let system_prompt = self.system_prompt_for_current_initial();
-        if compressor
+        if append_phase_should_defer_compression(phase) {
+            self.log_info(
+                "append_history_message_compression_deferred",
+                serde_json::json!({
+                    "phase": phase,
+                    "index": index,
+                    "history_len": self.history.len(),
+                    "all_messages_len": self.all_messages.len(),
+                }),
+            );
+            self.history.push(message);
+            self.persist_state_if_history_closed(phase)?;
+            self.log_info(
+                "append_history_message_completed",
+                serde_json::json!({
+                    "phase": phase,
+                    "index": index,
+                    "mode": "compression_deferred",
+                    "history_len": self.history.len(),
+                    "all_messages_len": self.all_messages.len(),
+                    "elapsed_ms": append_started_at.elapsed().as_millis(),
+                }),
+            );
+            return Ok(index);
+        }
+        let system_prompt_started_at = Instant::now();
+        self.log_info(
+            "append_history_system_prompt_started",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+            }),
+        );
+        let system_prompt = self.system_prompt_for_current_initial()?;
+        self.log_info(
+            "append_history_system_prompt_completed",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "has_system_prompt": system_prompt.is_some(),
+                "elapsed_ms": system_prompt_started_at.elapsed().as_millis(),
+            }),
+        );
+        let would_compress_started_at = Instant::now();
+        let would_compress = compressor
             .would_compress_with_next(&self.history, &message)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        self.log_info(
+            "append_history_would_compress_checked",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "would_compress": would_compress,
+                "elapsed_ms": would_compress_started_at.elapsed().as_millis(),
+            }),
+        );
+        if would_compress {
             self.flush_all_messages_before_compression(phase)?;
         }
+        let compression_started_at = Instant::now();
+        self.log_info(
+            "append_history_compression_append_started",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
         let report = {
             let mut request_too_large_attempts = 0usize;
             loop {
                 let compression_context =
                     self.compression_memory_context_for_append(&compressor, &message);
-                match compressor.append_with_compression(
+                match compressor.append_with_compression_with_tools(
                     &mut self.history,
                     message.clone(),
                     self.provider.as_ref(),
                     &self.model_config,
                     system_prompt.as_deref(),
                     compression_context.as_deref(),
+                    self.tool_catalog
+                        .iter()
+                        .map(|(_, tool)| tool)
+                        .collect::<Vec<_>>(),
                 ) {
                     Ok(report) => break report,
                     Err(error)
@@ -1519,12 +2123,34 @@ impl SessionActor {
                 }
             }
         };
+        self.log_info(
+            "append_history_compression_append_completed",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "compressed": report.compressed,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "elapsed_ms": compression_started_at.elapsed().as_millis(),
+            }),
+        );
         self.log_compression_report(phase, &report);
         if report.compressed {
             self.runtime_metadata_state
                 .promote_notified_components_to_system_snapshot();
         }
         self.persist_state_if_history_closed(phase)?;
+        self.log_info(
+            "append_history_message_completed",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "mode": "compression_checked",
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "elapsed_ms": append_started_at.elapsed().as_millis(),
+            }),
+        );
         Ok(index)
     }
 
@@ -1630,6 +2256,10 @@ impl SessionActor {
                     .unwrap_or_default(),
                 self.initial
                     .as_ref()
+                    .and_then(|initial| initial.remote_workspace_instructions.clone())
+                    .unwrap_or_default(),
+                self.initial
+                    .as_ref()
                     .is_some_and(|initial| initial.memory_enabled),
             )
             .map_err(SessionActorError::RuntimeMetadata)?;
@@ -1658,14 +2288,15 @@ impl SessionActor {
         &mut self,
         message: &ChatMessage,
         turn_number: u64,
-    ) -> Result<(), SessionActorError> {
+    ) -> Result<usize, SessionActorError> {
         let skill_names = loaded_skill_names_from_message(message);
         if skill_names.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+        let marked_skill_count = skill_names.len();
         self.runtime_metadata_state
             .mark_loaded_skills(&skill_names, turn_number);
-        Ok(())
+        Ok(marked_skill_count)
     }
 
     fn restore_persisted_state(
@@ -1690,9 +2321,21 @@ impl SessionActor {
                         .data_root()
                         .map_err(SessionActorError::RuntimeMetadata)?,
                     remote_aliases_prompt_for_mode(&incoming_initial.tool_remote_mode),
+                    incoming_initial
+                        .remote_workspace_instructions
+                        .clone()
+                        .unwrap_or_default(),
                     incoming_initial.memory_enabled,
                 )
                 .map_err(SessionActorError::RuntimeMetadata)?;
+        } else {
+            self.runtime_metadata_state.initialize_missing_component(
+                REMOTE_WORKSPACE_PROMPT_COMPONENT,
+                incoming_initial
+                    .remote_workspace_instructions
+                    .clone()
+                    .unwrap_or_default(),
+            );
         }
         Ok(())
     }
@@ -1746,7 +2389,42 @@ impl SessionActor {
             );
             return Ok(());
         }
-        self.persist_state()
+        let started_at = Instant::now();
+        self.log_info(
+            "session_state_persist_started",
+            serde_json::json!({
+                "phase": phase,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
+        match self.persist_state() {
+            Ok(()) => {
+                self.log_info(
+                    "session_state_persist_completed",
+                    serde_json::json!({
+                        "phase": phase,
+                        "history_len": self.history.len(),
+                        "all_messages_len": self.all_messages.len(),
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.log_error(
+                    "session_state_persist_failed",
+                    serde_json::json!({
+                        "phase": phase,
+                        "history_len": self.history.len(),
+                        "all_messages_len": self.all_messages.len(),
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "error": error.to_string(),
+                    }),
+                );
+                Err(error)
+            }
+        }
     }
 
     fn log_compression_report(&self, phase: &str, report: &CompressionReport) {
@@ -1774,13 +2452,19 @@ impl SessionActor {
     }
 
     fn idle_compaction_delay(&self) -> Option<Duration> {
-        self.initial.as_ref()?;
+        let initial = self.initial.as_ref()?;
+        if !initial.idle_timeout_compact_enabled {
+            return None;
+        }
         self.compressor.as_ref()?;
         if self.shutdown
+            || self.active_provider_request.is_some()
             || self.active_tool_batch.is_some()
             || !self.pending_control.is_empty()
             || !self.pending_data.is_empty()
+            || !self.pending_provider_events.is_empty()
             || !self.pending_tool_completions.is_empty()
+            || !self.pending_tool_progress.is_empty()
             || self.last_completed_turn_number <= self.last_idle_compaction_turn_number
             || count_unclosed_tool_calls(&self.history) > 0
         {
@@ -1815,7 +2499,7 @@ impl SessionActor {
 
         let threshold_tokens =
             idle_compaction_token_threshold(&self.model_config, self.initial.as_ref());
-        let system_prompt = self.system_prompt_for_current_initial();
+        let system_prompt = self.system_prompt_for_current_initial()?;
         let mut request_too_large_attempts = 0usize;
         let report = loop {
             let compression_context = if compressor
@@ -1826,13 +2510,17 @@ impl SessionActor {
             } else {
                 None
             };
-            match compressor.compact_if_needed_with_threshold(
+            match compressor.compact_if_needed_with_threshold_and_tools(
                 &mut self.history,
                 self.provider.as_ref(),
                 &self.model_config,
                 system_prompt.as_deref(),
                 threshold_tokens,
                 compression_context.as_deref(),
+                self.tool_catalog
+                    .iter()
+                    .map(|(_, tool)| tool)
+                    .collect::<Vec<_>>(),
             ) {
                 Ok(report) => break Ok(report),
                 Err(error)
@@ -2010,6 +2698,7 @@ pub enum SessionActorStep {
     ProcessedControl,
     ProcessedData,
     ProcessedIdleCompaction,
+    WaitingProviderRequest,
     WaitingToolBatch,
     Shutdown,
 }
@@ -2244,16 +2933,10 @@ fn tool_error_result_for_operation(
     operation: &ToolBatchOperation,
     error: &str,
 ) -> super::ToolResultItem {
-    let (tool_call_id, tool_name) = match &operation.operation {
-        ToolExecutionOp::LocalTool(tool_call)
-        | ToolExecutionOp::UnsupportedTool { tool_call, .. }
-        | ToolExecutionOp::SkillLoad { tool_call, .. }
-        | ToolExecutionOp::ProviderBacked { tool_call, .. }
-        | ToolExecutionOp::WebSearch { tool_call, .. } => {
+    let (tool_call_id, tool_name) = match &operation.item {
+        ToolBatchItem::RegisteredTool(tool_call)
+        | ToolBatchItem::UnsupportedTool { tool_call, .. } => {
             (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
-        }
-        ToolExecutionOp::ConversationBridge(request) => {
-            (request.tool_call_id.clone(), request.tool_name.clone())
         }
     };
     super::ToolResultItem {
@@ -2464,6 +3147,11 @@ fn message_text_for_memory_query(message: &ChatMessage) -> String {
     for item in &message.data {
         match item {
             ChatMessageItem::Context(context) => parts.push(context.text.trim().to_string()),
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    parts.push(text.trim().to_string());
+                }
+            }
             ChatMessageItem::SelectionReference(selection) => {
                 parts.push(selection.to_prompt_text());
             }
@@ -2569,6 +3257,10 @@ fn compression_error_is_request_too_large(error: &CompressionError) -> bool {
     request_too_large_text(&error.to_string())
 }
 
+fn append_phase_should_defer_compression(phase: &str) -> bool {
+    phase.starts_with("tool_result")
+}
+
 fn request_too_large_prune_start(messages: &[ChatMessage]) -> Option<usize> {
     if messages.len() <= 1 {
         return None;
@@ -2583,6 +3275,20 @@ fn current_time_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+fn message_id_for_all_messages_index(index: usize) -> String {
+    format!("msg_{index:020}_{:016x}", rand::random::<u64>())
+}
+
+fn message_id_has_all_messages_index(message_id: &str) -> bool {
+    let Some(rest) = message_id.strip_prefix("msg_") else {
+        return false;
+    };
+    let Some((index, _suffix)) = rest.split_once('_') else {
+        return false;
+    };
+    index.len() == 20 && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn now_rfc3339() -> String {
@@ -2662,6 +3368,16 @@ fn session_request_kind(request: &SessionRequest) -> &'static str {
     }
 }
 
+fn provider_stream_event_is_renderable(event: &ProviderStreamEvent) -> bool {
+    matches!(
+        event,
+        ProviderStreamEvent::OutputTextDelta { .. }
+            | ProviderStreamEvent::ToolCallInputDelta { .. }
+            | ProviderStreamEvent::ReasoningSummaryDelta { .. }
+            | ProviderStreamEvent::ReasoningSummaryPartAdded { .. }
+    )
+}
+
 fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
     match event {
         SessionEvent::MessageAppended { index, message } => serde_json::json!({
@@ -2690,6 +3406,97 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
                 "plan_items": plan.as_ref().map(|plan| plan.plan.len()).unwrap_or(0),
             })
         }
+        SessionEvent::StreamAssistantMessageDelta {
+            message_id,
+            turn_id,
+            in_message_index,
+            item_id,
+            delta,
+            message_index,
+        } => serde_json::json!({
+            "event": "stream_assistant_message_delta",
+            "message_id": message_id,
+            "turn_id": turn_id,
+            "in_message_index": in_message_index,
+            "item_id": item_id,
+            "message_index": message_index,
+            "chars": delta.chars().count(),
+        }),
+        SessionEvent::StreamToolCallDelta {
+            message_id,
+            turn_id,
+            in_message_index,
+            item_id,
+            call_id,
+            delta,
+        } => serde_json::json!({
+            "event": "stream_tool_call_delta",
+            "message_id": message_id,
+            "turn_id": turn_id,
+            "in_message_index": in_message_index,
+            "item_id": item_id,
+            "call_id": call_id,
+            "chars": delta.chars().count(),
+        }),
+        SessionEvent::StreamReasoningSummaryDelta {
+            message_id,
+            turn_id,
+            in_message_index,
+            item_id,
+            summary_index,
+            delta,
+        } => serde_json::json!({
+            "event": "stream_reasoning_summary_delta",
+            "message_id": message_id,
+            "turn_id": turn_id,
+            "in_message_index": in_message_index,
+            "item_id": item_id,
+            "summary_index": summary_index,
+            "chars": delta.chars().count(),
+        }),
+        SessionEvent::StreamReasoningSummaryPartAdded {
+            message_id,
+            turn_id,
+            in_message_index,
+            item_id,
+            summary_index,
+        } => serde_json::json!({
+            "event": "stream_reasoning_summary_part_added",
+            "message_id": message_id,
+            "turn_id": turn_id,
+            "in_message_index": in_message_index,
+            "item_id": item_id,
+            "summary_index": summary_index,
+        }),
+        SessionEvent::StreamError {
+            message_id,
+            turn_id,
+            in_message_index,
+            item_id,
+            message_index,
+            error,
+            error_detail,
+        } => serde_json::json!({
+            "event": "stream_error",
+            "message_id": message_id,
+            "turn_id": turn_id,
+            "in_message_index": in_message_index,
+            "item_id": item_id,
+            "message_index": message_index,
+            "error": error,
+            "error_detail": error_detail,
+        }),
+        SessionEvent::StreamToolResultDone {
+            turn_id,
+            batch_id,
+            tool_result,
+        } => serde_json::json!({
+            "event": "stream_tool_result_done",
+            "turn_id": turn_id,
+            "batch_id": batch_id,
+            "tool_name": tool_result.tool_name,
+            "tool_call_id": tool_result.tool_call_id,
+        }),
         SessionEvent::TurnCompleted { message } => serde_json::json!({
             "event": "turn_completed",
             "message_items": message.data.len(),
@@ -2754,30 +3561,6 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
     }
 }
 
-fn parse_task_plan_view(payload: serde_json::Value) -> Result<TaskPlanView, String> {
-    let mut plan: TaskPlanView = serde_json::from_value(payload)
-        .map_err(|error| format!("failed to parse update_plan payload: {error}"))?;
-    plan.explanation = plan
-        .explanation
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    for item in &mut plan.plan {
-        item.step = item.step.trim().to_string();
-        if item.step.is_empty() {
-            return Err("update_plan step must not be empty".to_string());
-        }
-    }
-    let in_progress_count = plan
-        .plan
-        .iter()
-        .filter(|item| matches!(item.status, TaskPlanItemStatus::InProgress))
-        .count();
-    if in_progress_count > 1 {
-        return Err("update_plan may include at most one in_progress step".to_string());
-    }
-    Ok(plan)
-}
-
 fn render_task_plan_context(plan: &TaskPlanView) -> Option<String> {
     if plan.explanation.is_none() && plan.plan.is_empty() {
         return None;
@@ -2813,10 +3596,6 @@ fn is_task_plan_context_message(message: &ChatMessage) -> bool {
                     if context.text.starts_with(SESSION_PLAN_CONTEXT_MARKER)
             )
         })
-}
-
-fn parse_tool_arguments(text: &str) -> serde_json::Value {
-    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
 }
 
 fn restored_history_needs_continuation(history: &[ChatMessage]) -> bool {
@@ -2877,7 +3656,7 @@ mod tests {
             MediaInputConfig, MediaInputTransport, ModelCapability, MultimodalInputConfig,
             ProviderType, RetryMode, TokenEstimatorType,
         },
-        providers::{Provider, ProviderError},
+        providers::{Provider, ProviderError, ProviderRequest},
         session_actor::{
             builtin_tool_catalog, tool_result_text, BuiltinToolCatalogOptions, ChatRole,
             ContextItem, FileItem, HostToolScope, SessionMailboxKind, TaskPlanItemView,
@@ -2907,6 +3686,22 @@ mod tests {
         (inbox, MemoryActorMailbox { sender })
     }
 
+    fn step_until(
+        actor: &mut SessionActor,
+        expected: SessionActorStep,
+        max_steps: usize,
+        label: &str,
+    ) {
+        for _ in 0..max_steps {
+            let step = actor.step().expect(label);
+            if step == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{label}: did not reach {expected:?}");
+    }
+
     #[derive(Default)]
     struct MemoryEventSink {
         events: Mutex<Vec<SessionEvent>>,
@@ -2921,6 +3716,7 @@ mod tests {
 
     struct ScriptedProvider {
         model_config: ModelConfig,
+        provider_system_prompt: Option<String>,
         responses: Mutex<VecDeque<ChatMessage>>,
         seen_requests: Mutex<Vec<ProviderRequestSnapshot>>,
     }
@@ -2929,6 +3725,7 @@ mod tests {
         fn new(responses: Vec<ChatMessage>) -> Self {
             Self {
                 model_config: test_model_config(),
+                provider_system_prompt: None,
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_requests: Mutex::new(Vec::new()),
             }
@@ -2936,6 +3733,11 @@ mod tests {
 
         fn with_model_config(mut self, model_config: ModelConfig) -> Self {
             self.model_config = model_config;
+            self
+        }
+
+        fn with_provider_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+            self.provider_system_prompt = Some(system_prompt.into());
             self
         }
     }
@@ -2950,6 +3752,13 @@ mod tests {
     impl Provider for ScriptedProvider {
         fn model_config(&self) -> &ModelConfig {
             &self.model_config
+        }
+
+        fn system_prompt_for_model(
+            &self,
+            _model_config: &ModelConfig,
+        ) -> Result<Option<String>, ProviderError> {
+            Ok(self.provider_system_prompt.clone())
         }
 
         fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
@@ -3084,20 +3893,83 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id.clone());
+            let results = batch
+                .operations
+                .iter()
+                .map(|operation| {
+                    let (tool_call_id, tool_name) = match &operation.item {
+                        ToolBatchItem::RegisteredTool(tool_call)
+                        | ToolBatchItem::UnsupportedTool { tool_call, .. } => {
+                            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
+                        }
+                    };
+                    ChatMessageItem::ToolResult(ToolResultItem {
+                        tool_call_id,
+                        tool_name,
+                        result: ToolResultContent::from_text(format!(
+                            "tool batch {} done",
+                            handle.batch_id
+                        )),
+                    })
+                })
+                .collect();
             self.batches.lock().unwrap().push(batch);
-            let message = ChatMessage::new(
-                ChatRole::Assistant,
-                vec![ChatMessageItem::ToolResult(ToolResultItem {
-                    tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
-                    result: ToolResultContent::from_text(format!(
-                        "tool batch {} done",
-                        handle.batch_id
-                    )),
-                })],
-            );
+            let message = ChatMessage::new(ChatRole::Assistant, results);
+            let _ = completion_tx.send(ToolBatchCompletion {
+                batch_id: handle.batch_id.clone(),
+                result: Ok(message),
+            });
+            Ok(handle)
+        }
+
+        fn interrupt(&self, _handle: &ToolBatchHandle) -> Result<(), ToolBatchError> {
+            Ok(())
+        }
+
+        fn finish(&self, _batch_id: &str) -> Result<(), ToolBatchError> {
+            Ok(())
+        }
+    }
+
+    struct ProgressEchoToolExecutor;
+
+    impl ToolBatchExecutor for ProgressEchoToolExecutor {
+        fn start(
+            &self,
+            batch: ToolBatch,
+            completion_tx: Sender<ToolBatchCompletion>,
+            progress_tx: Sender<ToolBatchProgress>,
+        ) -> Result<ToolBatchHandle, ToolBatchError> {
+            let handle = ToolBatchHandle::new(batch.batch_id.clone());
+            let results: Vec<ChatMessageItem> = batch
+                .operations
+                .iter()
+                .map(|operation| {
+                    let (tool_call_id, tool_name) = match &operation.item {
+                        ToolBatchItem::RegisteredTool(tool_call)
+                        | ToolBatchItem::UnsupportedTool { tool_call, .. } => {
+                            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
+                        }
+                    };
+                    let result = ToolResultItem {
+                        tool_call_id,
+                        tool_name,
+                        result: ToolResultContent::from_text(format!(
+                            "tool batch {} done",
+                            handle.batch_id
+                        )),
+                    };
+                    let _ = progress_tx.send(ToolBatchProgress {
+                        batch_id: handle.batch_id.clone(),
+                        result: result.clone(),
+                    });
+                    ChatMessageItem::ToolResult(result)
+                })
+                .collect();
+            let message = ChatMessage::new(ChatRole::Assistant, results);
             let _ = completion_tx.send(ToolBatchCompletion {
                 batch_id: handle.batch_id.clone(),
                 result: Ok(message),
@@ -3121,6 +3993,7 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id);
             let _ = completion_tx.send(ToolBatchCompletion {
@@ -3129,7 +4002,7 @@ mod tests {
                     ChatRole::Assistant,
                     vec![ChatMessageItem::ToolResult(ToolResultItem {
                         tool_call_id: "call_1".to_string(),
-                        tool_name: "image_load".to_string(),
+                        tool_name: "image_view".to_string(),
                         result: ToolResultContent::from_text("loaded image".to_string()).with_file(
                             FileItem {
                                 uri: "file:///tmp/test.png".to_string(),
@@ -3184,6 +4057,7 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id);
             if let Some(started_tx) = self.started_tx.lock().unwrap().take() {
@@ -3201,7 +4075,7 @@ mod tests {
                             ChatRole::Assistant,
                             vec![ChatMessageItem::ToolResult(ToolResultItem {
                                 tool_call_id: "call_1".to_string(),
-                                tool_name: "user_tell".to_string(),
+                                tool_name: "cron_tasks_list".to_string(),
                                 result: ToolResultContent::from_text("tool result".to_string()),
                             })],
                         )),
@@ -3230,6 +4104,7 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id);
             let _ = completion_tx.send(ToolBatchCompletion {
@@ -3267,6 +4142,7 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 10,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -3404,7 +4280,7 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "file_read".to_string(),
+                    tool_name: "shell_exec".to_string(),
                     arguments: ContextItem {
                         text: r#"{"path":"README.md"}"#.to_string(),
                     },
@@ -3414,7 +4290,7 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "file_read".to_string(),
+                    tool_name: "shell_exec".to_string(),
                     result: ToolResultContent::from_text("contents".to_string()),
                 })],
             ),
@@ -3487,8 +4363,63 @@ mod tests {
             .contains("Session kind: foreground"));
         assert!(seen_requests[0]
             .tool_names
-            .contains(&"file_read".to_string()));
+            .contains(&"shell_exec".to_string()));
         assert_eq!(seen_requests[0].message_count, 1);
+    }
+
+    #[test]
+    fn provider_system_prompt_replaces_common_prompt_section() {
+        let _cwd = temp_cwd("actor-provider-system-prompt");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(
+                    test_session_id("session_provider_system_prompt"),
+                    super::super::SessionType::Foreground,
+                ),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "hello".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(
+            ScriptedProvider::new(vec![ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "hi".to_string(),
+                })],
+            )])
+            .with_provider_system_prompt("provider native instructions"),
+        );
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider.clone(),
+            tools,
+            inbox,
+            events,
+            catalog,
+        );
+
+        let step = actor.run_until_idle(4).expect("actor should run");
+
+        assert_eq!(step, SessionActorStep::Idle);
+        let seen_requests = provider.seen_requests.lock().unwrap();
+        let system_prompt = seen_requests[0].system_prompt.as_ref().unwrap();
+        assert!(system_prompt.starts_with("provider native instructions"));
+        assert!(system_prompt.contains("Session kind: foreground"));
+        assert!(!system_prompt.contains("You are StellaClaw"));
     }
 
     #[test]
@@ -3723,6 +4654,9 @@ mod tests {
 
         actor
             .run_model_tool_loop("turn_retry", 1, 0)
+            .expect("request too large should start provider request");
+        actor
+            .run_until_idle(4)
             .expect("request too large should recover by pruning history");
 
         assert_eq!(*provider.calls.lock().unwrap(), 2);
@@ -3801,6 +4735,9 @@ mod tests {
 
         actor
             .run_model_tool_loop("turn_preflight", 1, 0)
+            .expect("oversized local estimate should start provider request");
+        actor
+            .run_until_idle(4)
             .expect("oversized local estimate should recover by pruning history before send");
 
         let seen_requests = provider.seen_requests.lock().unwrap();
@@ -3848,7 +4785,7 @@ mod tests {
         let mut actor = SessionActor::new(
             test_model_config(),
             provider,
-            tools,
+            tools.clone(),
             inbox,
             events.clone(),
             catalog,
@@ -3941,9 +4878,9 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
-                        text: r#"{"text":"working"}"#.to_string(),
+                        text: r#"{}"#.to_string(),
                     },
                 })],
             ),
@@ -3975,9 +4912,94 @@ mod tests {
         let batches = tools.batches.lock().unwrap();
         assert_eq!(batches.len(), 1);
         assert!(matches!(
-            batches[0].operations[0].operation,
-            ToolExecutionOp::ConversationBridge(_)
+            batches[0].operations[0].item,
+            ToolBatchItem::RegisteredTool(_)
         ));
+    }
+
+    #[test]
+    fn tool_results_emit_stream_event_before_durable_message() {
+        let _cwd = temp_cwd("actor-tool-result-stream-event");
+        let (inbox, mailbox) = test_inbox();
+        let session_id = test_session_id("session_tool_result_stream_event");
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(session_id, super::super::SessionType::Foreground),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "run tool".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{}"#.to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "done".to_string(),
+                })],
+            ),
+        ]));
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider,
+            Arc::new(ProgressEchoToolExecutor),
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        actor.run_until_idle(8).expect("actor should run");
+
+        let captured = events.events.lock().unwrap();
+        let progress_index = captured
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::StreamToolResultDone { tool_result, .. }
+                        if tool_result.tool_call_id == "call_1"
+                )
+            })
+            .expect("tool result stream event should be emitted");
+        let durable_index = captured
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::MessageAppended { message, .. }
+                        if message.data.iter().any(|item| matches!(
+                            item,
+                            ChatMessageItem::ToolResult(result)
+                                if result.tool_call_id == "call_1"
+                        ))
+                )
+            })
+            .expect("durable tool result message should be emitted");
+        assert!(progress_index < durable_index);
     }
 
     #[test]
@@ -4013,9 +5035,9 @@ mod tests {
                     ChatRole::Assistant,
                     vec![ChatMessageItem::ToolCall(ToolCallItem {
                         tool_call_id: "call_1".to_string(),
-                        tool_name: "user_tell".to_string(),
+                        tool_name: "not_a_catalog_tool".to_string(),
                         arguments: ContextItem {
-                            text: r#"{"text":"working"}"#.to_string(),
+                            text: r#"{}"#.to_string(),
                         },
                     })],
                 ),
@@ -4034,7 +5056,7 @@ mod tests {
             super::super::SessionType::Foreground,
         )
         .expect("catalog should build");
-        assert!(!catalog.contains("user_tell"));
+        assert!(!catalog.contains("not_a_catalog_tool"));
         let mut actor = SessionActor::new(
             model_config,
             provider,
@@ -4049,8 +5071,8 @@ mod tests {
         let batches = tools.batches.lock().unwrap();
         assert_eq!(batches.len(), 1);
         assert!(matches!(
-            batches[0].operations[0].operation,
-            ToolExecutionOp::UnsupportedTool { .. }
+            batches[0].operations[0].item,
+            ToolBatchItem::UnsupportedTool { .. }
         ));
     }
 
@@ -4082,7 +5104,7 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "image_load".to_string(),
+                    tool_name: "image_view".to_string(),
                     arguments: ContextItem {
                         text: r#"{"path":"test.png"}"#.to_string(),
                     },
@@ -4097,7 +5119,7 @@ mod tests {
         ]));
         let tools = Arc::new(MediaFileToolExecutor);
         let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
-            enable_native_image_load: true,
+            enable_native_image_view: true,
             ..BuiltinToolCatalogOptions::default()
         })
         .unwrap();
@@ -4172,7 +5194,7 @@ mod tests {
         actor.step().expect("initial should apply");
 
         let remote =
-            &actor.tool_catalog().get("file_read").unwrap().parameters["properties"]["remote"];
+            &actor.tool_catalog().get("shell_exec").unwrap().parameters["properties"]["remote"];
         assert_eq!(remote["type"], "string");
     }
 
@@ -4398,7 +5420,7 @@ mod tests {
         let mut restored = SessionActor::new(
             test_model_config(),
             provider,
-            tools,
+            tools.clone(),
             inbox,
             events.clone(),
             catalog,
@@ -4449,9 +5471,9 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
-                        text: r#"{"text":"working"}"#.to_string(),
+                        text: r#"{}"#.to_string(),
                     },
                 })],
             ),
@@ -4477,9 +5499,11 @@ mod tests {
             actor.step().expect("initial should apply"),
             SessionActorStep::ProcessedControl
         );
-        assert_eq!(
-            actor.step().expect("tool batch should start"),
-            SessionActorStep::WaitingToolBatch
+        step_until(
+            &mut actor,
+            SessionActorStep::WaitingToolBatch,
+            20,
+            "tool batch should start",
         );
         started_rx
             .recv()
@@ -4566,9 +5590,9 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
-                        text: r#"{"text":"working"}"#.to_string(),
+                        text: r#"{}"#.to_string(),
                     },
                 })],
             ),
@@ -4595,7 +5619,7 @@ mod tests {
         let mut actor = SessionActor::new(
             test_model_config(),
             provider,
-            tools,
+            tools.clone(),
             inbox,
             events.clone(),
             catalog,
@@ -4605,9 +5629,11 @@ mod tests {
             actor.step().expect("initial should apply"),
             SessionActorStep::ProcessedControl
         );
-        assert_eq!(
-            actor.step().expect("tool batch should start"),
-            SessionActorStep::WaitingToolBatch
+        step_until(
+            &mut actor,
+            SessionActorStep::WaitingToolBatch,
+            20,
+            "tool batch should start",
         );
         started_rx
             .recv()
@@ -4646,9 +5672,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(yielded, "interrupted batch should yield after completion");
-        assert_eq!(
-            actor.step().expect("new user message should run next"),
-            SessionActorStep::ProcessedData
+        step_until(
+            &mut actor,
+            SessionActorStep::ProcessedData,
+            20,
+            "new user message should run next",
         );
 
         let completed = events
@@ -4675,6 +5703,42 @@ mod tests {
         assert!(progress
             .iter()
             .all(|message| !message.contains("newer user message")));
+    }
+
+    #[test]
+    fn provider_supersede_grace_after_window_does_not_underflow() {
+        let _cwd = temp_cwd("actor-provider-supersede-grace-underflow");
+        let (inbox, _mailbox) = test_inbox();
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = ToolCatalog::new();
+        let mut actor =
+            SessionActor::new(test_model_config(), provider, tools, inbox, events, catalog);
+        actor.active_provider_request = Some(ActiveProviderRequest {
+            request_id: "request_1".to_string(),
+            message_id: "message_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            turn_number: 1,
+            step_index: 0,
+            request_too_large_attempts: 0,
+            started_at_ms: 0,
+            next_stream_event_index: 0,
+            last_activity_at: Instant::now() - PROVIDER_SUPERSEDE_GRACE - Duration::from_millis(1),
+        });
+        actor
+            .pending_data
+            .push_back(SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "interrupt after grace".to_string(),
+                    })],
+                ),
+            });
+
+        assert_eq!(actor.provider_supersede_grace_remaining(), None);
+        assert!(actor.has_ready_work());
     }
 
     #[test]
@@ -4705,9 +5769,9 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
-                        text: r#"{"text":"working"}"#.to_string(),
+                        text: r#"{}"#.to_string(),
                     },
                 })],
             ),
@@ -4727,7 +5791,7 @@ mod tests {
         let mut actor = SessionActor::new(
             test_model_config(),
             provider,
-            tools,
+            tools.clone(),
             inbox,
             events.clone(),
             catalog,
@@ -4807,15 +5871,18 @@ mod tests {
             ChatRole::Assistant,
             vec![ChatMessageItem::ToolCall(ToolCallItem {
                 tool_call_id: "call_orphan".to_string(),
-                tool_name: "user_tell".to_string(),
+                tool_name: "cron_tasks_list".to_string(),
                 arguments: ContextItem {
-                    text: r#"{"text":"orphaned"}"#.to_string(),
+                    text: r#"{}"#.to_string(),
                 },
             })],
         ));
 
         actor
             .run_model_tool_loop("turn_repair", 1, 0)
+            .expect("unclosed tool call should start provider request");
+        actor
+            .run_until_idle(4)
             .expect("unclosed tool call should be repaired");
 
         assert_eq!(count_unclosed_tool_calls(actor.history()), 0);
@@ -4841,9 +5908,9 @@ mod tests {
     }
 
     #[test]
-    fn update_plan_is_session_actor_state_and_clears_on_turn_completion() {
-        let _cwd = temp_cwd("actor-update-plan-state");
-        let session_id = test_session_id("session_update_plan_state");
+    fn update_plan_routes_through_conversation_bridge() {
+        let _cwd = temp_cwd("actor-update-plan-bridge");
+        let session_id = test_session_id("session_update_plan_bridge");
         let (inbox, mailbox) = test_inbox();
         mailbox.append(
             SessionMailboxKind::Control,
@@ -4900,19 +5967,12 @@ mod tests {
             actor.step().expect("initial should apply"),
             SessionActorStep::ProcessedControl
         );
-        assert_eq!(
-            actor
-                .step()
-                .expect("plan tool call should close and finish"),
-            SessionActorStep::ProcessedData
+        step_until(
+            &mut actor,
+            SessionActorStep::ProcessedData,
+            20,
+            "plan tool call should close and finish",
         );
-        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            SessionEvent::PlanUpdated { plan: Some(plan) }
-                if plan.plan.len() == 2
-                    && plan.plan[0].step == "Inspect state"
-                    && matches!(plan.plan[0].status, TaskPlanItemStatus::InProgress)
-        )));
         assert_eq!(count_unclosed_tool_calls(actor.history()), 0);
         assert!(actor.history().iter().any(|message| {
             message.data.iter().any(|item| {
@@ -4924,12 +5984,12 @@ mod tests {
                 )
             })
         }));
-        assert!(events
+        assert!(!events
             .events
             .lock()
             .unwrap()
             .iter()
-            .any(|event| matches!(event, SessionEvent::PlanUpdated { plan: None })));
+            .any(|event| matches!(event, SessionEvent::PlanUpdated { .. })));
         assert!(matches!(
             events.events.lock().unwrap().last(),
             Some(SessionEvent::TurnCompleted { .. })
@@ -4961,17 +6021,6 @@ mod tests {
                 ),
             },
         );
-        mailbox.append(
-            SessionMailboxKind::Data,
-            SessionRequest::EnqueueUserMessage {
-                message: ChatMessage::new(
-                    ChatRole::User,
-                    vec![ChatMessageItem::Context(ContextItem {
-                        text: "second request".to_string(),
-                    })],
-                ),
-            },
-        );
         let events = Arc::new(MemoryEventSink::default());
         let provider = Arc::new(ScriptedProvider::new(vec![
             ChatMessage::new(
@@ -4998,6 +6047,18 @@ mod tests {
         let (model_config, tokenizer_dir) = test_model_config_with_tokenizer();
         let mut actor = SessionActor::new(model_config, provider, tools, inbox, events, catalog);
 
+        actor.run_until_idle(4).expect("first turn should run");
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "second request".to_string(),
+                    })],
+                ),
+            },
+        );
         actor.run_until_idle(8).expect("actor should run");
 
         assert!(message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
@@ -5035,17 +6096,6 @@ mod tests {
                 ),
             },
         );
-        mailbox.append(
-            SessionMailboxKind::Data,
-            SessionRequest::EnqueueUserMessage {
-                message: ChatMessage::new(
-                    ChatRole::User,
-                    vec![ChatMessageItem::Context(ContextItem {
-                        text: "second request".to_string(),
-                    })],
-                ),
-            },
-        );
         let events = Arc::new(MemoryEventSink::default());
         let provider = Arc::new(ScriptedProvider::new(vec![
             ChatMessage::new(
@@ -5079,6 +6129,18 @@ mod tests {
             }],
         });
 
+        actor.run_until_idle(4).expect("first turn should run");
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "second request".to_string(),
+                    })],
+                ),
+            },
+        );
         actor.run_until_idle(8).expect("actor should run");
 
         assert!(actor
@@ -5306,12 +6368,74 @@ mod tests {
         fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
     }
 
+    #[test]
+    fn idle_compaction_respects_session_initial_switch() {
+        let _cwd = temp_cwd("actor-idle-compression-disabled");
+        let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_idle_compression_disabled"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(1_000);
+        initial.compression_retain_recent_tokens = Some(12);
+        initial.idle_timeout_compact_enabled = false;
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial { initial },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "old ".repeat(50),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "first final".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: compression_response("summary"),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let (mut model_config, tokenizer_dir) = test_model_config_with_tokenizer();
+        model_config.token_max_context = 64;
+        model_config.cache_timeout = 300;
+        let mut actor = SessionActor::new(model_config, provider, tools, inbox, events, catalog);
+
+        actor.run_until_idle(4).expect("actor should run");
+        actor.last_provider_request_started_at = Some(Instant::now() - Duration::from_secs(271));
+        actor.last_agent_returned_at = Some(Instant::now());
+        let compacted = actor
+            .try_run_idle_compaction()
+            .expect("idle compaction should not fail");
+
+        assert!(!compacted);
+        assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
+
+        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
+    }
+
     fn message_text_for_test(message: &ChatMessage) -> String {
         message
             .data
             .iter()
             .filter_map(|item| match item {
                 ChatMessageItem::Context(context) => Some(context.text.as_str()),
+                ChatMessageItem::Compaction(compaction) => compaction.generic_summary_text(),
                 _ => None,
             })
             .collect::<Vec<_>>()

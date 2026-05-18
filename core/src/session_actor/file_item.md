@@ -185,7 +185,7 @@ Tool output goes in `ToolResultContent.structured`. Pure text output should be w
   "type": "tool_result",
   "payload": {
     "tool_call_id": "call_1",
-    "tool_name": "image_load",
+    "tool_name": "image_view",
     "result": {
       "structured": {
         "kind": "json_result",

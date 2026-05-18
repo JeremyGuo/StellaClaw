@@ -147,6 +147,13 @@ impl OpenAiImageEditProvider {
 }
 
 impl ProviderBackend for OpenAiImageEditProvider {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -333,6 +340,7 @@ fn convert_image_response(
     }
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
@@ -383,6 +391,7 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 5,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,

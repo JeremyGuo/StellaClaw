@@ -455,8 +455,8 @@ ws://host:port/api/conversations/{id}/foreground/ws?token=&lt;web_token&gt;</cod
 // later
 { "type": "conversation_upserted", "conversation_id": "web-main-000001", "conversation": {...} } // create/rename/model/remote/sandbox/session summary change
 { "type": "conversation_processing", "conversation_id": "...", "processing_state": "typing", "running": true }
-{ "type": "conversation_turn_completed", "conversation_id": "...", "last_message_id": "42", "unread": true, "conversation": {...} }
-{ "type": "conversation_seen", "conversation_id": "...", "seen": { "last_seen_message_id": "42", "updated_at": "..." } }
+{ "type": "conversation_turn_completed", "conversation_id": "...", "last_message_id": "msg_00000000000000000042_abcd", "unread": true, "conversation": {...} }
+{ "type": "conversation_seen", "conversation_id": "...", "seen": { "last_seen_message_id": "msg_00000000000000000042_abcd", "updated_at": "..." } }
 { "type": "conversation_deleted", "conversation_id": "..." }</code></pre>
 
         <h3>Foreground session stream</h3>
@@ -467,7 +467,7 @@ ws://host:port/api/conversations/{id}/foreground/ws?token=&lt;web_token&gt;</cod
           </tbody>
         </table>
         <pre><code>// server -> client
-{ "type": "subscription_ack", "reason": "subscribed", "next_message_id": "12", "current_message_id": "11", "turn_progress": null }
+{ "type": "subscription_ack", "reason": "subscribed", "current_message_id": "msg_00000000000000000011_abcd", "next_message_index": 12, "turn_progress": null }
 { "type": "messages", "conversation_id": "...", "messages": [...] }
 { "type": "turn_progress", "turn_id": "...", "phase": "thinking|working|done|failed", "activity": "...", "plan": {...}, "progress": {...} }
 { "type": "error", "severity": "error", "message": "...", "can_continue": true }</code></pre>
@@ -517,14 +517,14 @@ ws://host:port/api/conversations/{id}/foreground/ws?token=&lt;web_token&gt;</cod
   "processing_state": "idle|typing",
   "running": false,
   "message_count": 43,
-  "last_message_id": "42",
+  "last_message_id": "msg_00000000000000000042_abcd",
   "last_message_time": "2026-04-30T...Z",
-  "last_seen_message_id": "42",
+  "last_seen_message_id": "msg_00000000000000000042_abcd",
   "last_seen_at": "2026-04-30T...Z"
 }</code></pre>
         <h3>MessageSkeleton</h3>
         <pre><code>{
-  "id": "42",
+  "id": "msg_00000000000000000042_abcd",
   "index": 42,
   "role": "user|assistant|system",
   "text": "plain rendered text",

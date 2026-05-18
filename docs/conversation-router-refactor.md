@@ -176,7 +176,7 @@ Two-way request/response protocols are owned by the request receiver. The servic
 
 Examples:
 
-- `CronService` owns `create_cron_task` request and `create_cron_task` response.
+- `CronService` owns `cron_task_create` request and `cron_task_create` response.
 - `SessionService` owns `start_session` request and `start_session` response.
 - `WorkspaceService` owns `read_file` request and `read_file` response.
 - `TerminalService` owns `create_terminal` request and `create_terminal` response.
@@ -473,7 +473,7 @@ payload={
 source=session(web-main-000001.foreground)
 target=service(cron)
 payload={
-  "action": "create_cron_task",
+  "action": "cron_task_create",
   "request_id": "...",
   "payload": { ... },
   "echo_data": {
@@ -487,13 +487,13 @@ payload={
 
 When a model inside a session calls a host tool or service-backed action, `SessionService` acts as the bridge from agent-server to the service bus.
 
-For example, a model call to `create_cron_task` becomes a packet:
+For example, a model call to `cron_task_create` becomes a packet:
 
 ```text
 source=session(web-main-000001.foreground)
 target=service(cron)
 payload={
-  "action": "create_cron_task",
+  "action": "cron_task_create",
   "request_id": "...",
   "payload": { ... },
   "echo_data": {
@@ -510,8 +510,8 @@ Tool/service action routing should come from a registry, not from ad hoc service
 Example mappings:
 
 ```text
-create_cron_task   -> service(cron)
-update_cron_task   -> service(cron)
+cron_task_create   -> service(cron)
+cron_task_update   -> service(cron)
 memory_search      -> service(memory)
 skill_create       -> service(skill)
 tool_binary_ensure -> service(tool_binary)
@@ -575,11 +575,11 @@ Cron does not need to persist full background-agent output by default. A backgro
 `CronService` owns the request/response protocols for:
 
 ```text
-list_cron_tasks
-get_cron_task
-create_cron_task
-update_cron_task
-remove_cron_task
+cron_tasks_list
+cron_task_get
+cron_task_create
+cron_task_update
+cron_task_remove
 ```
 
 ## Channel Service

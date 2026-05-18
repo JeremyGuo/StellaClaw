@@ -8,6 +8,7 @@ The Rust definitions live in `core/src/session_actor/chat_message.rs`.
 
 ```rust
 pub struct ChatMessage {
+    pub message_id: String,
     pub role: ChatRole,
     pub user_name: Option<String>,
     pub message_time: Option<String>,
@@ -16,19 +17,32 @@ pub struct ChatMessage {
 }
 ```
 
+### `message_id`
+
+Stable provider-neutral local ID for this persisted message. It is generated before a new message is appended and is used by stream events, Web queries, and seen state. Old histories are upgraded by assigning missing IDs.
+
 ### `role`
 
 The side that authored the message.
 
 - `ChatRole::User`: external user input, runtime notices, or synthetic user-side context inserted by the system.
 - `ChatRole::Assistant`: model output, including final text, reasoning, tool calls, tool results recorded during assistant turns, and assistant-generated files.
+- `ChatRole::Compaction`: synthetic compacted-history block produced by a provider or by the generic summary compactor. It is provider-neutral persistence, not a visible user/assistant turn. Providers decide whether to materialize it, pass it through as an opaque provider-specific item, or drop it entirely.
 
 Serialized as lowercase snake case:
 
 ```json
 { "role": "user" }
 { "role": "assistant" }
+{ "role": "compaction" }
 ```
+
+`ChatRole::Compaction` has special request behavior:
+
+- Codex subscription may replay opaque encrypted compaction payloads as Responses `compaction` items.
+- Providers without matching support should ignore provider-specific builtin payloads before context estimation and request translation.
+- Generic summary compaction stores human-readable summary text in `ChatMessageItem::Compaction`; default provider normalization materializes that summary as ordinary user-side context.
+- It should not be rendered as an ordinary chat message unless a debug or inspection UI intentionally exposes compacted context.
 
 ### `user_name`
 
@@ -104,6 +118,7 @@ USD cost values corresponding to the token buckets above.
 pub enum ChatMessageItem {
     Reasoning(ReasoningItem),
     Context(ContextItem),
+    Compaction(CompactionItem),
     SelectionReference(SelectionReferenceItem),
     File(FileItem),
     ToolCall(ToolCallItem),
@@ -136,6 +151,30 @@ Typical uses:
 - fallback text when media cannot be sent directly to a model
 
 `text` may contain structured strings such as JSON, XML-like tool-call fallbacks, or system-generated metadata blocks.
+
+### `Compaction`
+
+Structured compacted-history payload.
+
+```rust
+pub enum CompactionKind {
+    GenericSummary,
+    ProviderBuiltin,
+}
+
+pub struct CompactionItem {
+    pub kind: CompactionKind,
+    pub provider_type: Option<ProviderType>,
+    pub payload: serde_json::Value,
+}
+```
+
+Uses:
+
+- `generic_summary`: provider-neutral summary text stored as `{"text": "..."}`. Providers that do not support a specialized compact format should materialize this as user-side context.
+- `provider_builtin`: provider-specific compact state. Codex subscription stores Responses compact state as `provider_type = CodexSubscription` with `{"encrypted_content": "..."}` and replays it as a Responses `compaction` item.
+
+Provider-specific builtin compaction must not be sent to a different provider. Generic summary compaction is portable.
 
 ### `SelectionReference`
 
@@ -176,21 +215,26 @@ Model reasoning metadata.
 ```rust
 pub struct ReasoningItem {
     pub text: String,
-    pub codex_summary: Option<String>,
+    pub codex_summary: Vec<ReasoningSummaryPart>,
     pub codex_encrypted_content: Option<String>,
+}
+
+pub struct ReasoningSummaryPart {
+    pub text: String,
 }
 ```
 
 Fields:
 
 - `text`: visible or fallback reasoning text. Empty strings are omitted during serialization.
-- `codex_summary`: optional Codex reasoning summary.
+- `codex_summary`: ordered Codex reasoning summary parts.
 - `codex_encrypted_content`: optional encrypted Codex reasoning payload used for Codex Responses history replay.
 
 Behavior:
 
 - Plain reasoning is often dropped before provider requests.
 - Codex encrypted reasoning is preserved for Codex subscription replay.
+- Codex summary part order is preserved exactly as produced by the provider; callers should not sort or deduplicate it.
 - Reasoning should not be treated as ordinary user/assistant visible text unless a provider explicitly maps it that way.
 
 ### `File`
@@ -421,7 +465,7 @@ File-only tool result:
       "type": "tool_result",
       "payload": {
         "tool_call_id": "call_abc",
-        "tool_name": "image_load",
+        "tool_name": "image_view",
         "result": {
           "files": [
             {

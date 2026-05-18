@@ -2,12 +2,12 @@ import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState }
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
-import { ChevronDown, Download, FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
+import { ChevronDown, Copy, Download, FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, firstToolNameForMessage, isExecutionMessage, liveActivitySignature, markerIndexes, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { displayMessages, firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -28,10 +28,9 @@ const REASONING_EFFORTS = [
   { value: 'default', label: 'Default', description: '恢复模型默认 reasoning effort' }
 ];
 
-function serverMessageIndex(message) {
-  const index = Number(message?.index ?? message?.id);
-  return Number.isFinite(index) ? index : -1;
-}
+const VIRTUALIZE_ENTRY_THRESHOLD = 80;
+const VIRTUAL_ENTRY_ESTIMATE = 150;
+const VIRTUAL_OVERSCAN_PX = 1100;
 
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
@@ -104,9 +103,11 @@ function selectionSummary(selection) {
   return text.length > 28 ? `${text.slice(0, 28)}...` : text || '选区';
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
+  const renderEntries = useMemo(() => assistantTurnEntries(renderedMessages), [renderedMessages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
+  const entryKeys = useMemo(() => renderEntries.map((entry, index) => entryKey(entry, index)), [renderEntries]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
   const newestMessageKey = useMemo(() => {
     const message = messages.at(-1);
@@ -122,7 +123,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const modeLabel = typeof mode === 'string' ? mode : mode?.label || '本地';
   const modeTone = typeof mode === 'string' ? '' : mode?.tone || 'local';
   const modeTitle = typeof mode === 'string' ? mode : mode?.title || modeLabel;
-  const [typingKeys, setTypingKeys] = useState(() => new Set());
   const [commandPanel, setCommandPanel] = useState('commands');
   const [models, setModels] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -139,21 +139,52 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const lastEnterKeyUpAtRef = useRef(0);
   const suppressNextEnterRef = useRef(false);
   const scrollRef = useRef(null);
+  const contentRef = useRef(null);
+  const virtualHeightsRef = useRef(new Map());
   const previousCountRef = useRef(0);
   const loadingOlderRef = useRef(false);
   const prependAdjustRef = useRef(null);
   const stickToBottomRef = useRef(true);
-  const knownMessagesRef = useRef(new Set());
-  const typedMessagesRef = useRef(new Set());
-  const typewriterHydratedRef = useRef(false);
-  const newestSeenIndexRef = useRef(-1);
+  const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
+  const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
+  const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
   const currentActivity = (runningActivities || []).at(-1) || null;
+  const inlineActivity = shouldShowInlineActivity(currentActivity) ? currentActivity : null;
   const progressVisible = Boolean(currentActivity);
-  const turnStoppedAfterTool = useMemo(() => {
-    if (!messagesReady || currentActivity || !messages.length) return false;
+  const sessionRunning = Boolean(processing || currentActivity);
+  const pendingAssistantVisible = shouldShowPendingAssistant(renderEntries, currentActivity, sending, processing);
+  const responseSpacerVisible = Boolean(pendingAssistantVisible && renderedMessages.length > 0 && !modelSelectionPending);
+  const latestAssistantTurnIndex = useMemo(() => {
+    for (let index = renderEntries.length - 1; index >= 0; index -= 1) {
+      if (renderEntries[index]?.type === 'assistantTurn') return index;
+    }
+    return -1;
+  }, [renderEntries]);
+  const virtualWindow = useMemo(() => virtualWindowForEntries({
+    entries: renderEntries,
+    keys: entryKeys,
+    heightCache: virtualHeightsRef.current,
+    heightVersion: virtualHeightVersion,
+    viewport,
+    activeIndex: latestAssistantTurnIndex
+  }), [renderEntries, entryKeys, virtualHeightVersion, viewport, latestAssistantTurnIndex]);
+  const toolStopNoticeCandidate = useMemo(() => {
+    if (!messagesReady || sending || processing || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
     return isExecutionMessage(lastMessage);
-  }, [messages, messagesReady, currentActivity]);
+  }, [messages, messagesReady, sending, processing, currentActivity]);
+  const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
+
+  useEffect(() => {
+    if (!toolStopNoticeCandidate) {
+      setToolStopNoticeReady(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setToolStopNoticeReady(true);
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [toolStopNoticeCandidate, newestMessageKey]);
 
   const updateComposerMetrics = () => {
     const node = composerRef.current;
@@ -165,6 +196,20 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       root?.style.setProperty('--composer-card-height', `${Math.ceil(composer.getBoundingClientRect().height)}px`);
     }
   };
+
+  function updateResponseSpacerMetrics() {
+    const list = scrollRef.current;
+    if (!list) return;
+    if (!responseSpacerVisible) {
+      list.style.setProperty('--response-spacer-height', '0px');
+      return;
+    }
+    const root = list.closest('.chat-workspace');
+    const composerHeight = root?.querySelector('.composer-wrap')?.getBoundingClientRect().height || 0;
+    const usableHeight = Math.max(160, list.clientHeight - composerHeight);
+    const height = Math.round(Math.min(48, Math.max(12, usableHeight * 0.05)));
+    list.style.setProperty('--response-spacer-height', `${height}px`);
+  }
 
   useLayoutEffect(() => {
     scrollRef.current?.style.setProperty('--progress-height', '0px');
@@ -180,6 +225,64 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (composer) observer.observe(composer);
     return () => observer.disconnect();
   }, []);
+
+  useLayoutEffect(() => {
+    updateResponseSpacerMetrics();
+    if (stickToBottomRef.current) {
+      requestAnimationFrame(scrollToBottom);
+    }
+  }, [responseSpacerVisible, activeMessageScope, renderedMessages.length, messages.length, newestMessageKey, messagesReady, activitySignature, pendingAssistantVisible]);
+
+  useLayoutEffect(() => {
+    const list = scrollRef.current;
+    const content = contentRef.current;
+    const composer = composerRef.current;
+    if (!list) return undefined;
+    const observer = new ResizeObserver(() => {
+      updateResponseSpacerMetrics();
+      syncViewport();
+      if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
+    });
+    observer.observe(list);
+    if (content) observer.observe(content);
+    if (composer) observer.observe(composer);
+    return () => observer.disconnect();
+  }, [responseSpacerVisible, activeMessageScope, renderEntries.length]);
+
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content || !virtualWindow.virtualized) return undefined;
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      let changed = false;
+      content.querySelectorAll('[data-virtual-key]').forEach((node) => {
+        const key = node.getAttribute('data-virtual-key');
+        if (!key) return;
+        const height = Math.ceil(node.getBoundingClientRect().height);
+        if (!Number.isFinite(height) || height <= 0) return;
+        if (Math.abs((virtualHeightsRef.current.get(key) || 0) - height) > 1) {
+          virtualHeightsRef.current.set(key, height);
+          changed = true;
+        }
+      });
+      if (changed) {
+        setVirtualHeightVersion((value) => value + 1);
+        if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
+      }
+    };
+    const scheduleMeasure = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(measure);
+    };
+    scheduleMeasure();
+    const observer = new ResizeObserver(scheduleMeasure);
+    content.querySelectorAll('[data-virtual-key]').forEach((node) => observer.observe(node));
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [virtualWindow.virtualized, virtualWindow.start, virtualWindow.end, activeMessageScope, newestMessageKey, activitySignature]);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -204,7 +307,21 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const scrollToBottom = () => {
     const list = scrollRef.current;
     if (!list) return;
-    list.scrollTop = list.scrollHeight;
+    list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+  };
+
+  const syncViewport = () => {
+    const list = scrollRef.current;
+    if (!list) return;
+    const next = {
+      scrollTop: list.scrollTop,
+      clientHeight: list.clientHeight
+    };
+    setViewport((current) => (
+      Math.abs(current.scrollTop - next.scrollTop) < 1 && Math.abs(current.clientHeight - next.clientHeight) < 1
+        ? current
+        : next
+    ));
   };
 
   useLayoutEffect(() => {
@@ -229,10 +346,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     loadingOlderRef.current = false;
     prependAdjustRef.current = null;
     stickToBottomRef.current = true;
-    knownMessagesRef.current = new Set();
-    typedMessagesRef.current = new Set();
-    typewriterHydratedRef.current = false;
-    newestSeenIndexRef.current = -1;
+    setViewport({ scrollTop: 0, clientHeight: scrollRef.current?.clientHeight || 0 });
     requestAnimationFrame(scrollToBottom);
     setDraft('');
     setComposerAttachments((current) => {
@@ -241,7 +355,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       });
       return [];
     });
-    setTypingKeys(new Set());
   }, [activeMessageScope]);
 
   useEffect(() => {
@@ -253,46 +366,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
     });
   }, []);
-
-  useEffect(() => {
-    const known = knownMessagesRef.current;
-    const maxIndex = messages.reduce((max, message) => Math.max(max, serverMessageIndex(message)), -1);
-    if (!messagesReady || !typewriterHydratedRef.current) {
-      messages.forEach((message, index) => {
-        const key = messageKey(message, index);
-        known.add(key);
-        if (shouldTypewriterMessage(message)) {
-          typedMessagesRef.current.add(`${key}:${messageText(message)}`);
-        }
-      });
-      newestSeenIndexRef.current = maxIndex;
-      typewriterHydratedRef.current = Boolean(messagesReady);
-      return;
-    }
-
-    const nextTyping = [];
-    const previousNewestIndex = newestSeenIndexRef.current;
-    messages.forEach((message, index) => {
-      const key = messageKey(message, index);
-      const signature = `${key}:${messageText(message)}`;
-      const isNew = !known.has(key);
-      known.add(key);
-      const isAppendedCurrentMessage = serverMessageIndex(message) > previousNewestIndex;
-      if (isNew && isAppendedCurrentMessage && shouldTypewriterMessage(message) && !typedMessagesRef.current.has(signature)) {
-        typedMessagesRef.current.add(signature);
-        nextTyping.push(key);
-      }
-    });
-    newestSeenIndexRef.current = Math.max(newestSeenIndexRef.current, maxIndex);
-
-    if (nextTyping.length > 0) {
-      setTypingKeys((current) => {
-        const next = new Set(current);
-        nextTyping.forEach((key) => next.add(key));
-        return next;
-      });
-    }
-  }, [messages, activeMessageScope, messagesReady]);
 
   const loadOlderPreservingViewport = async () => {
     const list = scrollRef.current;
@@ -337,6 +410,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const handleScroll = () => {
     const list = scrollRef.current;
     if (!list) return;
+    syncViewport();
     stickToBottomRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
     if (list.scrollTop <= 96) {
       loadOlderPreservingViewport();
@@ -462,30 +536,39 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
             <span>选择一个 Conversation，或者新建对话，让 Stellacode 帮你检查项目、修改代码、运行命令和整理上下文。</span>
           </div>
         ) : (
-          <>
-            {renderedMessages.map((message, index) => (
-              message.type === 'toolGroup'
-                ? <MemoToolProcessGroup key={message.id} group={message} />
-                : (
-                  <MemoMessageArticle
-                    key={messageKey(message, index)}
-                    message={message}
-                    typewriter={typingKeys.has(messageKey(message, index))}
-                    onOpenAttachment={onOpenAttachment}
-                    onDownloadAttachment={onDownloadAttachment}
-                    onTypewriterDone={() => {
-                      const key = messageKey(message, index);
-                      setTypingKeys((current) => {
-                        if (!current.has(key)) return current;
-                        const next = new Set(current);
-                        next.delete(key);
-                        return next;
-                      });
-                    }}
-                  />
-                )
+          <div className="message-stream-content" ref={contentRef}>
+            {virtualWindow.virtualized && virtualWindow.topPadding > 0 && (
+              <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.topPadding}px` }} aria-hidden="true" />
+            )}
+            {virtualWindow.items.map(({ entry, index, key }) => (
+              <div className="virtual-entry" key={key} data-virtual-key={key}>
+                {entry.type === 'assistantTurn'
+                  ? (
+                    <MemoAssistantTurn
+                      entry={entry}
+                      active={sessionRunning && index === latestAssistantTurnIndex}
+                      onOpenAttachment={onOpenAttachment}
+                      onDownloadAttachment={onDownloadAttachment}
+                      onResolveAttachmentUrl={onResolveAttachmentUrl}
+                      onOpenLocalLink={onOpenLocalLink}
+                    />
+                  )
+                  : (
+                    <MemoMessageArticle
+                      message={entry.message}
+                      onOpenAttachment={onOpenAttachment}
+                      onDownloadAttachment={onDownloadAttachment}
+                      onResolveAttachmentUrl={onResolveAttachmentUrl}
+                      onOpenLocalLink={onOpenLocalLink}
+                    />
+                  )}
+              </div>
             ))}
-            {currentActivity && <InlineActivityStatus activity={currentActivity} />}
+            {virtualWindow.virtualized && virtualWindow.bottomPadding > 0 && (
+              <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.bottomPadding}px` }} aria-hidden="true" />
+            )}
+            {pendingAssistantVisible && <PendingAssistantPlaceholder />}
+            {inlineActivity && <InlineActivityStatus activity={inlineActivity} />}
             {turnStoppedAfterTool && (
               <div className="turn-continuation-notice">
                 <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
@@ -494,7 +577,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                 </button>
               </div>
             )}
-          </>
+            <div className="response-spacer" aria-hidden="true" />
+          </div>
         )}
       </div>
       <LiveActivityStack activities={runningActivities} progressRef={progressRef} />
@@ -697,6 +781,106 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   );
 }
 
+function entryKey(entry, index) {
+  if (entry?.type === 'assistantTurn') return entry.id || `assistant-turn-${index}`;
+  return messageKey(entry?.message, index);
+}
+
+function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeIndex }) {
+  const count = entries.length;
+  if (count <= VIRTUALIZE_ENTRY_THRESHOLD) {
+    return {
+      virtualized: false,
+      start: 0,
+      end: Math.max(0, count - 1),
+      topPadding: 0,
+      bottomPadding: 0,
+      items: entries.map((entry, index) => ({ entry, index, key: keys[index] || entryKey(entry, index) }))
+    };
+  }
+  const heights = keys.map((key) => heightCache.get(key) || VIRTUAL_ENTRY_ESTIMATE);
+  const offsets = new Array(count + 1);
+  offsets[0] = 0;
+  for (let index = 0; index < count; index += 1) {
+    offsets[index + 1] = offsets[index] + heights[index];
+  }
+  const top = Math.max(0, Number(viewport.scrollTop || 0) - VIRTUAL_OVERSCAN_PX);
+  const bottom = Math.max(top, Number(viewport.scrollTop || 0) + Number(viewport.clientHeight || 0) + VIRTUAL_OVERSCAN_PX);
+  let start = 0;
+  while (start < count - 1 && offsets[start + 1] < top) start += 1;
+  let end = start;
+  while (end < count - 1 && offsets[end] < bottom) end += 1;
+  if (Number.isFinite(activeIndex) && activeIndex >= 0) {
+    start = Math.min(start, Math.max(0, activeIndex - 2));
+    end = Math.max(end, Math.min(count - 1, activeIndex + 2));
+  }
+  return {
+    virtualized: true,
+    start,
+    end,
+    topPadding: offsets[start],
+    bottomPadding: Math.max(0, offsets[count] - offsets[end + 1]),
+    items: entries.slice(start, end + 1).map((entry, offset) => {
+      const index = start + offset;
+      return { entry, index, key: keys[index] || entryKey(entry, index) };
+    })
+  };
+}
+
+function shouldShowPendingAssistant(entries, currentActivity, sending, processing) {
+  const state = String(currentActivity?.state || '').toLowerCase();
+  const activityId = String(currentActivity?.id || '').trim();
+  const active = Boolean(sending || processing || (currentActivity && state !== 'done' && state !== 'failed'));
+  if (!active) return false;
+  if (activityId.startsWith('stream-assistant-') || activityId.startsWith('stream-reasoning-') || activityId.startsWith('stream-tool-')) return false;
+  const lastUserIndex = findLastEntryIndex(entries, (entry) => (
+    entry?.type === 'message' && String(entry.message?.role || '').toLowerCase() === 'user'
+  ));
+  if (lastUserIndex < 0) return false;
+  const hasAssistantAfterUser = entries.slice(lastUserIndex + 1).some((entry) => {
+    if (entry?.type === 'assistantTurn') return true;
+    if (entry?.type !== 'message') return false;
+    return String(entry.message?.role || '').toLowerCase() === 'assistant';
+  });
+  return !hasAssistantAfterUser;
+}
+
+function findLastEntryIndex(entries, predicate) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (predicate(entries[index])) return index;
+  }
+  return -1;
+}
+
+function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }) {
+  return (
+    <div className={`pending-assistant-placeholder${compact ? ' compact' : ''}`} aria-live="polite">
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function assistantTurnEntries(renderedMessages) {
+  const entries = [];
+  for (let index = 0; index < renderedMessages.length; index += 1) {
+    const message = renderedMessages[index];
+    if (message?.type !== 'toolGroup') {
+      entries.push({ type: 'message', id: messageKey(message, index), message });
+      continue;
+    }
+    const nextMessage = renderedMessages[index + 1];
+    const finalMessage = isFinalAssistantMessage(nextMessage) ? nextMessage : null;
+    entries.push({
+      type: 'assistantTurn',
+      id: `turn-${message.id || messageKey(message.messages?.[0], index)}`,
+      processGroup: message,
+      finalMessage
+    });
+    if (finalMessage) index += 1;
+  }
+  return entries;
+}
+
 function ModelSelectionGate({ models, loading, error, onReload, onChoose }) {
   return (
     <section className="model-gate">
@@ -749,6 +933,13 @@ function InlineActivityStatus({ activity }) {
       {detail && <code>{detail}</code>}
     </div>
   );
+}
+
+function shouldShowInlineActivity(activity) {
+  if (!activity) return false;
+  const state = String(activity?.state || 'running').toLowerCase();
+  if (state === 'failed') return true;
+  return false;
 }
 
 function ActivityStatus({ activity }) {
@@ -847,31 +1038,115 @@ function planStatusMark(status) {
   return '○';
 }
 
-export function MessageArticle({ message, typewriter = false, onTypewriterDone, onOpenAttachment, onDownloadAttachment }) {
+export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
   const className = messageArticleClassName(message);
+  const roleName = String(message.role || '').toLowerCase();
+  const auxiliaryMessages = Array.isArray(message._auxiliary) ? message._auxiliary : [];
   return (
     <article className={className}>
-      <div className="message-role">
-        <span>{role}</span>
-        {Array.isArray(message._auxiliary) && message._auxiliary.length > 0 && (
-          <AuxiliaryDots messages={message._auxiliary} />
-        )}
-      </div>
-      <MessageBody message={message} typewriter={typewriter} onTypewriterDone={onTypewriterDone} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      {message.pending && <div className="message-status">正在发送...</div>}
-      {message.error && <div className="message-status error">{message.error}</div>}
-      {String(message.role || '').toLowerCase() === 'assistant' && (
-        <TokenUsage usage={usage} />
+      {auxiliaryMessages.length > 0 && (
+        <div className="message-role">
+          <span>{role}</span>
+          <AuxiliaryDots messages={auxiliaryMessages} />
+        </div>
       )}
+      <MessageBody message={message} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
+      {(roleName === 'user' || (roleName === 'assistant' && !message._streaming)) && (
+        <MessageActionBar message={message} role={roleName} usage={usage} />
+      )}
+      {message.pending && <div className="message-status">正在发送...</div>}
+      {!message.pending && message.queued && <div className="message-status">已排队</div>}
+      {message.error && <div className="message-status error">{message.error}</div>}
     </article>
   );
+}
+
+function MessageActionBar({ message, role, usage }) {
+  const [copied, setCopied] = useState(false);
+  const text = messageText(message).trim();
+  const replyTime = role === 'assistant' ? formatMessageTime(message?.message_time || message?.time || message?.created_at) : '';
+  const showUsage = role === 'assistant' && Number(usage?.total || 0) > 0;
+  if (!text && !replyTime && !showUsage) return null;
+  const copyMessage = async () => {
+    if (!text) return;
+    try {
+      await navigator.clipboard?.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <div className={`message-actions ${role}`} aria-label="消息操作">
+      {text && (
+        <button className="message-action-button" type="button" onClick={copyMessage} title={copied ? '已复制' : '复制消息'} aria-label={copied ? '已复制' : '复制消息'}>
+          <Copy size={15} strokeWidth={1.8} aria-hidden="true" />
+        </button>
+      )}
+      {replyTime && <span className="message-reply-time">{replyTime}</span>}
+      {showUsage && <TokenUsage usage={usage} />}
+    </div>
+  );
+}
+
+function formatMessageTime(value) {
+  const date = parseMessageDate(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  const now = new Date();
+  const dateParts = systemDateParts(date);
+  const nowParts = systemDateParts(now);
+  const clock = systemClock(date);
+  if (dateParts.year === nowParts.year && dateParts.month === nowParts.month && dateParts.day === nowParts.day) return clock;
+  return `${dateParts.month}/${dateParts.day} ${clock}`;
+}
+
+function parseMessageDate(value) {
+  if (!value) return new Date(Number.NaN);
+  const raw = String(value).trim();
+  if (!raw) return new Date(Number.NaN);
+  const hasExplicitZone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  const looksLikeDateTime = /^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}/.test(raw);
+  const normalized = looksLikeDateTime && !hasExplicitZone ? `${raw.replace(' ', 'T')}Z` : raw;
+  return new Date(normalized);
+}
+
+function systemDateParts(date) {
+  const parts = new Intl.DateTimeFormat(undefined, {
+    timeZone: systemTimeZone(),
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric'
+  }).formatToParts(date);
+  return {
+    year: Number(parts.find((part) => part.type === 'year')?.value || 0),
+    month: Number(parts.find((part) => part.type === 'month')?.value || 0),
+    day: Number(parts.find((part) => part.type === 'day')?.value || 0)
+  };
+}
+
+function systemClock(date) {
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone: systemTimeZone(),
+    hour: 'numeric',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  }).format(date);
+}
+
+function systemTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
 
 function messageArticleClassName(message) {
   const classes = ['message', message.role || 'assistant'];
   if (message._forceSeparate) classes.push('force-separate');
+  if (message._streaming) classes.push('streaming');
+  if (message.pending) classes.push('pending');
+  if (message.queued) classes.push('queued');
+  if (message._streamFailed) classes.push('stream-failed');
   const itemList = Array.isArray(message?.items) ? message.items : [];
   if (itemList.some((item) => item?.type === 'selection_reference')) {
     classes.push('has-selection-reference');
@@ -891,9 +1166,13 @@ function messageArticleClassName(message) {
 }
 
 const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
-  if (previous.message !== next.message || previous.typewriter !== next.typewriter) return false;
-  if (previous.onOpenAttachment !== next.onOpenAttachment || previous.onDownloadAttachment !== next.onDownloadAttachment) return false;
-  if (previous.typewriter || next.typewriter) return previous.onTypewriterDone === next.onTypewriterDone;
+  if (previous.message !== next.message) return false;
+  if (
+    previous.onOpenAttachment !== next.onOpenAttachment
+    || previous.onDownloadAttachment !== next.onDownloadAttachment
+    || previous.onResolveAttachmentUrl !== next.onResolveAttachmentUrl
+    || previous.onOpenLocalLink !== next.onOpenLocalLink
+  ) return false;
   return true;
 });
 
@@ -973,8 +1252,28 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-export function ToolProcessGroup({ group }) {
-  const [open, setOpen] = useState(false);
+export function AssistantTurn({ entry, active = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  const finalMessage = entry.finalMessage;
+  const complete = isFinalAssistantMessage(finalMessage);
+  return (
+    <section className={`assistant-turn${active ? ' active' : ''}${complete ? ' complete' : ''}`}>
+      <MemoToolProcessGroup group={entry.processGroup} active={active} />
+      {finalMessage && (
+        <MemoMessageArticle
+          message={finalMessage}
+          onOpenAttachment={onOpenAttachment}
+          onDownloadAttachment={onDownloadAttachment}
+          onResolveAttachmentUrl={onResolveAttachmentUrl}
+          onOpenLocalLink={onOpenLocalLink}
+        />
+      )}
+    </section>
+  );
+}
+
+const MemoAssistantTurn = memo(AssistantTurn);
+
+export function ToolProcessGroup({ group, active = false }) {
   const messages = group.messages || [];
   const expandedRows = useMemo(() => messages.map((message, index) => {
     const { textMessage, toolCards, segments } = splitMessageForDisplay(message);
@@ -986,61 +1285,363 @@ export function ToolProcessGroup({ group }) {
       usage: tokenUsage(message)
     };
   }), [messages]);
-  const cards = useMemo(() => expandedRows.flatMap((row) => row.toolCards), [expandedRows]);
-  const firstName = useMemo(() => firstToolNameForMessage(messages[0]), [messages]);
-  const summary = useMemo(() => toolGroupSummary(cards, messages, firstName), [cards, messages, firstName]);
-  const done = useMemo(() => Boolean(group.nextMessage) || toolCardsAreComplete(cards), [cards, group.nextMessage]);
-  const shouldAutoCollapse = Boolean(group.nextMessage);
-  const elapsed = '';
+  const blocks = useMemo(() => toolProcessBlocks(expandedRows), [expandedRows]);
+  const activeTail = active && !group.nextMessage;
+  const lastToolBlockIndex = useMemo(() => {
+    for (let index = blocks.length - 1; index >= 0; index -= 1) {
+      if (blocks[index]?.type === 'tools') return index;
+    }
+    return -1;
+  }, [blocks]);
+  const hasFinalMessage = isFinalAssistantMessage(group.nextMessage);
+  const toolsComplete = useMemo(() => {
+    const toolBlocks = blocks.filter((block) => block.type === 'tools');
+    return toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards));
+  }, [blocks]);
+  const waitingForNextItem = activeTail && toolsComplete && !hasFinalMessage;
+  const complete = !activeTail && (hasFinalMessage || toolsComplete);
+  const [open, setOpen] = useState(() => !hasFinalMessage);
+  const wasActiveTailRef = useRef(activeTail);
+  const hadFinalMessageRef = useRef(hasFinalMessage);
   useEffect(() => {
-    setOpen(!shouldAutoCollapse);
-  }, [shouldAutoCollapse]);
+    if (activeTail && !wasActiveTailRef.current) {
+      setOpen(true);
+    }
+    wasActiveTailRef.current = activeTail;
+  }, [activeTail]);
+  useEffect(() => {
+    if (!hadFinalMessageRef.current && hasFinalMessage) {
+      setOpen(false);
+    }
+    hadFinalMessageRef.current = hasFinalMessage;
+  }, [hasFinalMessage]);
+  const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete);
+  const summary = useMemo(() => toolRoundSummary(blocks), [blocks]);
+  const title = toolRoundTitle(elapsed, complete, summary);
   return (
-    <details className="tool-process-group" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary>
-        <span>{done ? summary.doneTitle : summary.runningTitle}{elapsed}</span>
-      </summary>
-      {open && (
-        <div className="tool-process-body">
-          {expandedRows.map((row) => {
-            const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
-            const text = row.textMessage ? messageText(row.textMessage) : '';
-            let renderedCardIndex = 0;
-            return (
-              <Fragment key={row.id}>
-                {text && <MarkdownContent className="tool-note" text={text} attachments={attachments} />}
-                {(row.segments || [{ notes: [], cards: row.toolCards }]).map((segment, segmentIndex) => (
-                  <Fragment key={`${row.id}-segment-${segmentIndex}`}>
-                    {segment.notes?.map((note, noteIndex) => (
-                      note.kind === 'reasoning'
-                        ? <ReasoningNote key={`${row.id}-${segmentIndex}-note-${noteIndex}`} text={note.text} />
-                        : <MarkdownContent key={`${row.id}-${segmentIndex}-note-${noteIndex}`} className="tool-note" text={note.text} attachments={attachments} />
-                    ))}
-                    {segment.cards.map((card, cardIndex) => {
-                      const showRowUsage = renderedCardIndex === row.toolCards.length - 1;
-                      renderedCardIndex += 1;
-                      return (
-                        <ToolInlineCard
-                          key={`${row.id}-${segmentIndex}-card-${cardIndex}`}
-                          kind={card.kind}
-                          name={card.name}
-                          payload={card.payload}
-                          usage={showRowUsage ? row.usage : null}
-                        />
-                      );
-                    })}
-                  </Fragment>
-                ))}
-              </Fragment>
-            );
-          })}
+    <section className={`tool-process-group${open ? ' open' : ''}${complete ? ' complete' : ''}${activeTail ? ' active' : ''}`}>
+      <button className="tool-round-toggle" type="button" onClick={() => setOpen((value) => !value)}>
+        <span>{title}</span>
+        {summary.total > 0 && <em>{summary.label}</em>}
+        <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
+      </button>
+      {!open && summary.total > 0 && (
+        <div className="tool-round-compact" aria-hidden="true">
+          {summary.names.slice(0, 4).map((name, index) => (
+            <code key={`${name}-${index}`}>{name}</code>
+          ))}
+          {summary.extra > 0 && <code>+{summary.extra}</code>}
         </div>
       )}
-    </details>
+      <div className="tool-round-separator" aria-hidden="true" />
+      {open && (
+        <div className="tool-process-round-body">
+          {blocks.map((block, index) => {
+            if (block.type === 'tools') {
+              const cardsComplete = toolCardsAreComplete(block.cards);
+              return (
+                <ToolProcessSegment
+                  key={block.id}
+                  block={block}
+                  complete={complete || cardsComplete}
+                  running={!cardsComplete && index === lastToolBlockIndex && activeTail}
+                />
+              );
+            }
+            return block.kind === 'reasoning'
+              ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
+              : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} typewriter={!complete && activeTail} />;
+          })}
+          {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在思考" />}
+        </div>
+      )}
+    </section>
   );
 }
 
 const MemoToolProcessGroup = memo(ToolProcessGroup);
+
+function useToolRoundElapsed(messages, nextMessage, complete) {
+  const startMsRef = useRef(toolRoundStartMs(messages));
+  const finalElapsedMsRef = useRef(null);
+  const wasLiveRef = useRef(!complete);
+  const [tickMs, setTickMs] = useState(() => Date.now());
+
+  if (!complete) {
+    wasLiveRef.current = true;
+  } else if (wasLiveRef.current && finalElapsedMsRef.current === null) {
+    finalElapsedMsRef.current = Math.max(0, Date.now() - startMsRef.current);
+  }
+
+  useEffect(() => {
+    if (complete) return undefined;
+    const timer = window.setInterval(() => {
+      setTickMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [complete]);
+
+  if (complete) {
+    const elapsedMs = finalElapsedMsRef.current ?? toolRoundElapsedMs(messages, nextMessage);
+    return elapsedMs !== null ? formatElapsedMs(elapsedMs) : '';
+  }
+  return formatElapsedMs(Math.max(0, tickMs - startMsRef.current));
+}
+
+function toolRoundStartMs(messages) {
+  const times = (messages || [])
+    .map(messageTimeMs)
+    .filter((value) => Number.isFinite(value));
+  return times.length > 0 ? Math.min(...times) : Date.now();
+}
+
+function toolRoundTitle(elapsed, complete, summary = {}) {
+  const prefix = complete ? '已处理' : '处理中';
+  const detail = elapsed ? ` ${elapsed}` : '';
+  if (summary.reasoning > 0 && summary.tools === 0) return `${prefix}${detail} · 思考`;
+  if (summary.tools > 0) return `${prefix}${detail} · 工具`;
+  return `${prefix}${detail}`;
+}
+
+function toolRoundSummary(blocks) {
+  const names = [];
+  let reasoning = 0;
+  for (const block of blocks || []) {
+    if (block?.kind === 'reasoning') reasoning += 1;
+    if (block?.type !== 'tools') continue;
+    for (const card of mergedToolCards(block.cards || [])) {
+      const name = String(card.name || 'tool').trim() || 'tool';
+      if (!names.includes(name)) names.push(name);
+    }
+  }
+  const parts = [];
+  if (reasoning > 0) parts.push(`${reasoning} 思考`);
+  if (names.length > 0) parts.push(`${names.length} 工具`);
+  return {
+    reasoning,
+    tools: names.length,
+    names,
+    extra: Math.max(0, names.length - 4),
+    total: reasoning + names.length,
+    label: parts.join(' · ')
+  };
+}
+
+function toolRoundElapsedMs(messages, nextMessage) {
+  const times = [...(messages || []), nextMessage]
+    .map(messageTimeMs)
+    .filter((value) => Number.isFinite(value));
+  if (times.length < 2) return null;
+  return Math.max(0, Math.max(...times) - Math.min(...times));
+}
+
+function messageTimeMs(message) {
+  const value = message?.message_time || message?.created_at || message?.time || '';
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatElapsedMs(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+function toolProcessBlocks(rows) {
+  const blocks = [];
+  let pendingCards = [];
+  let pendingId = '';
+  const flushTools = () => {
+    if (!pendingCards.length) return;
+    blocks.push({
+      type: 'tools',
+      id: pendingId || `tools-${blocks.length}`,
+      cards: pendingCards
+    });
+    pendingCards = [];
+    pendingId = '';
+  };
+  const pushNote = (note) => {
+    flushTools();
+    blocks.push(note);
+  };
+  rows.forEach((row) => {
+    const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
+    const text = row.textMessage ? messageText(row.textMessage) : '';
+    if (text) {
+      pushNote({
+        type: 'note',
+        kind: 'text',
+        id: `${row.id}-text`,
+        text,
+        attachments
+      });
+    }
+    let renderedCardIndex = 0;
+    (row.segments || [{ notes: [], cards: row.toolCards }]).forEach((segment, segmentIndex) => {
+      (segment.notes || []).forEach((note, noteIndex) => {
+        pushNote({
+          type: 'note',
+          kind: note.kind === 'reasoning' ? 'reasoning' : 'text',
+          id: `${row.id}-${segmentIndex}-note-${noteIndex}`,
+          text: note.text,
+          attachments
+        });
+      });
+      if (!segment.cards?.length) return;
+      const cards = segment.cards.map((card, cardIndex) => {
+        const rowUsage = renderedCardIndex === row.toolCards.length - 1 ? row.usage : null;
+        renderedCardIndex += 1;
+        return {
+          ...card,
+          renderId: `${row.id}-${segmentIndex}-card-${cardIndex}`,
+          sourceRowId: row.id,
+          sourceRowUsage: rowUsage
+        };
+      });
+      if (!pendingId) pendingId = `${row.id}-${segmentIndex}-tools`;
+      pendingCards = pendingCards.concat(cards);
+    });
+  });
+  flushTools();
+  return blocks;
+}
+
+function ToolProcessSegment({ block, complete, running = false }) {
+  const [open, setOpen] = useState(() => Boolean(running));
+  const manualOpenRef = useRef(false);
+  const wasRunningRef = useRef(Boolean(running));
+  const toolRows = useMemo(() => mergedToolCards(block.cards), [block.cards]);
+  const firstName = useMemo(() => block.cards[0]?.name || 'tool', [block.cards]);
+  const summary = useMemo(() => toolGroupSummary(block.cards, firstName), [block.cards, firstName]);
+  const title = complete ? summary.doneTitle : summary.runningTitle;
+  useEffect(() => {
+    if (running && !manualOpenRef.current) {
+      setOpen(true);
+    }
+    if (!running && wasRunningRef.current && complete && !manualOpenRef.current) {
+      setOpen(false);
+    }
+    wasRunningRef.current = running;
+  }, [complete, running]);
+  return (
+    <section className={`tool-process-segment${open ? ' open' : ''}${running ? ' running' : ''}`}>
+      <button
+        className="tool-process-toggle"
+        type="button"
+        onClick={() => {
+          manualOpenRef.current = true;
+          setOpen((value) => !value);
+        }}
+      >
+        <TerminalSquare size={15} strokeWidth={1.9} aria-hidden="true" />
+        <span>{title}</span>
+        <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="tool-process-body">
+          {toolRows.map((card) => (
+            <ToolInlineCard
+              key={card.renderId}
+              kind={card.kind}
+              name={card.name}
+              payload={card.payload}
+              callPayload={card.callPayload}
+              resultPayload={card.resultPayload}
+              usage={card.usage}
+              running={card.running}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function mergedToolCards(cards) {
+  const rows = [];
+  const byId = new Map();
+  cards.forEach((card, index) => {
+    const id = String(card.id || '').trim();
+    if (!id) {
+      rows.push({ order: index, call: card.kind === 'call' ? card : null, result: card.kind === 'result' ? card : null, sourceRowIds: new Set([card.sourceRowId].filter(Boolean)) });
+      return;
+    }
+    let row = byId.get(id);
+    if (!row) {
+      row = { order: index, call: null, result: null, sourceRowIds: new Set() };
+      byId.set(id, row);
+      rows.push(row);
+    }
+    if (card.sourceRowId) row.sourceRowIds.add(card.sourceRowId);
+    if (card.kind === 'result') {
+      row.result = card;
+    } else {
+      row.call = card;
+    }
+  });
+  const orderedRows = rows.sort((left, right) => left.order - right.order);
+  const usageBySourceRow = new Map();
+  cards.forEach((card) => {
+    if (card.sourceRowId && Number(card.sourceRowUsage?.total || 0)) {
+      usageBySourceRow.set(card.sourceRowId, card.sourceRowUsage);
+    }
+  });
+  const lastMergedRowBySource = new Map();
+  orderedRows.forEach((row) => {
+    row.sourceRowIds.forEach((sourceRowId) => {
+      lastMergedRowBySource.set(sourceRowId, row);
+    });
+  });
+  const usageByMergedRow = new Map();
+  usageBySourceRow.forEach((usage, sourceRowId) => {
+    const row = lastMergedRowBySource.get(sourceRowId);
+    if (row) usageByMergedRow.set(row, addToolUsage(usageByMergedRow.get(row), usage));
+  });
+  return orderedRows.map((row, index) => {
+    const call = row.call;
+    const result = row.result;
+    const displayCard = call || result;
+    const detailCard = result || call;
+    return {
+      renderId: call?.renderId || result?.renderId || `tool-row-${index}`,
+      id: displayCard?.id || detailCard?.id || '',
+      kind: result ? 'result' : 'call',
+      name: displayCard?.name || detailCard?.name || 'tool',
+      payload: displayCard?.payload ?? detailCard?.payload ?? '',
+      callPayload: call?.payload,
+      resultPayload: result?.payload,
+      usage: usageByMergedRow.get(row) || null,
+      running: Boolean(call && !result)
+    };
+  });
+}
+
+function addToolUsage(left, right) {
+  if (!Number(right?.total || 0)) return left || null;
+  if (!left) {
+    return {
+      input: Number(right.input || 0),
+      output: Number(right.output || 0),
+      cacheRead: Number(right.cacheRead || 0),
+      cacheWrite: Number(right.cacheWrite || 0),
+      total: Number(right.total || 0)
+    };
+  }
+  return {
+    input: Number(left.input || 0) + Number(right.input || 0),
+    output: Number(left.output || 0) + Number(right.output || 0),
+    cacheRead: Number(left.cacheRead || 0) + Number(right.cacheRead || 0),
+    cacheWrite: Number(left.cacheWrite || 0) + Number(right.cacheWrite || 0),
+    total: Number(left.total || 0) + Number(right.total || 0)
+  };
+}
 
 function toolCardsAreComplete(cards) {
   if (!cards.length) return false;
@@ -1058,37 +1659,43 @@ function toolCardsAreComplete(cards) {
   return hasResult && (open.size === 0 || cards.at(-1)?.kind === 'result');
 }
 
-export function MessageBody({ message, typewriter = false, onTypewriterDone, onOpenAttachment, onDownloadAttachment }) {
+export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const text = messageText(message);
+  const structuredItems = messageItems(message);
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
   const files = Array.isArray(message?.files) ? message.files : [];
   const allAttachments = [...attachments, ...files];
+  const typewriter = Boolean(message?._streaming && String(message?.role || '').toLowerCase() === 'assistant');
   const inlineIndexes = markerIndexes(text);
   const structuredAttachmentIndexes = new Set(
-    (Array.isArray(message?.items) ? message.items : [])
+    structuredItems
       .filter((item) => item?.type === 'file' && item.attachment_index !== undefined)
       .map((item) => Number(item.attachment_index))
       .filter((index) => Number.isFinite(index))
   );
+  const structuredAttachmentKeys = new Set(
+    structuredItems
+      .filter((item) => item?.type === 'file')
+      .map(attachmentIdentity)
+      .filter(Boolean)
+  );
   const trailingAttachments = allAttachments.filter((attachment, index) => {
     const attachmentIndex = Number(attachment?.index);
+    const key = attachmentIdentity(attachment);
     return !inlineIndexes.has(index)
       && !inlineIndexes.has(attachmentIndex)
       && !structuredAttachmentIndexes.has(index)
-      && !structuredAttachmentIndexes.has(attachmentIndex);
+      && !structuredAttachmentIndexes.has(attachmentIndex)
+      && !(key && structuredAttachmentKeys.has(key));
   });
   return (
     <div className="message-body">
-      {typewriter && text ? (
-        <TypewriterMarkdown className="message-text" text={text} attachments={allAttachments} onDone={onTypewriterDone} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      ) : Array.isArray(message?.items) && message.items.length > 0 ? (
-        <StructuredItems role={message?.role} items={message.items} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
+      {structuredItems.length > 0 ? (
+        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />
       ) : text ? (
-        <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      ) : trailingAttachments.length > 0 ? null : (
-        <div className="message-text muted">空消息</div>
-      )}
-      {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />}
+        <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />
+      ) : null}
+      {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
         <div className="message-attachments muted">正在加载附件...</div>
       )}
@@ -1099,7 +1706,25 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone, onO
   );
 }
 
-export function StructuredItems({ role, items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment }) {
+function attachmentIdentity(attachment) {
+  if (!attachment || typeof attachment !== 'object') return '';
+  const file = attachment.file && typeof attachment.file === 'object' ? attachment.file : {};
+  return String(
+    attachment.uri
+    || attachment.file_uri
+    || attachment.url
+    || attachment.path
+    || file.uri
+    || file.file_uri
+    || file.url
+    || file.path
+    || attachment.name
+    || attachment.filename
+    || ''
+  ).trim();
+}
+
+export function StructuredItems({ role, items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, typewriter = false }) {
   const orderedItems = orderedStructuredItems(items, role);
   const hasTextItem = orderedItems.some(({ item }) => typeof item === 'string' || item?.type === 'text');
   const hasSelectionReference = orderedItems.some(({ item }) => item?.type === 'selection_reference');
@@ -1107,13 +1732,13 @@ export function StructuredItems({ role, items, attachments, fallbackText, onOpen
   const rendered = orderedItems
     .map(({ item, index }) => {
       if (typeof item === 'string') {
-        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
+        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
       }
       if (item?.type === 'text') {
-        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
+        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
       }
       if (item?.type === 'file') {
-        return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
+        return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />;
       }
       if (item?.type === 'selection_reference') {
         return <SelectionReferenceCard key={index} selection={item.selection || item.payload || item} />;
@@ -1143,11 +1768,14 @@ export function StructuredItems({ role, items, attachments, fallbackText, onOpen
         attachments={attachments}
         onOpenAttachment={onOpenAttachment}
         onDownloadAttachment={onDownloadAttachment}
+        onResolveAttachmentUrl={onResolveAttachmentUrl}
+        onOpenLocalLink={onOpenLocalLink}
+        typewriter={typewriter}
       />
     );
   }
   if (rendered.length) return <>{rendered}</>;
-  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
+  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
 }
 
 function orderedStructuredItems(items, role) {
@@ -1183,9 +1811,25 @@ function SelectionReferenceCard({ selection }) {
   );
 }
 
-function ReasoningNote({ text }) {
+function ReasoningNote({ text, collapsible = false, defaultOpen = true, live = false }) {
   const value = String(text || '').trim();
+  const [open, setOpen] = useState(defaultOpen);
+  useEffect(() => {
+    if (live) setOpen(true);
+  }, [live]);
   if (!value) return null;
+  if (collapsible) {
+    return (
+      <div className={`reasoning-note collapsible${open ? ' open' : ''}${live ? ' live' : ''}`}>
+        <button type="button" onClick={() => setOpen((current) => !current)}>
+          <span>思考</span>
+          <em>{open ? '收起' : shortReasoningSummary(value)}</em>
+          <ChevronDown size={14} strokeWidth={1.9} aria-hidden="true" />
+        </button>
+        {open && <MarkdownContent className="reasoning-note-text" text={value} />}
+      </div>
+    );
+  }
   return (
     <div className="reasoning-note">
       <span>思考</span>
@@ -1194,52 +1838,15 @@ function ReasoningNote({ text }) {
   );
 }
 
-export function TypewriterMarkdown({ text, attachments = [], className = 'message-text', onDone, onOpenAttachment, onDownloadAttachment }) {
-  const value = String(text || '');
-  const [count, setCount] = useState(0);
-  const doneRef = useRef(false);
-
-  useEffect(() => {
-    setCount(0);
-    doneRef.current = false;
-  }, [value]);
-
-  useEffect(() => {
-    if (!value) return undefined;
-    let frame = 0;
-    let cancelled = false;
-    const total = value.length;
-    const step = Math.max(2, Math.ceil(total / 80));
-    const tick = () => {
-      if (cancelled) return;
-      setCount((current) => {
-        const next = Math.min(total, current + step);
-        if (next >= total && !doneRef.current) {
-          doneRef.current = true;
-          window.setTimeout(() => onDone?.(), 80);
-        }
-        return next;
-      });
-      frame = window.setTimeout(tick, 18);
-    };
-    frame = window.setTimeout(tick, 18);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(frame);
-    };
-  }, [value, onDone]);
-
-  return (
-    <div className="typewriter-message">
-      <MarkdownContent className={className} text={value.slice(0, count)} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      {count < value.length && <span className="typewriter-caret" aria-hidden="true" />}
-    </div>
-  );
+function shortReasoningSummary(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '展开';
+  return text.length > 72 ? `${text.slice(0, 72)}...` : text;
 }
 
-export function MarkdownContent({ text, attachments = [], className = 'markdown-content', onOpenAttachment, onDownloadAttachment }) {
-  const value = String(text || '');
-  if (!value.trim()) return <span className="message-empty">空消息</span>;
+export function MarkdownContent({ text, attachments = [], className = 'markdown-content', onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, typewriter = false }) {
+  const value = useTypewriterText(String(text || ''), typewriter);
+  if (!value.trim()) return null;
   const parts = [];
   const pattern = /(\[\[attachment:(\d+)]]|\[tool_(call|result)\s+([^\]\n]+)\]\s*([\s\S]*?)(?=\n\[tool_(?:call|result)\s+|$))/g;
   let cursor = 0;
@@ -1247,12 +1854,12 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   while ((match = pattern.exec(value)) !== null) {
     const before = value.slice(cursor, match.index);
     if (before.trim()) {
-      parts.push(<MarkdownBlock key={`text-${cursor}`} text={before} />);
+      parts.push(<MarkdownBlock key={`text-${cursor}`} text={before} onOpenLocalLink={onOpenLocalLink} />);
     }
     if (match[2] !== undefined) {
       const attachment = attachments[Number(match[2])];
       if (attachment) {
-        parts.push(<AttachmentCard key={`attachment-${match.index}`} attachment={attachment} inline onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />);
+        parts.push(<AttachmentCard key={`attachment-${match.index}`} attachment={attachment} inline onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />);
       }
     } else if (match[3]) {
       parts.push(
@@ -1268,25 +1875,80 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   }
   const rest = value.slice(cursor);
   if (rest.trim()) {
-    parts.push(<MarkdownBlock key={`text-${cursor}`} text={rest} />);
+    parts.push(<MarkdownBlock key={`text-${cursor}`} text={rest} onOpenLocalLink={onOpenLocalLink} />);
   }
-  return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} />}</div>;
+  return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} onOpenLocalLink={onOpenLocalLink} />}</div>;
 }
 
-export function MarkdownBlock({ text }) {
+function useTypewriterText(text, enabled) {
+  const target = String(text || '');
+  const targetRef = useRef(target);
+  const displayedRef = useRef(enabled ? '' : target);
+  const [displayed, setDisplayed] = useState(displayedRef.current);
+
+  useEffect(() => {
+    targetRef.current = target;
+    if (!enabled) {
+      displayedRef.current = target;
+      setDisplayed(target);
+      return;
+    }
+    if (!target.startsWith(displayedRef.current)) {
+      displayedRef.current = '';
+      setDisplayed('');
+    }
+  }, [target, enabled]);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const timer = window.setInterval(() => {
+      const current = displayedRef.current;
+      const nextTarget = targetRef.current;
+      if (current === nextTarget) return;
+      if (!nextTarget.startsWith(current)) {
+        displayedRef.current = nextTarget;
+        setDisplayed(nextTarget);
+        return;
+      }
+      const remaining = nextTarget.slice(current.length);
+      const step = Math.max(1, Math.min(10, Math.ceil(remaining.length / 5)));
+      const next = current + remaining.slice(0, step);
+      displayedRef.current = next;
+      setDisplayed(next);
+    }, 24);
+    return () => window.clearInterval(timer);
+  }, [enabled]);
+
+  return enabled ? displayed : target;
+}
+
+export function MarkdownBlock({ text, onOpenLocalLink }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeHighlight]}
       components={{
-        a: ({ node, ...props }) => (
-          <a
-            {...props}
-            target={isExternalUrl(props.href) ? '_blank' : undefined}
-            rel={isExternalUrl(props.href) ? 'noreferrer' : undefined}
-            onClick={(event) => handleExternalLinkClick(event, props.href)}
-          />
-        ),
+        a: ({ node, ...props }) => {
+          const href = String(props.href || '');
+          const external = isExternalUrl(href);
+          return (
+            <a
+              {...props}
+              target={external ? '_blank' : undefined}
+              rel={external ? 'noreferrer' : undefined}
+              onClick={(event) => {
+                if (external) {
+                  handleExternalLinkClick(event, href);
+                  return;
+                }
+                if (onOpenLocalLink?.(href)) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              }}
+            />
+          );
+        },
         img: ({ node, ...props }) => <img {...props} className="message-inline-image" loading="lazy" alt={props.alt || ''} />
       }}
     >
@@ -1295,23 +1957,63 @@ export function MarkdownBlock({ text }) {
   );
 }
 
-export function AttachmentList({ attachments, onOpenAttachment, onDownloadAttachment }) {
+export function AttachmentList({ attachments, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl }) {
   return (
     <div className="message-attachments">
       {attachments.map((attachment, index) => (
-        <AttachmentCard key={`${attachmentName(attachment)}-${attachment?.path || index}`} attachment={attachment} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
+        <AttachmentCard key={`${attachmentName(attachment)}-${attachment?.path || index}`} attachment={attachment} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />
       ))}
     </div>
   );
 }
 
-export function AttachmentCard({ attachment, inline = false, onOpenAttachment, onDownloadAttachment }) {
+function useResolvedAttachmentUrl(attachment, onResolveAttachmentUrl) {
+  const rawUrl = attachmentUrl(attachment);
+  const needsResolve = isResolvableLocalAttachmentUrl(rawUrl) || (!rawUrl && hasLocalAttachmentPath(attachment));
+  const initialUrl = needsResolve ? '' : rawUrl;
+  const [url, setUrl] = useState(initialUrl);
+  useEffect(() => {
+    let disposed = false;
+    const nextRawUrl = attachmentUrl(attachment);
+    const shouldResolve = isResolvableLocalAttachmentUrl(nextRawUrl) || (!nextRawUrl && hasLocalAttachmentPath(attachment));
+    setUrl(shouldResolve ? '' : nextRawUrl);
+    if (!shouldResolve || !onResolveAttachmentUrl) return undefined;
+    Promise.resolve(onResolveAttachmentUrl(attachment, nextRawUrl))
+      .then((resolvedUrl) => {
+        if (!disposed) setUrl(resolvedUrl || nextRawUrl || '');
+      })
+      .catch(() => {
+        if (!disposed) setUrl(nextRawUrl || '');
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [attachment, onResolveAttachmentUrl]);
+  return url;
+}
+
+function isResolvableLocalAttachmentUrl(value) {
+  const url = String(value || '').trim();
+  if (!url) return false;
+  if (/^(?:data:|blob:|https?:)/i.test(url)) return false;
+  if (/^file:/i.test(url)) return true;
+  return url.startsWith('/') || /^[A-Za-z]:[\\/]/.test(url);
+}
+
+function hasLocalAttachmentPath(attachment) {
+  const path = String(attachment?.path || attachment?.file_path || '').trim();
+  return Boolean(path && !/^(?:data:|blob:|https?:)/i.test(path));
+}
+
+export function AttachmentCard({ attachment, inline = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl }) {
   const name = attachmentName(attachment);
-  const url = attachmentUrl(attachment);
+  const url = useResolvedAttachmentUrl(attachment, onResolveAttachmentUrl);
   const size = formatBytes(attachment?.size_bytes || attachment?.size);
   const [loadedImageSize, setLoadedImageSize] = useState(null);
-  const canOpen = Boolean(onOpenAttachment && attachment?.path);
-  const canDownload = Boolean(onDownloadAttachment && attachment?.path);
+  const [imageFailed, setImageFailed] = useState(false);
+  const hasAttachmentLocation = Boolean(attachment?.path || attachment?.file_path || attachment?.uri || attachment?.file_uri || attachment?.url);
+  const canOpen = Boolean(onOpenAttachment && hasAttachmentLocation);
+  const canDownload = Boolean(onDownloadAttachment && hasAttachmentLocation);
   const openAttachment = () => {
     if (canOpen) onOpenAttachment(attachment);
   };
@@ -1320,17 +2022,22 @@ export function AttachmentCard({ attachment, inline = false, onOpenAttachment, o
     if (canDownload) onDownloadAttachment(attachment);
   };
   const meta = attachmentMeta(attachment, name);
+  useEffect(() => {
+    setImageFailed(false);
+    setLoadedImageSize(null);
+  }, [url]);
   if (isImageAttachment(attachment)) {
     const imageWidth = attachmentImageDisplayWidth(attachment, loadedImageSize);
     const imageStyle = imageWidth ? { '--attachment-image-width': `${imageWidth}px` } : undefined;
+    const showImage = Boolean(url && !imageFailed);
     return (
       <div
-        className={`message-attachment image${inline ? ' inline' : ''}${url ? '' : ' loading'}${canOpen ? ' clickable' : ''}`}
+        className={`message-attachment image${inline ? ' inline' : ''}${showImage ? '' : ' loading'}${canOpen ? ' clickable' : ''}`}
         style={imageStyle}
         title={canOpen ? `预览 ${name}` : name}
       >
         <button className="attachment-image-preview" type="button" onClick={openAttachment} disabled={!canOpen}>
-          {url ? (
+          {showImage ? (
           <img
             src={url}
             alt={name}
@@ -1341,8 +2048,9 @@ export function AttachmentCard({ attachment, inline = false, onOpenAttachment, o
                 setLoadedImageSize({ width: image.naturalWidth, height: image.naturalHeight });
               }
             }}
+            onError={() => setImageFailed(true)}
           />
-          ) : <span className="image-placeholder">正在加载图片</span>}
+          ) : <span className="image-placeholder">{imageFailed ? '无法加载图片' : '正在加载图片'}</span>}
         </button>
         <div className="attachment-image-caption">
           <span>{name}</span>
@@ -1490,14 +2198,32 @@ function toolDisplay(kind, name, payload) {
   const data = parseToolPayload(payload);
   const lowerName = String(name || '').toLowerCase();
   const isResult = kind === 'result';
-  if (lowerName.includes('shell')) {
+  if (lowerName.includes('shell') || lowerName.includes('command') || lowerName.includes('terminal') || lowerName.includes('stdin')) {
     const command = data.command || data.cmd || data.text || '';
     const outputSummary = isResult ? shellResultSummary(data) : '';
     return {
       title: isResult ? '已运行' : '运行',
-      chip: 'shell',
+      chip: name || 'shell',
       summary: outputSummary || command || 'shell command',
       detailTitle: 'Shell'
+    };
+  }
+  if (lowerName.includes('fetch') || lowerName.includes('browser') || lowerName.includes('open_url')) {
+    const url = data.url || data.href || data.uri || data.text || '';
+    return {
+      title: isResult ? '已抓取' : '抓取',
+      chip: name,
+      summary: url || 'Web page',
+      detailTitle: 'Web'
+    };
+  }
+  if (lowerName.includes('image') || lowerName.includes('screenshot')) {
+    const file = data.path || data.file_path || data.file || data.url || '';
+    return {
+      title: isResult ? '已查看' : '查看',
+      chip: name,
+      summary: file || 'Image',
+      detailTitle: 'Image'
     };
   }
   if (lowerName.includes('search') || lowerName.includes('grep') || lowerName === 'rg') {
@@ -1540,66 +2266,76 @@ function toolDisplay(kind, name, payload) {
   };
 }
 
-function compactFileName(path) {
-  return String(path || '').split('/').filter(Boolean).at(-1) || String(path || '');
-}
-
-function diffLabel(data) {
-  const added = data.added ?? data.additions ?? data.lines_added ?? data.bytes_written;
-  const removed = data.removed ?? data.deletions ?? data.lines_removed;
-  if (added === undefined && removed === undefined) return '';
-  return `+${Number(added || 0)} -${Number(removed || 0)}`;
-}
-
-function toolGroupSummary(cards, messages, fallbackName) {
-  const names = cards.map((card) => String(card.name || '').toLowerCase());
-  const editLike = names.some((name) => name.includes('edit') || name.includes('write') || name.includes('patch'));
-  const readLike = names.some((name) => name.includes('read'));
-  const searchLike = names.some((name) => name.includes('search') || name.includes('grep') || name === 'rg');
-  const shellLike = names.some((name) => name.includes('shell'));
-  const fileRows = [];
-  const seen = new Set();
-  cards.forEach((card) => {
-    const data = parseToolPayload(card.payload);
-    const lowerName = String(card.name || '').toLowerCase();
-    const path = data.path || data.file_path || data.file || data.target || '';
-    if (!path) return;
-    const isEdit = lowerName.includes('edit') || lowerName.includes('write') || lowerName.includes('patch');
-    const isRead = lowerName.includes('read');
-    if (!isEdit && !isRead) return;
-    const key = `${isEdit ? 'edit' : 'read'}:${path}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    fileRows.push({
-      action: isEdit ? '已编辑' : '已读取',
-      path: compactFileName(path),
-      diff: isEdit ? diffLabel(data) : ''
-    });
+function toolGroupSummary(cards, fallbackName) {
+  const records = toolOperationRecords(cards);
+  const counts = new Map();
+  records.forEach((card) => {
+    const category = toolCategory(card.name);
+    counts.set(category, (counts.get(category) || 0) + 1);
   });
-  const baseName = editLike ? '文件'
-    : searchLike ? '搜索'
-      : shellLike ? '命令'
-        : readLike ? '文件'
-          : fallbackName || '工具';
-  const doneTitle = editLike && fileRows.length
-    ? '已编辑文件'
-    : searchLike
-      ? '已搜索'
-      : shellLike
-        ? `已运行 ${fallbackName || '命令'}`
-        : `已处理 · ${baseName}`;
-  const runningTitle = editLike && fileRows.length
-    ? '正在编辑文件'
-    : searchLike
-      ? `正在搜索`
-      : shellLike
-        ? `正在运行 ${fallbackName || '命令'}`
-        : `正在处理 · ${baseName}`;
-  return {
-    doneTitle,
-    runningTitle,
-    fileRows
-  };
+  const parts = [
+    toolCountLabel(counts, 'search'),
+    toolCountLabel(counts, 'command'),
+    toolCountLabel(counts, 'edit'),
+    toolCountLabel(counts, 'fetch'),
+    toolCountLabel(counts, 'read'),
+    toolCountLabel(counts, 'image'),
+    toolCountLabel(counts, 'plan'),
+    toolCountLabel(counts, 'memory'),
+    toolCountLabel(counts, 'skill'),
+    toolCountLabel(counts, 'cron'),
+    toolCountLabel(counts, 'agent'),
+    toolCountLabel(counts, 'tool')
+  ].filter(Boolean);
+  const doneTitle = parts.join(' ') || `已处理 ${fallbackName || '工具'}`;
+  const runningTitle = `正在处理 ${fallbackName || '工具'}`;
+  return { doneTitle, runningTitle };
+}
+
+function toolOperationRecords(cards) {
+  const hasCalls = cards.some((card) => card.kind === 'call');
+  const seen = new Set();
+  return cards.filter((card, index) => {
+    if (hasCalls && card.kind !== 'call') return false;
+    const id = String(card.id || '').trim();
+    const key = id || `${card.kind}:${card.name || 'tool'}:${index}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function toolCategory(name) {
+  const lowerName = String(name || '').toLowerCase();
+  if (lowerName.includes('search') || lowerName.includes('grep') || lowerName === 'rg') return 'search';
+  if (lowerName.includes('shell') || lowerName.includes('command') || lowerName.includes('terminal') || lowerName.includes('stdin')) return 'command';
+  if (lowerName.includes('edit') || lowerName.includes('write') || lowerName.includes('patch')) return 'edit';
+  if (lowerName.includes('fetch') || lowerName.includes('browser') || lowerName.includes('open_url')) return 'fetch';
+  if (lowerName.includes('file_read') || lowerName.includes('read')) return 'read';
+  if (lowerName.includes('image') || lowerName.includes('screenshot')) return 'image';
+  if (lowerName.includes('plan')) return 'plan';
+  if (lowerName.includes('memory')) return 'memory';
+  if (lowerName.includes('skill')) return 'skill';
+  if (lowerName.includes('cron') || lowerName.includes('automation')) return 'cron';
+  if (lowerName.includes('agent') || lowerName.includes('subagent')) return 'agent';
+  return 'tool';
+}
+
+function toolCountLabel(counts, category) {
+  const count = counts.get(category) || 0;
+  if (!count) return '';
+  if (category === 'search') return `已探索 ${count} 次搜索`;
+  if (category === 'command') return `已运行 ${count} 条命令`;
+  if (category === 'edit') return `已编辑 ${count} 次`;
+  if (category === 'fetch') return `已抓取 ${count} 个网页`;
+  if (category === 'read') return `已读取 ${count} 个文件`;
+  if (category === 'image') return `已查看 ${count} 张图片`;
+  if (category === 'plan') return count === 1 ? '已更新计划' : `已更新 ${count} 次计划`;
+  if (category === 'memory') return `已访问 ${count} 次记忆`;
+  if (category === 'skill') return `已运行 ${count} 个技能`;
+  if (category === 'cron') return `已处理 ${count} 个定时任务`;
+  if (category === 'agent') return `已运行 ${count} 个代理`;
+  return `已调用 ${count} 个工具`;
 }
 
 function ToolDetail({ title, name, payload }) {
@@ -1957,18 +2693,31 @@ function diffMarker(type) {
   return ' ';
 }
 
-export function ToolInlineCard({ kind, name, payload, usage }) {
+export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, usage, running = false }) {
   const display = toolDisplay(kind, name, payload);
+  const hasMergedPayload = callPayload !== undefined || resultPayload !== undefined;
   return (
-    <details className={`tool-inline-card ${kind}`}>
+    <details className={`tool-inline-card ${kind}${running ? ' running' : ''}`}>
       <summary>
         <span>{display.title}</span>
         <code>{display.chip}</code>
         <em>{display.summary}</em>
         <InlineTokenUsage usage={usage} />
-        <i className="tool-detail-dot" aria-hidden="true" />
       </summary>
-      <ToolDetail title={display.detailTitle} name={name} payload={payload} />
+      {hasMergedPayload ? (
+        <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} />
+      ) : (
+        <ToolDetail title={display.detailTitle} name={name} payload={payload} />
+      )}
     </details>
+  );
+}
+
+function MergedToolDetail({ name, callPayload, resultPayload }) {
+  return (
+    <div className="merged-tool-detail">
+      {callPayload !== undefined ? <ToolDetail title="调用参数" name={name} payload={callPayload} /> : null}
+      {resultPayload !== undefined ? <ToolDetail title="工具结果" name={name} payload={resultPayload} /> : null}
+    </div>
   );
 }

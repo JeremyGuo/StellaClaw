@@ -55,6 +55,14 @@ impl Default for RetryMode {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MultimodalEstimatorConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +108,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub max_tokens: u64,
     pub cache_timeout: u64,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub idle_timeout_compact_enabled: bool,
     #[serde(default = "default_conn_timeout")]
     pub conn_timeout: u64,
     #[serde(default = "default_request_timeout")]
@@ -184,6 +194,7 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 30,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -267,6 +278,7 @@ mod tests {
             token_max_context: 200_000,
             max_tokens: 0,
             cache_timeout: 120,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 10,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -308,10 +320,31 @@ mod tests {
             }
         );
         assert_eq!(config.max_tokens, 0);
+        assert!(config.idle_timeout_compact_enabled);
         assert_eq!(config.effective_max_tokens(), 128000);
         assert_eq!(config.conn_timeout_secs(), 2);
         assert_eq!(config.request_timeout_secs(), 600);
         assert_eq!(config.max_request_size_bytes(), 30 * 1024 * 1024);
+    }
+
+    #[test]
+    fn model_config_allows_disabling_idle_timeout_compaction() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "open_router_completion",
+            "model_name": "openai/gpt-4o-mini",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "capabilities": ["chat"],
+            "token_max_context": 128000,
+            "cache_timeout": 300,
+            "idle_timeout_compact_enabled": false,
+            "token_estimator_type": "local"
+        }))
+        .expect("model config should deserialize");
+
+        assert!(!config.idle_timeout_compact_enabled);
+        let json = serde_json::to_value(&config).expect("model config serializes");
+        assert_eq!(json["idle_timeout_compact_enabled"], false);
     }
 
     #[test]

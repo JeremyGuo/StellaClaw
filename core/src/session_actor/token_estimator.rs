@@ -570,6 +570,11 @@ fn render_message_content(message: &ChatMessage) -> String {
             ChatMessageItem::Context(context) => {
                 sections.push(context.text.clone());
             }
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    sections.push(text.to_string());
+                }
+            }
             ChatMessageItem::SelectionReference(selection) => {
                 sections.push(selection.to_prompt_text());
             }
@@ -598,6 +603,7 @@ fn render_openai_message_content(message: &ChatMessage) -> String {
     for item in &message.data {
         match item {
             ChatMessageItem::Reasoning(_)
+            | ChatMessageItem::Compaction(_)
             | ChatMessageItem::File(_)
             | ChatMessageItem::ToolCall(_) => {}
             ChatMessageItem::Context(context) => {
@@ -687,6 +693,7 @@ fn collect_message_files(message: &ChatMessage) -> Vec<FileItem> {
                 files.extend(tool_result.result.files.iter().cloned());
             }
             ChatMessageItem::Reasoning(_)
+            | ChatMessageItem::Compaction(_)
             | ChatMessageItem::Context(_)
             | ChatMessageItem::SelectionReference(_)
             | ChatMessageItem::ToolCall(_) => {}
@@ -730,6 +737,7 @@ fn role_name(role: &ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Compaction => "compaction",
     }
 }
 
@@ -936,7 +944,7 @@ mod tests {
         let messages = vec![ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::Reasoning(ReasoningItem::codex(
-                None,
+                Vec::new(),
                 Some("a".repeat(1_000)),
                 None,
             ))],
@@ -1346,6 +1354,7 @@ tool reference
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 10,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -1394,6 +1403,7 @@ tool reference
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 10,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,

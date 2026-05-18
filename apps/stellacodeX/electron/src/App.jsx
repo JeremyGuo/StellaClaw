@@ -7,17 +7,24 @@ import {
   connectionInfo,
   conversationStreamUrl,
   createConversation,
+  createForegroundSession,
   deleteConversation,
+  deleteForegroundSession,
   displayConversationName,
+  displayForegroundSessionName,
+  foregroundSessions,
   markConversationSeen,
   loadConversations,
   loadMessages,
   loadModels,
-  loadStatus,
   loadWorkspace,
   loadWorkspaceFile,
+  normalizeConversationSummary,
+  normalizeForegroundSessionSummary,
   postConversationMessage,
-  renameConversation
+  renameConversation,
+  renameForegroundSession,
+  selectedForegroundSessionId
 } from './lib/api';
 import { ConversationBar } from './components/ConversationBar';
 import { WindowChrome } from './components/WindowChrome';
@@ -27,13 +34,15 @@ import { WorkspacePanel } from './components/WorkspacePanel';
 import { FilePreviewPanel } from './components/FilePreviewPanel';
 import { TerminalDock } from './components/TerminalDock';
 import { NewConversationDialog } from './components/NewConversationDialog';
+import { RenameConversationDialog, RenameSessionDialog } from './components/RenameConversationDialog';
+import { ConversationPropertiesDialog } from './components/ConversationPropertiesDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
-import { fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
-import { activityFromMessages, addUsageTotals, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastMessageId, lastServerMessageId, liveActivitySignature, mergeMessages, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
+import { attachmentName, fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
+import { activityFromMessages, addUsageTotals, committedMessageProtocolMismatches, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
 import { effectiveThemeMode, themeCssVariables } from './lib/theme';
 import { collectDroppedFiles, packFilesToTarGz, uploadPayloadStats } from './lib/uploadArchive';
-import { normalizeWorkspacePath, parentWorkspacePath, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
+import { normalizeWorkspacePath, parentWorkspacePath, workspaceDisplayRoot, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
 
 const SIDEBAR_EXPANDED = 286;
 const SIDEBAR_COLLAPSED = 0;
@@ -45,10 +54,79 @@ const TERMINAL_LIST_MIN = 180;
 const TERMINAL_LIST_MAX = 360;
 const MAX_UPLOAD_COMPRESSED_BYTES = 10 * 1024 * 1024;
 const PDF_PREVIEW_MAX_BYTES = 50 * 1024 * 1024;
+const MESSAGE_IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
 const MIN_DISPLAY_FONT_SIZE = 11;
 const MAX_DISPLAY_FONT_SIZE = 18;
 const MIN_UI_SCALE = 0.8;
 const MAX_UI_SCALE = 1.4;
+const MESSAGE_CACHE_LIMIT = 240;
+const LOCAL_CACHE_MAX_BYTES = 1_500_000;
+const LOCAL_CACHE_PREFIX = 'stellacode.cache.v1';
+
+function localCacheKey(kind, parts) {
+  return `${LOCAL_CACHE_PREFIX}:${kind}:${parts.map((part) => encodeURIComponent(String(part ?? ''))).join(':')}`;
+}
+
+function readLocalCache(kind, parts) {
+  if (typeof window === 'undefined' || !window.localStorage) return null;
+  try {
+    const raw = window.localStorage.getItem(localCacheKey(kind, parts));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalCache(kind, parts, value) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    const raw = JSON.stringify({ saved_at: Date.now(), value });
+    if (raw.length > LOCAL_CACHE_MAX_BYTES) return;
+    window.localStorage.setItem(localCacheKey(kind, parts), raw);
+  } catch {
+    // Cache writes are opportunistic.
+  }
+}
+
+function removeLocalCache(kind, parts) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.removeItem(localCacheKey(kind, parts));
+  } catch {
+    // Cache invalidation is best-effort.
+  }
+}
+
+function durableMessagesForCache(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => (
+      message
+      && !message._streaming
+      && !message._optimistic
+      && !message.pending
+      && !message.queued
+      && !message._userMessageStarted
+    ))
+    .sort((left, right) => messageIndex(left) - messageIndex(right))
+    .slice(-MESSAGE_CACHE_LIMIT);
+}
+
+function readMessageCache(serverId, conversationId, foregroundSessionId) {
+  return readLocalCache('messages', [serverId, conversationId, foregroundSessionId || 'main']) || [];
+}
+
+function writeMessageCache(serverId, conversationId, foregroundSessionId, messages) {
+  const durable = durableMessagesForCache(messages);
+  if (durable.length > 0) {
+    writeLocalCache('messages', [serverId, conversationId, foregroundSessionId || 'main'], durable);
+  }
+}
+
+function removeMessageCache(serverId, conversationId, foregroundSessionId) {
+  removeLocalCache('messages', [serverId, conversationId, foregroundSessionId || 'main']);
+}
 
 function setPxVariable(element, name, value) {
   if (!Number.isFinite(value)) return;
@@ -93,6 +171,130 @@ function safeDecodeUriComponent(value) {
   } catch {
     return value;
   }
+}
+
+function filePathFromFileUri(value) {
+  const raw = String(value || '').trim();
+  if (!/^file:/i.test(raw)) return '';
+  try {
+    return decodeURIComponent(new URL(raw).pathname);
+  } catch {
+    return '';
+  }
+}
+
+function normalizeAbsolutePath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function isAbsolutePath(value) {
+  const raw = String(value || '').trim();
+  return raw.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw);
+}
+
+function pathRelativeToRoot(path, root) {
+  const absolutePath = normalizeAbsolutePath(path);
+  const absoluteRoot = normalizeAbsolutePath(root);
+  if (!absolutePath || !absoluteRoot) return '';
+  if (absolutePath === absoluteRoot) return '';
+  const prefix = `${absoluteRoot}/`;
+  if (!absolutePath.startsWith(prefix)) return '';
+  return normalizeWorkspacePath(absolutePath.slice(prefix.length));
+}
+
+function localAttachmentPath(attachment, rawUrl = '') {
+  const uriPath = filePathFromFileUri(rawUrl)
+    || filePathFromFileUri(attachment?.uri)
+    || filePathFromFileUri(attachment?.file_uri)
+    || filePathFromFileUri(attachment?.url);
+  if (uriPath) return uriPath;
+  return String(attachment?.path || attachment?.file_path || attachment?.src || '').trim();
+}
+
+function attachmentWorkspacePath(attachment, rawUrl, workspaceRoots = []) {
+  const explicit = String(
+    attachment?.workspace_path
+    || attachment?.relative_path
+    || attachment?.workspace_relative_path
+    || ''
+  ).trim();
+  if (explicit) return normalizeWorkspacePath(explicit);
+  const path = localAttachmentPath(attachment, rawUrl);
+  if (!path) return '';
+  if (!isAbsolutePath(path) && !/^file:/i.test(path) && !/^[a-z][a-z0-9+.-]*:/i.test(path)) {
+    return normalizeWorkspacePath(path);
+  }
+  for (const root of workspaceRoots) {
+    const relative = pathRelativeToRoot(path, root);
+    if (relative) return relative;
+  }
+  return '';
+}
+
+function conversationFileTargetFromPath(value) {
+  const path = normalizeAbsolutePath(value);
+  const match = path.match(/(?:^|\/)conversations\/([^/]+)\/(.+)$/);
+  if (!match) return null;
+  const conversationId = match[1];
+  const relativePath = normalizeWorkspacePath(match[2]);
+  if (!conversationId || !relativePath) return null;
+  return { conversationId, path: relativePath };
+}
+
+function workspaceTargetFromLocalLink(rawHref, fallbackConversationId, workspaceRoots = []) {
+  const raw = String(rawHref || '').trim();
+  if (!raw || raw.startsWith('#') || /^(?:https?:|mailto:|data:|blob:|javascript:)/i.test(raw)) {
+    return null;
+  }
+  const withoutHash = raw.split('#', 1)[0];
+  const withoutQuery = withoutHash.split('?', 1)[0];
+  const decoded = safeDecodeUriComponent(withoutQuery);
+  const localPath = filePathFromFileUri(decoded) || decoded;
+  if (!localPath) return null;
+  const explicitDirectory = /\/$/.test(localPath);
+  const absoluteTarget = conversationFileTargetFromPath(localPath);
+  if (absoluteTarget) {
+    return { ...absoluteTarget, explicitDirectory };
+  }
+  if (isAbsolutePath(localPath)) {
+    for (const root of workspaceRoots) {
+      if (normalizeAbsolutePath(localPath) === normalizeAbsolutePath(root)) {
+        return { conversationId: fallbackConversationId, path: '', explicitDirectory: true };
+      }
+      const relative = pathRelativeToRoot(localPath, root);
+      if (relative) {
+        return { conversationId: fallbackConversationId, path: relative, explicitDirectory };
+      }
+    }
+    return null;
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(localPath)) return null;
+  const path = normalizeWorkspacePath(localPath);
+  if (!path || !fallbackConversationId) return null;
+  return { conversationId: fallbackConversationId, path, explicitDirectory };
+}
+
+function attachmentConversationFileTarget(attachment, rawUrl, fallbackConversationId, workspaceRoots = []) {
+  const absoluteTarget = conversationFileTargetFromPath(localAttachmentPath(attachment, rawUrl));
+  if (absoluteTarget) return absoluteTarget;
+  const path = attachmentWorkspacePath(attachment, rawUrl, workspaceRoots);
+  if (!path || !fallbackConversationId) return null;
+  return { conversationId: fallbackConversationId, path };
+}
+
+function attachmentCacheKey(serverId, conversationId, path, attachment, rawUrl = '') {
+  return [
+    serverId,
+    conversationId,
+    path,
+    rawUrl,
+    attachment?.uri,
+    attachment?.file_uri,
+    attachment?.path,
+    attachment?.name
+  ].map((value) => String(value || '')).join('|');
 }
 
 function applyChromeMetrics(metrics) {
@@ -201,30 +403,35 @@ function revokeFilePreviewUrls(files = []) {
 }
 
 function maxMessageId(...values) {
-  let max = -1;
+  let best;
+  let bestOrder = -1;
   for (const value of values) {
-    const number = Number(value);
-    if (Number.isFinite(number)) max = Math.max(max, number);
+    const order = messageOrderFromId(value);
+    if (order !== undefined && order >= bestOrder) {
+      best = String(value);
+      bestOrder = order;
+    }
   }
-  return max >= 0 ? String(max) : undefined;
+  return best;
 }
 
 function compareMessageIds(left, right) {
-  const leftNumber = Number(left);
-  const rightNumber = Number(right);
-  if (!Number.isFinite(leftNumber) && !Number.isFinite(rightNumber)) return 0;
-  if (!Number.isFinite(leftNumber)) return -1;
-  if (!Number.isFinite(rightNumber)) return 1;
-  return leftNumber === rightNumber ? 0 : leftNumber > rightNumber ? 1 : -1;
+  const leftOrder = messageOrderFromId(left);
+  const rightOrder = messageOrderFromId(right);
+  if (leftOrder === undefined && rightOrder === undefined) return 0;
+  if (leftOrder === undefined) return -1;
+  if (rightOrder === undefined) return 1;
+  return leftOrder === rightOrder ? 0 : leftOrder > rightOrder ? 1 : -1;
 }
 
 function mergeConversationSummary(existing, incoming) {
+  incoming = normalizeConversationSummary(incoming);
   if (!existing) return incoming;
   if (!incoming) return existing;
+  existing = normalizeConversationSummary(existing);
   const incomingHasNewerMessage = compareMessageIds(incoming.last_message_id, existing.last_message_id) >= 0;
   const seen = maxMessageId(existing.last_seen_message_id, incoming.last_seen_message_id);
-  const incomingSeen = Number(incoming?.last_seen_message_id);
-  const existingSeen = Number(existing?.last_seen_message_id);
+  const incomingSeenIsNewer = compareMessageIds(incoming?.last_seen_message_id, existing?.last_seen_message_id) >= 0;
   const merged = {
     ...existing,
     ...incoming,
@@ -242,13 +449,61 @@ function mergeConversationSummary(existing, incoming) {
   return {
     ...merged,
     last_seen_message_id: seen,
-    last_seen_at: Number.isFinite(incomingSeen) && (!Number.isFinite(existingSeen) || incomingSeen >= existingSeen)
+    last_seen_at: incomingSeenIsNewer
       ? incoming?.last_seen_at
       : existing?.last_seen_at
   };
 }
 
+function patchConversationForegroundSession(conversation, sessionId, patch) {
+  const targetSessionId = String(sessionId || 'main');
+  const sessions = foregroundSessions(conversation);
+  let found = false;
+  const nextSessions = sessions.map((session) => {
+    const currentId = String(session?.id || 'main');
+    if (currentId !== targetSessionId) return session;
+    found = true;
+    return normalizeForegroundSessionSummary({ ...session, ...patch, id: currentId }, conversation);
+  });
+  if (!found) {
+    nextSessions.push(normalizeForegroundSessionSummary({
+      id: targetSessionId,
+      session_id: targetSessionId,
+      is_main: targetSessionId === 'main',
+      ...patch
+    }, conversation));
+  }
+  return {
+    ...conversation,
+    ...(targetSessionId === 'main' ? patch : {}),
+    foreground_sessions: nextSessions
+  };
+}
+
+function nextForegroundSessionName(conversation) {
+  const existingNames = new Set(
+    foregroundSessions(conversation)
+      .map((session) => displayForegroundSessionName(session, conversation).trim())
+      .filter(Boolean)
+  );
+  let index = Math.max(2, existingNames.size + 1);
+  while (existingNames.has(`Session ${index}`)) index += 1;
+  return `Session ${index}`;
+}
+
+function createLocalForegroundSessionId(conversation) {
+  const existingIds = new Set(foregroundSessions(conversation).map((session) => String(session?.id || 'main')));
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const id = `session_${Date.now().toString(36)}_${suffix}`;
+    if (!existingIds.has(id)) return id;
+  }
+  return `session_${Date.now().toString(36)}`;
+}
+
 function applyConversationStreamEvent(current, payload) {
+  const type = String(payload?.type || '');
+  const eventType = type.startsWith('home.') ? type.slice('home.'.length) : type;
   const sort = (list) => [...list].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
   const upsert = (list, incoming) => {
     if (!incoming?.conversation_id) return list;
@@ -261,21 +516,65 @@ function applyConversationStreamEvent(current, payload) {
     ));
   };
 
-  if (payload.type === 'conversation_snapshot') {
+  if (eventType === 'snapshot' || eventType === 'conversation_snapshot') {
     const existingById = new Map(current.map((conversation) => [conversation.conversation_id, conversation]));
     return (payload.conversations || [])
       .map((conversation) => mergeConversationSummary(existingById.get(conversation.conversation_id), conversation));
   }
 
-  if (payload.type === 'conversation_upserted') {
+  if (eventType === 'conversation_upserted') {
     return upsert(current, payload.conversation);
   }
 
-  if (payload.type === 'conversation_deleted' && payload.conversation_id) {
+  if (eventType === 'conversation_updated' && payload.conversation_id) {
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? normalizeConversationSummary({
+          ...conversation,
+          ...(payload.patch || {}),
+          conversation_id: payload.conversation_id
+        })
+        : conversation
+    ));
+  }
+
+  if (eventType === 'foreground_session_upserted' && payload.conversation_id && payload.foreground_session) {
+    const session = payload.foreground_session;
+    const sessionId = session.id || session.foreground_session_id || 'main';
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? patchConversationForegroundSession(conversation, sessionId, session)
+        : conversation
+    ));
+  }
+
+  if (eventType === 'foreground_session_updated' && payload.conversation_id) {
+    const foregroundSessionId = payload.foreground_session_id || payload.session_id || 'main';
+    const patch = payload.patch?.foreground_session || payload.patch || {};
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? patchConversationForegroundSession(conversation, foregroundSessionId, patch)
+        : conversation
+    ));
+  }
+
+  if (eventType === 'foreground_session_deleted' && payload.conversation_id) {
+    const foregroundSessionId = String(payload.foreground_session_id || 'main');
+    return current.map((conversation) => {
+      if (conversation.conversation_id !== payload.conversation_id) return conversation;
+      return {
+        ...conversation,
+        foreground_sessions: foregroundSessions(conversation)
+          .filter((session) => String(session?.id || 'main') !== foregroundSessionId)
+      };
+    });
+  }
+
+  if (eventType === 'conversation_deleted' && payload.conversation_id) {
     return current.filter((conversation) => conversation.conversation_id !== payload.conversation_id);
   }
 
-  if (payload.type === 'conversation_processing' && payload.conversation_id) {
+  if (eventType === 'conversation_processing' && payload.conversation_id) {
     return current.map((conversation) => (
       conversation.conversation_id === payload.conversation_id
         ? {
@@ -287,7 +586,7 @@ function applyConversationStreamEvent(current, payload) {
     ));
   }
 
-  if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
+  if (eventType === 'conversation_turn_completed' && payload.conversation_id) {
     const incoming = {
       ...(payload.conversation || {}),
       conversation_id: payload.conversation_id,
@@ -303,11 +602,32 @@ function applyConversationStreamEvent(current, payload) {
     return upsert(current, incoming);
   }
 
-  if (payload.type === 'conversation_seen' && payload.conversation_id && payload.seen) {
+  if (eventType === 'foreground_session_state_updated' && payload.conversation_id) {
+    const foregroundSessionId = payload.foreground_session_id || 'main';
+    const state = String(payload.state || 'idle').toLowerCase();
+    const running = state === 'running' || state === 'queued';
     return current.map((conversation) => (
       conversation.conversation_id === payload.conversation_id
-        ? mergeConversationSummary(conversation, {
-          conversation_id: payload.conversation_id,
+        ? patchConversationForegroundSession(conversation, foregroundSessionId, {
+          state,
+          active_turn_id: payload.active_turn_id || payload.activeTurnId || null,
+          last_error: payload.last_error || payload.lastError || null,
+          processing_state: state,
+          running
+        })
+        : conversation
+    ));
+  }
+
+  if (
+    (eventType === 'conversation_seen' || eventType === 'foreground_session_seen_state_updated')
+    && payload.conversation_id
+    && payload.seen
+  ) {
+    const foregroundSessionId = payload.foreground_session_id || 'main';
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? patchConversationForegroundSession(conversation, foregroundSessionId, {
           last_seen_message_id: payload.seen.last_seen_message_id,
           last_seen_at: payload.seen.updated_at
         })
@@ -319,13 +639,15 @@ function applyConversationStreamEvent(current, payload) {
 }
 
 function hasUnreadConversation(conversation) {
-  return compareMessageIds(conversation?.last_message_id, conversation?.last_seen_message_id) > 0;
+  return foregroundSessions(conversation).some((session) => (
+    compareMessageIds(session?.last_message_id, session?.last_seen_message_id) > 0
+  ));
 }
 
 function recentMessagePageParams(conversation, limit = 40, totalOverride = undefined) {
   const boundedLimit = Math.max(1, Math.min(200, Number(limit) || 40));
   const overrideTotal = Number(totalOverride);
-  const lastId = Number(conversation?.last_message_id);
+  const lastId = messageOrderFromId(conversation?.last_message_id);
   const messageCount = Number(conversation?.message_count);
   let total = 0;
   if (Number.isFinite(overrideTotal) && overrideTotal > 0) {
@@ -353,6 +675,9 @@ function slashCommandState(value) {
   if (name === '/reasoning') {
     return { control: true, name, title: '切换推理强度', detail: 'reasoning effort 命令已发送' };
   }
+  if (name === '/idle_compact' || name === '/idle_timeout_compact') {
+    return { control: true, name, title: '切换空闲压缩', detail: 'idle compact 命令已发送' };
+  }
   if (name === '/cancel') {
     return { control: true, name, title: '取消执行', detail: '取消命令已发送' };
   }
@@ -363,6 +688,14 @@ function slashCommandState(value) {
     return { control: true, name, title: '读取状态', detail: '状态命令已发送' };
   }
   return { control: false, name, title: '等待响应', detail: '消息已送达，等待模型开始处理' };
+}
+
+function controlCommandActivity(command) {
+  const name = String(command || '').trim().split(/\s+/, 1)[0]?.toLowerCase() || '';
+  if (name === '/model') return '模型切换命令已发送';
+  if (name === '/reasoning') return 'Reasoning 命令已发送';
+  if (name === '/idle_compact' || name === '/idle_timeout_compact') return '空闲压缩设置命令已发送';
+  return 'Conversation 设置命令已发送';
 }
 
 function normalizePlan(rawPlan) {
@@ -407,6 +740,35 @@ function normalizePlanStatus(status) {
   return '';
 }
 
+function isActiveSessionState(value) {
+  return ['running', 'queued', 'processing', 'in_progress', 'active'].includes(
+    String(value || '').trim().toLowerCase()
+  );
+}
+
+function chatSnapshotState(snapshot) {
+  const currentTurnState = snapshot?.current_turn_state || snapshot?.currentTurnState || null;
+  const queued = Array.isArray(snapshot?.queued_outbound_messages)
+    ? snapshot.queued_outbound_messages
+    : Array.isArray(snapshot?.queuedOutboundMessages)
+      ? snapshot.queuedOutboundMessages
+      : [];
+  const state = currentTurnState
+    ? 'running'
+    : queued.length > 0
+      ? 'queued'
+      : 'idle';
+  return {
+    state,
+    currentTurnState,
+    activeTurnId: String(currentTurnState?.turn_id || currentTurnState?.turnId || '').trim()
+  };
+}
+
+function chatSessionStateIsActive(state) {
+  return isActiveSessionState(state?.state);
+}
+
 function normalizeProgressFeedback(payload) {
   const source = payload.progress || payload.event || payload;
   const finalState = source.final_state || source.finalState || payload.final_state || payload.finalState || '';
@@ -446,6 +808,480 @@ function mergeProgressActivity(current, progress) {
   };
 }
 
+function normalizedStreamEvent(payload) {
+  return payload?.event || payload?.session_event || payload?.stream_event || payload;
+}
+
+function streamEventType(event) {
+  const raw = String(event?.type || event?.event_type || event?.kind || '').toLowerCase();
+  return raw.startsWith('chat.') ? raw.slice('chat.'.length) : raw;
+}
+
+function streamMessageId(event) {
+  return String(
+    event?.message_id
+    || event?.messageId
+    || event?.stream_id
+    || event?.streamId
+    || event?.item_id
+    || event?.itemId
+    || event?.turn_id
+    || event?.turnId
+    || ''
+  ).trim();
+}
+
+function streamActivityBaseId(event) {
+  return streamMessageId(event) || 'current';
+}
+
+function streamItemId(event) {
+  return String(event?.call_id || event?.callId || event?.item_id || event?.itemId || streamActivityBaseId(event)).trim();
+}
+
+function streamDeltaText(event) {
+  return String(event?.delta ?? event?.text_delta ?? event?.textDelta ?? '');
+}
+
+function streamErrorText(event) {
+  return String(event?.error || event?.message || event?.error_detail || event?.errorDetail || '流式响应失败').trim();
+}
+
+function streamMessageIndexFromEvent(event) {
+  const fromMessageId = messageOrderFromId(streamMessageId(event));
+  if (Number.isFinite(fromMessageId)) return fromMessageId;
+  const explicit = Number(event?.message_index ?? event?.messageIndex ?? event?.index);
+  if (Number.isFinite(explicit)) return explicit;
+  return undefined;
+}
+
+function removeStreamingMessagesForTurn(current, turnId = '') {
+  const scopedTurnId = String(turnId || '').trim();
+  let changed = false;
+  const next = current.filter((message) => {
+    if (!message?._streaming || String(message?.role || '').toLowerCase() !== 'assistant') return true;
+    const messageTurnId = String(message?._streamTurnId || message?.turn_id || message?.turnId || '').trim();
+    const remove = scopedTurnId ? messageTurnId === scopedTurnId : true;
+    if (remove) changed = true;
+    return !remove;
+  });
+  return changed ? next : current;
+}
+
+function nextStreamMessageIndex(messages) {
+  let last = undefined;
+  let optimisticUsers = 0;
+  for (const message of messages || []) {
+    if (message?._optimistic) {
+      if (String(message?.role || '').toLowerCase() === 'user') optimisticUsers += 1;
+      continue;
+    }
+    if (message?._streaming) continue;
+    const index = messageIndex(message);
+    if (Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER) {
+      last = last === undefined ? index : Math.max(last, index);
+    }
+  }
+  if (last !== undefined) return last + optimisticUsers + 1;
+  return optimisticUsers > 0 ? optimisticUsers : undefined;
+}
+
+function appendTextDelta(existingText, delta) {
+  const previous = String(existingText || '');
+  const chunk = String(delta || '');
+  if (!chunk) return previous;
+  if (!previous) return chunk;
+  if (chunk === previous || previous.endsWith(chunk)) return previous;
+  if (chunk.startsWith(previous)) return chunk;
+  const maxOverlap = Math.min(previous.length, chunk.length);
+  for (let length = maxOverlap; length > 0; length -= 1) {
+    if (previous.slice(-length) === chunk.slice(0, length)) {
+      return `${previous}${chunk.slice(length)}`;
+    }
+  }
+  return `${previous}${chunk}`;
+}
+
+function findStreamingMessagePosition(current, id, turnId) {
+  const messageId = String(id || '').trim();
+  const streamTurnId = String(turnId || '').trim();
+  return current.findIndex((message) => {
+    if (!message?._streaming || String(message?.role || '').toLowerCase() !== 'assistant') return false;
+    const existingId = String(message?.id ?? message?.message_id ?? '').trim();
+    if (messageId && existingId === messageId) return true;
+    return Boolean(streamTurnId && String(message?._streamTurnId || '') === streamTurnId);
+  });
+}
+
+function appendStreamAssistantDelta(current, event) {
+  const id = streamMessageId(event);
+  const delta = streamDeltaText(event);
+  if (!id || !delta) return current;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const itemId = String(event?.item_id || event?.itemId || '').trim();
+  const position = findStreamingMessagePosition(current, id, turnId);
+  const now = new Date().toISOString();
+  const fallbackIndex = nextStreamMessageIndex(current);
+  const buildMessage = (existing = {}) => {
+    const nextText = appendTextDelta(existing.text || existing.preview || '', delta);
+    const items = Array.isArray(existing.items) ? [...existing.items] : [];
+    const textIndex = items.findIndex((item) => item?.type === 'text');
+    const textItem = {
+      type: 'text',
+      index: textIndex >= 0 ? items[textIndex].index : items.length,
+      text: nextText,
+      text_with_attachment_markers: nextText
+    };
+    if (textIndex >= 0) {
+      items[textIndex] = { ...items[textIndex], ...textItem };
+    } else {
+      items.push(textItem);
+    }
+    const eventIndex = streamMessageIndexFromEvent(event);
+    const existingIndex = Number(existing.index);
+    const index = Number.isFinite(eventIndex)
+      ? eventIndex
+      : Number.isFinite(existingIndex)
+        ? existingIndex
+        : fallbackIndex;
+    return {
+      ...existing,
+      id,
+      message_id: id,
+      index: Number.isFinite(index) ? index : existing.index,
+      role: 'assistant',
+      text: nextText,
+      preview: nextText,
+      content: nextText,
+      text_with_attachment_markers: nextText,
+      items,
+      attachments: existing.attachments || [],
+      attachment_count: existing.attachment_count || 0,
+      message_time: existing.message_time || now,
+      _streamTurnId: turnId || existing._streamTurnId || '',
+      _streamItemId: itemId || existing._streamItemId || '',
+      _streaming: true
+    };
+  };
+  if (position < 0) return [...current, buildMessage()];
+  const next = [...current];
+  next[position] = buildMessage(next[position]);
+  return next;
+}
+
+function appendStreamToolCallDelta(current, event) {
+  const id = streamMessageId(event);
+  const delta = streamDeltaText(event);
+  if (!id || !delta) return current;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const itemId = String(event?.item_id || event?.itemId || '').trim();
+  const callId = String(event?.call_id || event?.callId || itemId).trim();
+  if (!callId) return current;
+  const position = findStreamingMessagePosition(current, id, turnId);
+  const now = new Date().toISOString();
+  const fallbackIndex = nextStreamMessageIndex(current);
+  const buildMessage = (existing = {}) => {
+    const items = Array.isArray(existing.items) ? [...existing.items] : [];
+    const itemIndex = items.findIndex((item) => item?.type === 'tool_call' && String(item?.tool_call_id || '') === callId);
+    const label = itemId && !/^item_|^fc_|^call_/.test(itemId) ? itemId : 'tool';
+    if (itemIndex >= 0) {
+      items[itemIndex] = {
+        ...items[itemIndex],
+        arguments: appendTextDelta(items[itemIndex].arguments || '', delta)
+      };
+    } else {
+      items.push({
+        type: 'tool_call',
+        index: items.length,
+        tool_call_id: callId,
+        tool_name: label,
+        arguments: delta
+      });
+    }
+    const eventIndex = streamMessageIndexFromEvent(event);
+    const existingIndex = Number(existing.index);
+    const index = Number.isFinite(eventIndex)
+      ? eventIndex
+      : Number.isFinite(existingIndex)
+        ? existingIndex
+        : fallbackIndex;
+    return {
+      ...existing,
+      id,
+      message_id: id,
+      index: Number.isFinite(index) ? index : existing.index,
+      role: 'assistant',
+      text: existing.text || existing.preview || '',
+      preview: existing.preview || existing.text || '',
+      content: existing.content || existing.text || existing.preview || '',
+      text_with_attachment_markers: existing.text_with_attachment_markers || existing.text || existing.preview || '',
+      items,
+      attachments: existing.attachments || [],
+      attachment_count: existing.attachment_count || 0,
+      message_time: existing.message_time || now,
+      _streamTurnId: turnId || existing._streamTurnId || '',
+      _streamItemId: itemId || existing._streamItemId || '',
+      _streaming: true
+    };
+  };
+  if (position < 0) return [...current, buildMessage()];
+  const next = [...current];
+  next[position] = buildMessage(next[position]);
+  return next;
+}
+
+function appendStreamReasoningSummary(current, event) {
+  const id = streamMessageId(event);
+  if (!id) return current;
+  const delta = streamDeltaText(event);
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const itemId = String(event?.item_id || event?.itemId || '').trim();
+  const summaryIndex = Number(event?.summary_index ?? event?.summaryIndex ?? 0);
+  const position = findStreamingMessagePosition(current, id, turnId);
+  const now = new Date().toISOString();
+  const fallbackIndex = nextStreamMessageIndex(current);
+  const buildMessage = (existing = {}) => {
+    const items = Array.isArray(existing.items) ? [...existing.items] : [];
+    const reasoningIndex = items.findIndex((item) => (
+      item?.type === 'reasoning'
+      && Number(item?._summaryIndex ?? item?.summary_index ?? item?.summaryIndex ?? 0) === summaryIndex
+    ));
+    if (reasoningIndex >= 0) {
+      const text = appendTextDelta(items[reasoningIndex].text || items[reasoningIndex].summary || '', delta);
+      items[reasoningIndex] = {
+        ...items[reasoningIndex],
+        text,
+        summary: text,
+        _summaryIndex: summaryIndex
+      };
+    } else {
+      items.push({
+        type: 'reasoning',
+        index: items.length,
+        text: delta,
+        summary: delta,
+        _summaryIndex: summaryIndex
+      });
+    }
+    const eventIndex = streamMessageIndexFromEvent(event);
+    const existingIndex = Number(existing.index);
+    const index = Number.isFinite(eventIndex)
+      ? eventIndex
+      : Number.isFinite(existingIndex)
+        ? existingIndex
+        : fallbackIndex;
+    return {
+      ...existing,
+      id,
+      message_id: id,
+      index: Number.isFinite(index) ? index : existing.index,
+      role: 'assistant',
+      text: existing.text || existing.preview || '',
+      preview: existing.preview || existing.text || '',
+      content: existing.content || existing.text || existing.preview || '',
+      text_with_attachment_markers: existing.text_with_attachment_markers || existing.text || existing.preview || '',
+      items,
+      attachments: existing.attachments || [],
+      attachment_count: existing.attachment_count || 0,
+      message_time: existing.message_time || now,
+      _streamTurnId: turnId || existing._streamTurnId || '',
+      _streamItemId: itemId || existing._streamItemId || '',
+      _streaming: true
+    };
+  };
+  if (position < 0) return [...current, buildMessage()];
+  const next = [...current];
+  next[position] = buildMessage(next[position]);
+  return next;
+}
+
+function liveToolResultMessage(event, existingMessages = []) {
+  const toolResult = event?.tool_result || event?.toolResult || event;
+  if (!toolResult || typeof toolResult !== 'object') return null;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const toolCallId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.tool_call_id || event?.toolCallId || '').trim();
+  const toolName = String(toolResult.tool_name || toolResult.toolName || 'tool').trim() || 'tool';
+  if (!toolCallId && !toolName) return null;
+  const result = toolResult.result || {};
+  const id = `live-tool-result-${turnId || 'turn'}-${toolCallId || toolName}`;
+  return {
+    id,
+    message_id: id,
+    index: nextStreamMessageIndex(existingMessages),
+    role: 'assistant',
+    text: '',
+    preview: '',
+    content: '',
+    text_with_attachment_markers: '',
+    items: [{
+      type: 'tool_result',
+      index: 0,
+      tool_call_id: toolCallId,
+      tool_name: toolName,
+      context: result.context?.text || null,
+      context_with_attachment_markers: result.context?.text || null,
+      structured: result.structured || null,
+      files: Array.isArray(result.files) ? result.files : []
+    }],
+    attachments: Array.isArray(result.files) ? result.files : [],
+    attachment_count: Array.isArray(result.files) ? result.files.length : 0,
+    message_time: new Date().toISOString(),
+    _streamTurnId: turnId,
+    _streaming: true,
+    _liveToolResult: true,
+    _liveToolCallId: toolCallId
+  };
+}
+
+function appendToolResultToStreamingMessage(current, event) {
+  const toolResult = event?.tool_result || event?.toolResult || event;
+  if (!toolResult || typeof toolResult !== 'object') return null;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const toolCallId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.tool_call_id || event?.toolCallId || '').trim();
+  const toolName = String(toolResult.tool_name || toolResult.toolName || 'tool').trim() || 'tool';
+  if (!toolCallId && !toolName) return null;
+  const position = current.findIndex((message) => (
+    message?._streaming
+    && String(message?.role || '').toLowerCase() === 'assistant'
+    && (!turnId || String(message?._streamTurnId || '') === turnId)
+  ));
+  if (position < 0) return null;
+  const result = toolResult.result || {};
+  const next = [...current];
+  const message = next[position];
+  const items = Array.isArray(message.items) ? [...message.items] : [];
+  const existingIndex = items.findIndex((item) => (
+    item?.type === 'tool_result'
+    && String(item?.tool_call_id || '') === toolCallId
+  ));
+  const item = {
+    type: 'tool_result',
+    index: existingIndex >= 0 ? items[existingIndex].index : items.length,
+    tool_call_id: toolCallId,
+    tool_name: toolName,
+    context: result.context?.text || null,
+    context_with_attachment_markers: result.context?.text || null,
+    structured: result.structured || null,
+    files: Array.isArray(result.files) ? result.files : []
+  };
+  if (existingIndex >= 0) items[existingIndex] = { ...items[existingIndex], ...item };
+  else items.push(item);
+  const resultFiles = existingIndex >= 0 ? [] : (Array.isArray(result.files) ? result.files : []);
+  next[position] = {
+    ...message,
+    items,
+    attachments: [
+      ...(Array.isArray(message.attachments) ? message.attachments : []),
+      ...resultFiles
+    ],
+    attachment_count: Number(message.attachment_count || 0) + resultFiles.length
+  };
+  return next;
+}
+
+function appendStreamToolResultDone(current, event) {
+  const merged = appendToolResultToStreamingMessage(current, event);
+  if (merged) return merged;
+  const message = liveToolResultMessage(event, current);
+  if (!message) return current;
+  const existingIndex = current.findIndex((item) => (
+    item?._liveToolResult
+    && String(item?._liveToolCallId || '') === String(message._liveToolCallId || '')
+    && String(item?._streamTurnId || '') === String(message._streamTurnId || '')
+  ));
+  if (existingIndex < 0) return [...current, message];
+  const next = [...current];
+  next[existingIndex] = {
+    ...next[existingIndex],
+    ...message,
+    index: next[existingIndex].index
+  };
+  return next;
+}
+
+function markQueuedUserMessage(current, clientMessageId) {
+  const id = String(clientMessageId || '').trim();
+  if (!id) return current;
+  let changed = false;
+  const next = current.map((message) => {
+    if (String(message?.id ?? message?.message_id ?? '') !== id) return message;
+    changed = true;
+    return {
+      ...message,
+      pending: false,
+      queued: true
+    };
+  });
+  return changed ? next : current;
+}
+
+function applyStreamErrorToMessages(current, event) {
+  const id = streamMessageId(event);
+  const error = streamErrorText(event);
+  if (!id) {
+    let changed = false;
+    const next = current.filter((message) => {
+      const remove = message?._streaming && String(message?.role || '').toLowerCase() === 'assistant';
+      if (remove) changed = true;
+      return !remove;
+    });
+    return changed ? next : current;
+  }
+  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  if (position < 0) {
+    const index = streamMessageIndexFromEvent(event);
+    return [
+      ...current,
+      {
+        id,
+        message_id: id,
+        index: Number.isFinite(index) ? index : undefined,
+        role: 'assistant',
+        text: '',
+        preview: '',
+        items: [],
+        attachments: [],
+        attachment_count: 0,
+        message_time: new Date().toISOString(),
+        error,
+        _streaming: false,
+        _streamFailed: true
+      }
+    ];
+  }
+  const next = [...current];
+  next[position] = {
+    ...next[position],
+    _streaming: false,
+    _streamFailed: true,
+    error
+  };
+  return next;
+}
+
+function streamFinalizedActivityIds(messages) {
+  const ids = new Set();
+  for (const message of messages || []) {
+    const id = String(message?.id ?? message?.message_id ?? '').trim();
+    if (id) {
+      ids.add(`stream-assistant-${id}`);
+      ids.add(`stream-reasoning-${id}`);
+      ids.add(`stream-tool-${id}`);
+    }
+    const items = [
+      ...(Array.isArray(message?.items) ? message.items : []),
+      ...(Array.isArray(message?.data) ? message.data : [])
+    ];
+    for (const item of items) {
+      if (item?.type !== 'tool_call' && item?.type !== 'tool_result') continue;
+      const payload = item?.payload && typeof item.payload === 'object' ? item.payload : item;
+      const toolId = String(payload?.tool_call_id || payload?.call_id || payload?.item_id || '').trim();
+      if (toolId) ids.add(`stream-tool-${toolId}`);
+    }
+  }
+  return ids;
+}
+
 function App() {
   const [settings, setSettings] = useState(null);
   const [systemTheme, setSystemTheme] = useState(() => {
@@ -462,6 +1298,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [sessionActivity, setSessionActivity] = useState('');
+  const [chatSessionState, setChatSessionState] = useState({ state: 'idle' });
   const [runningActivities, setRunningActivities] = useState([]);
   const [overviewPanelOpen, setOverviewPanelOpen] = useState(false);
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(false);
@@ -479,6 +1316,15 @@ function App() {
   const [conversationLayout, setConversationLayout] = useState(null);
   const [newConversationOpen, setNewConversationOpen] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
+  const [renamingConversation, setRenamingConversation] = useState(null);
+  const [renamingConversationSaving, setRenamingConversationSaving] = useState(false);
+  const [renamingSession, setRenamingSession] = useState(null);
+  const [renamingSessionSaving, setRenamingSessionSaving] = useState(false);
+  const [propertiesConversation, setPropertiesConversation] = useState(null);
+  const [propertiesModels, setPropertiesModels] = useState([]);
+  const [propertiesModelsLoading, setPropertiesModelsLoading] = useState(false);
+  const [propertiesModelsError, setPropertiesModelsError] = useState('');
+  const [propertiesApplying, setPropertiesApplying] = useState(false);
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState('');
   const [selectionReferences, setSelectionReferences] = useState([]);
@@ -491,16 +1337,24 @@ function App() {
   const conversationsRef = useRef([]);
   const openFilesRef = useRef([]);
   const appForegroundRef = useRef(appForeground);
+  const settingsRef = useRef(null);
+  const settingsSaveSeqRef = useRef(0);
   const selectedRef = useRef(null);
   const websocketRef = useRef(null);
   const websocketReconnectRef = useRef(null);
   const websocketKeyRef = useRef('');
   const seenUsageMessagesRef = useRef(new Map());
+  const streamBuffersRef = useRef(new Map());
+  const attachmentImageUrlCacheRef = useRef(new Map());
+  const workspaceResourceCacheRef = useRef(new Map());
   const loadingOlderRef = useRef(false);
   const layoutDraftRef = useRef(null);
   const restoringUiRef = useRef(false);
   const uiSaveTimerRef = useRef(null);
   const readSaveTimersRef = useRef(new Map());
+  const selectedSessionId = selectedForegroundSessionId(selected);
+  const selectedServerId = selected?.serverId || '';
+  const selectedConversationId = selected?.conversationId || '';
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -513,6 +1367,10 @@ function App() {
   useEffect(() => {
     appForegroundRef.current = appForeground;
   }, [appForeground]);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   useLayoutEffect(() => {
     applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
@@ -605,7 +1463,7 @@ function App() {
 
   useEffect(() => {
     setSelectionReferences([]);
-  }, [selected?.serverId, selected?.conversationId]);
+  }, [selected?.serverId, selected?.conversationId, selectedSessionId]);
 
   useEffect(() => () => {
     revokeFilePreviewUrls(openFilesRef.current);
@@ -643,11 +1501,26 @@ function App() {
     () => conversations.find((item) => item.conversation_id === selected?.conversationId) || null,
     [conversations, selected]
   );
+  const propertiesConversationCurrent = useMemo(() => (
+    propertiesConversation
+      ? conversations.find((item) => item.conversation_id === propertiesConversation.conversation_id) || propertiesConversation
+      : null
+  ), [conversations, propertiesConversation]);
+  const activeForegroundSession = useMemo(() => {
+    if (!activeConversation) return null;
+    return foregroundSessions(activeConversation).find((session) => (
+      String(session?.id || 'main') === selectedSessionId
+    )) || foregroundSessions(activeConversation)[0] || null;
+  }, [activeConversation, selectedSessionId]);
   const displayFontSize = clamp(settings?.displayFontSize, MIN_DISPLAY_FONT_SIZE, MAX_DISPLAY_FONT_SIZE) || 12;
   const uiScale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
   const terminalFontSize = clamp(displayFontSize + 1, 11, 22) || 13;
-  const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId) : '';
+  const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId, selectedSessionId) : '';
+  const selectedConversationUiKey = selected ? conversationKey(selected.serverId, selected.conversationId, 'main') : '';
   const selectedStatus = selected ? statuses.get(selectedKey) : null;
+  const selectedChatSessionState = chatSessionState.scopeKey === selectedKey
+    ? chatSessionState
+    : { state: 'idle' };
   const selectedConversationStatus = useMemo(() => ({
     ...(selectedStatus || {}),
     ...(activeConversation ? {
@@ -658,12 +1531,14 @@ function App() {
       sandbox_source: activeConversation.sandbox_source,
       remote: activeConversation.remote,
       workspace: activeConversation.workspace,
+      processing_state: selectedChatSessionState.state || 'idle',
+      running: chatSessionStateIsActive(selectedChatSessionState),
       running_background: activeConversation.running_background,
       total_background: activeConversation.total_background,
       running_subagents: activeConversation.running_subagents,
       total_subagents: activeConversation.total_subagents
     } : {})
-  }), [selectedStatus, activeConversation]);
+  }), [selectedStatus, activeConversation, selectedChatSessionState]);
   const activeServer = useMemo(
     () => (settings?.servers || []).find((server) => server.id === activeServerId) || null,
     [settings?.servers, activeServerId]
@@ -674,10 +1549,87 @@ function App() {
     () => composerModeInfo(selectedConversationStatus),
     [selectedConversationStatus]
   );
+  const messageAttachmentWorkspaceRoots = useMemo(() => {
+    const rootListing = workspaceListings.get('');
+    return Array.from(new Set([
+      workspaceDisplayRoot(rootListing, selectedConversationStatus),
+      rootListing?.workspace_root,
+      rootListing?.remote?.cwd,
+      selectedConversationStatus?.workspace,
+      activeConversation?.workspace
+    ].map(normalizeAbsolutePath).filter(Boolean)));
+  }, [workspaceListings, selectedConversationStatus, activeConversation?.workspace]);
+  const readWorkspaceResourceCache = useCallback((kind, parts) => {
+    const key = localCacheKey(kind, parts);
+    if (workspaceResourceCacheRef.current.has(key)) {
+      return workspaceResourceCacheRef.current.get(key);
+    }
+    const cached = readLocalCache(kind, parts);
+    if (cached !== null) {
+      workspaceResourceCacheRef.current.set(key, cached);
+    }
+    return cached;
+  }, []);
+  const writeWorkspaceResourceCache = useCallback((kind, parts, value) => {
+    const key = localCacheKey(kind, parts);
+    workspaceResourceCacheRef.current.set(key, value);
+    writeLocalCache(kind, parts, value);
+  }, []);
+  const removeWorkspaceResourceCache = useCallback((kind, parts) => {
+    const key = localCacheKey(kind, parts);
+    workspaceResourceCacheRef.current.delete(key);
+    removeLocalCache(kind, parts);
+  }, []);
+  const loadWorkspaceFileCached = useCallback(async (serverId, conversationId, path, limitBytes, options = {}) => {
+    const normalized = normalizeWorkspacePath(path);
+    const parts = [serverId, conversationId, normalized, limitBytes || 'full'];
+    const useCache = options.cache !== false;
+    if (useCache && !options.force) {
+      const cached = readWorkspaceResourceCache('workspace-file', parts);
+      if (cached) return cached;
+    }
+    const loaded = await loadWorkspaceFile(serverId, conversationId, normalized, limitBytes);
+    if (useCache) {
+      writeWorkspaceResourceCache('workspace-file', parts, loaded);
+    }
+    return loaded;
+  }, [readWorkspaceResourceCache, writeWorkspaceResourceCache]);
+  const resolveMessageAttachmentUrl = useCallback(async (attachment, rawUrl = '') => {
+    const serverId = selected?.serverId || '';
+    const conversationId = selected?.conversationId || '';
+    if (!serverId || !conversationId) return rawUrl || '';
+    const target = attachmentConversationFileTarget(attachment, rawUrl, conversationId, messageAttachmentWorkspaceRoots);
+    if (!target) return rawUrl || '';
+    const key = attachmentCacheKey(serverId, target.conversationId, target.path, attachment, rawUrl);
+    if (attachmentImageUrlCacheRef.current.has(key)) {
+      return attachmentImageUrlCacheRef.current.get(key);
+    }
+    try {
+      const file = await loadWorkspaceFileCached(serverId, target.conversationId, target.path, MESSAGE_IMAGE_PREVIEW_MAX_BYTES);
+      const dataUrl = workspaceFileImageDataUrl(target.path || attachmentName(attachment), file);
+      if (dataUrl) {
+        attachmentImageUrlCacheRef.current.set(key, dataUrl);
+        return dataUrl;
+      }
+    } catch {
+      return rawUrl || '';
+    }
+    return rawUrl || '';
+  }, [selected?.serverId, selected?.conversationId, messageAttachmentWorkspaceRoots, loadWorkspaceFileCached]);
+  const messageAttachmentWorkspaceTarget = useCallback((attachment, rawUrl = '') => (
+    attachmentConversationFileTarget(attachment, rawUrl, selected?.conversationId || '', messageAttachmentWorkspaceRoots)
+  ), [messageAttachmentWorkspaceRoots, selected?.conversationId]);
+  const messageAttachmentWorkspacePath = useCallback((attachment) => (
+    messageAttachmentWorkspaceTarget(attachment)?.path
+    || String(attachment?.path || '').trim()
+  ), [messageAttachmentWorkspaceTarget]);
   const selectedUsage = useMemo(
     () => statusUsageTotals(selectedStatus, selectedKey ? statusDeltas.get(selectedKey) : null),
     [selectedStatus, selectedKey, statusDeltas]
   );
+  const selectedProcessingState = String(selectedConversationStatus?.processing_state || '').trim().toLowerCase();
+  const selectedProcessing = Boolean(selectedConversationStatus?.running)
+    || isActiveSessionState(selectedProcessingState);
   const updateReady = updaterStatus?.state === 'downloaded';
 
   const upsertTransfer = useCallback((id, patch) => {
@@ -704,16 +1656,32 @@ function App() {
   }, []);
 
   const saveSettings = useCallback(async (next) => {
-    const saved = await window.stellacode2.saveSettings(next);
+    const base = settingsRef.current || {};
+    const request = {
+      ...base,
+      ...(next || {}),
+      layout: next?.layout ? { ...(base.layout || {}), ...(next.layout || {}) } : base.layout,
+      conversationUi: next?.conversationUi ? { ...(base.conversationUi || {}), ...(next.conversationUi || {}) } : base.conversationUi,
+      conversationListUi: next?.conversationListUi ? { ...(base.conversationListUi || {}), ...(next.conversationListUi || {}) } : base.conversationListUi,
+      hiddenConversations: next?.hiddenConversations ?? base.hiddenConversations
+    };
+    const seq = settingsSaveSeqRef.current + 1;
+    settingsSaveSeqRef.current = seq;
+    const saved = await window.stellacode2.saveSettings(request);
     const merged = {
       ...saved,
-      layout: next?.layout ? { ...(saved.layout || {}), ...(next.layout || {}) } : saved.layout,
-      conversationUi: next?.conversationUi ? { ...(saved.conversationUi || {}), ...(next.conversationUi || {}) } : saved.conversationUi,
-      hiddenConversations: next?.hiddenConversations
-        ? { ...(saved.hiddenConversations || {}), ...(next.hiddenConversations || {}) }
-        : saved.hiddenConversations
+      layout: request.layout ? { ...(saved.layout || {}), ...(request.layout || {}) } : saved.layout,
+      conversationUi: request.conversationUi ? { ...(saved.conversationUi || {}), ...(request.conversationUi || {}) } : saved.conversationUi,
+      conversationListUi: request.conversationListUi ? { ...(saved.conversationListUi || {}), ...(request.conversationListUi || {}) } : saved.conversationListUi,
+      hiddenConversations: request.hiddenConversations ?? saved.hiddenConversations
     };
+    if (settingsSaveSeqRef.current !== seq) {
+      const latest = settingsRef.current;
+      if (latest) window.stellacode2.saveSettings(latest).catch(() => {});
+      return latest || merged;
+    }
     setSettings(merged);
+    settingsRef.current = merged;
     return merged;
   }, []);
 
@@ -730,32 +1698,34 @@ function App() {
       };
       window.clearTimeout(uiSaveTimerRef.current);
       uiSaveTimerRef.current = window.setTimeout(() => {
-        window.stellacode2.saveSettings(next).catch(() => {});
+        window.stellacode2.saveSettings(settingsRef.current || next).catch(() => {});
       }, 260);
       return next;
     });
   }, []);
 
-  const markConversationRead = useCallback((serverId, conversationId, lastMessageId) => {
-    const seen = Number(lastMessageId);
+  const markConversationRead = useCallback((serverId, conversationId, foregroundSessionId, lastMessageId) => {
     if (!appForegroundRef.current) return;
-    if (!serverId || !conversationId || !Number.isFinite(seen)) return;
-    const key = conversationKey(serverId, conversationId);
-    const nextConversations = conversationsRef.current.map((conversation) => (
-      conversation.conversation_id === conversationId
-        ? mergeConversationSummary(conversation, {
-          conversation_id: conversationId,
-          last_seen_message_id: String(seen)
-        })
-        : conversation
-    ));
-    conversationsRef.current = nextConversations;
-    setConversations(nextConversations);
+    const seen = String(lastMessageId || '').trim();
+    if (!serverId || !conversationId || !seen || messageOrderFromId(seen) === undefined) return;
+    const sessionId = foregroundSessionId || 'main';
+    const key = conversationKey(serverId, conversationId, sessionId);
+    setConversations((current) => {
+      const next = current.map((conversation) => (
+        conversation.conversation_id === conversationId
+          ? patchConversationForegroundSession(conversation, sessionId, {
+            last_seen_message_id: seen
+          })
+          : conversation
+      ));
+      conversationsRef.current = next;
+      return next;
+    });
     const existing = readSaveTimersRef.current.get(key);
     if (existing) window.clearTimeout(existing);
     const timer = window.setTimeout(() => {
       readSaveTimersRef.current.delete(key);
-      markConversationSeen(serverId, conversationId, seen).catch(() => {});
+      markConversationSeen(serverId, conversationId, seen, sessionId).catch(() => {});
     }, 180);
     readSaveTimersRef.current.set(key, timer);
   }, []);
@@ -775,7 +1745,8 @@ function App() {
       const list = await loadConversations(serverId);
       setConversations(list);
       if (!selectedRef.current && list[0]) {
-        setSelected({ serverId, conversationId: list[0].conversation_id });
+        const sessionId = foregroundSessions(list[0])[0]?.id || 'main';
+        setSelected({ serverId, conversationId: list[0].conversation_id, foregroundSessionId: sessionId });
       }
     } finally {
       setLoading(false);
@@ -803,23 +1774,28 @@ function App() {
           const nextConversations = applyConversationStreamEvent(conversationsRef.current, payload);
           conversationsRef.current = nextConversations;
           setConversations(nextConversations);
+          const homeType = String(payload?.type || '').startsWith('home.')
+            ? String(payload.type).slice('home.'.length)
+            : String(payload?.type || '');
           if (
-            payload.type === 'conversation_deleted'
+            homeType === 'conversation_deleted'
             && selectedRef.current?.serverId === activeServerId
             && selectedRef.current?.conversationId === payload.conversation_id
           ) {
             const next = nextConversations[0];
-            setSelected(next ? { serverId: activeServerId, conversationId: next.conversation_id } : null);
+            const sessionId = next ? foregroundSessions(next)[0]?.id || 'main' : 'main';
+            setSelected(next ? { serverId: activeServerId, conversationId: next.conversation_id, foregroundSessionId: sessionId } : null);
           }
           if (!selectedRef.current) {
-            const fallbackConversation = payload.type === 'conversation_snapshot'
+            const fallbackConversation = (homeType === 'snapshot' || homeType === 'conversation_snapshot')
               ? (payload.conversations || [])[0]
               : payload.conversation;
             if (fallbackConversation?.conversation_id) {
-              setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id });
+              const sessionId = foregroundSessions(fallbackConversation)[0]?.id || 'main';
+              setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id, foregroundSessionId: sessionId });
             }
           }
-          if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
+          if (homeType === 'conversation_turn_completed' && payload.conversation_id) {
             const completed = nextConversations.find((conversation) => conversation.conversation_id === payload.conversation_id);
             const selectedConversation = selectedRef.current;
             const isActive = selectedConversation?.serverId === activeServerId
@@ -853,9 +1829,9 @@ function App() {
 
   useEffect(() => {
     if (!appForeground) return;
-    if (!selectedKey || !activeConversation?.last_message_id) return;
-    markConversationRead(selected.serverId, selected.conversationId, activeConversation.last_message_id);
-  }, [appForeground, selected, selectedKey, activeConversation?.last_message_id, markConversationRead]);
+    if (!selectedKey || !activeForegroundSession?.last_message_id) return;
+    markConversationRead(selected.serverId, selected.conversationId, selectedSessionId, activeForegroundSession.last_message_id);
+  }, [appForeground, selected, selectedKey, selectedSessionId, activeForegroundSession?.last_message_id, markConversationRead]);
 
   const saveSettingsFromDialog = useCallback(async (next) => {
     setSettingsSaving(true);
@@ -884,24 +1860,34 @@ function App() {
     });
   }, [refreshConversations]);
 
-  const renameSelectedConversation = useCallback(async (conversation) => {
+  const openRenameConversationDialog = useCallback((conversation) => {
+    if (!conversation) return;
+    setRenamingConversation(conversation);
+  }, []);
+
+  const renameSelectedConversation = useCallback(async (conversation, nickname) => {
     if (!activeServerId || !conversation) return;
     const currentName = displayConversationName(conversation);
-    const nextName = window.prompt('重命名 Conversation', currentName);
-    if (nextName === null) return;
-    const nickname = nextName.trim();
-    if (!nickname || nickname === currentName) return;
+    const nextName = String(nickname || '').trim();
+    if (!nextName || nextName === currentName) {
+      setRenamingConversation(null);
+      return;
+    }
+    setRenamingConversationSaving(true);
     try {
-      const updated = await renameConversation(activeServerId, conversation.conversation_id, nickname);
+      const updated = await renameConversation(activeServerId, conversation.conversation_id, nextName);
       setConversations((current) => current.map((item) => (
         item.conversation_id === conversation.conversation_id
-          ? { ...item, ...(updated || {}), nickname }
+          ? { ...item, ...(updated || {}), nickname: nextName }
           : item
       )));
+      setRenamingConversation(null);
     } catch (error) {
       window.alert(error?.message || '重命名失败');
+    } finally {
+      setRenamingConversationSaving(false);
     }
-  }, [activeServerId, settings]);
+  }, [activeServerId]);
 
   const deleteSelectedConversation = useCallback(async (conversation) => {
     if (!activeServerId || !conversation || !settings) return;
@@ -912,7 +1898,8 @@ function App() {
       setConversations((current) => {
         const next = current.filter((item) => item.conversation_id !== conversation.conversation_id);
         if (selected?.conversationId === conversation.conversation_id) {
-          setSelected(next[0] ? { serverId: activeServerId, conversationId: next[0].conversation_id } : null);
+          const sessionId = next[0] ? foregroundSessions(next[0])[0]?.id || 'main' : 'main';
+          setSelected(next[0] ? { serverId: activeServerId, conversationId: next[0].conversation_id, foregroundSessionId: sessionId } : null);
         }
         return next;
       });
@@ -947,7 +1934,8 @@ function App() {
         item.conversation_id !== conversationId
           && !currentIds.has(item.conversation_id)
       ));
-      setSelected(nextVisible ? { serverId: activeServerId, conversationId: nextVisible.conversation_id } : null);
+      const sessionId = nextVisible ? foregroundSessions(nextVisible)[0]?.id || 'main' : 'main';
+      setSelected(nextVisible ? { serverId: activeServerId, conversationId: nextVisible.conversation_id, foregroundSessionId: sessionId } : null);
     }
     try {
       await saveSettings(nextSettings);
@@ -955,6 +1943,24 @@ function App() {
       window.alert(error?.message || '保存隐藏状态失败');
     }
   }, [activeServerId, conversations, saveSettings, selected?.conversationId, settings]);
+
+  const updateConversationListUi = useCallback((patch) => {
+    if (!activeServerId || !settings) return;
+    const currentListUi = settings.conversationListUi?.[activeServerId] || {};
+    const nextServerListUi = {
+      ...currentListUi,
+      ...patch
+    };
+    const nextSettings = {
+      ...settings,
+      conversationListUi: {
+        ...(settings.conversationListUi || {}),
+        [activeServerId]: nextServerListUi
+      }
+    };
+    setSettings(nextSettings);
+    saveSettings(nextSettings).catch(() => {});
+  }, [activeServerId, saveSettings, settings]);
 
   const createNewConversation = useCallback(async ({ serverId, nickname }) => {
     if (!serverId || creatingConversation) return;
@@ -969,7 +1975,7 @@ function App() {
       }
       const list = await loadConversations(serverId);
       setConversations(list);
-      setSelected({ serverId, conversationId });
+      setSelected({ serverId, conversationId, foregroundSessionId: 'main' });
       setNewConversationOpen(false);
       setOverviewPanelOpen(false);
       setWorkspacePanelOpen(false);
@@ -981,16 +1987,108 @@ function App() {
     }
   }, [creatingConversation, saveSettings, settings]);
 
+  const createConversationForegroundSession = useCallback(async (conversation) => {
+    if (!activeServerId || !conversation) return;
+    const sessionId = createLocalForegroundSessionId(conversation);
+    const nickname = nextForegroundSessionName(conversation);
+    try {
+      const session = await createForegroundSession(activeServerId, conversation.conversation_id, {
+        sessionId,
+        nickname
+      });
+      const createdSessionId = session?.id || sessionId;
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+      setSelected({
+        serverId: activeServerId,
+        conversationId: conversation.conversation_id,
+        foregroundSessionId: createdSessionId
+      });
+      updateConversationListUi({
+        openConversationIds: Array.from(new Set([
+          ...((settings?.conversationListUi?.[activeServerId]?.openConversationIds) || []),
+          conversation.conversation_id
+        ]))
+      });
+    } catch (error) {
+      window.alert(error?.message || '创建对话失败');
+    }
+  }, [activeServerId, settings, updateConversationListUi]);
+
+  const renameConversationForegroundSession = useCallback(async (conversation, session) => {
+    if (!activeServerId || !conversation || !session) return;
+    setRenamingSession({ conversation, session });
+  }, [activeServerId]);
+
+  const renameSelectedForegroundSession = useCallback(async (conversation, session, nickname) => {
+    if (!activeServerId || !conversation || !session) return;
+    const sessionId = session.id || 'main';
+    const currentName = displayForegroundSessionName(session, conversation).trim();
+    const nextName = String(nickname || '').trim();
+    if (!nextName || nextName === currentName) {
+      setRenamingSession(null);
+      return;
+    }
+    setRenamingSessionSaving(true);
+    try {
+      await renameForegroundSession(activeServerId, conversation.conversation_id, sessionId, nextName);
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+      setRenamingSession(null);
+    } catch (error) {
+      window.alert(error?.message || '重命名 Session 失败');
+    } finally {
+      setRenamingSessionSaving(false);
+    }
+  }, [activeServerId]);
+
+  const deleteConversationForegroundSession = useCallback(async (conversation, session) => {
+    if (!activeServerId || !conversation || !session || session.is_main) return;
+    const title = displayForegroundSessionName(session, conversation);
+    if (!window.confirm(`删除对话「${title}」？`)) return;
+    const sessionId = session.id || 'main';
+    try {
+      await deleteForegroundSession(activeServerId, conversation.conversation_id, sessionId);
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+      if (
+        selected?.conversationId === conversation.conversation_id
+        && selectedSessionId === sessionId
+      ) {
+        const refreshedConversation = list.find((item) => item.conversation_id === conversation.conversation_id);
+        const fallback = foregroundSessions(refreshedConversation)[0]?.id || 'main';
+        setSelected(refreshedConversation
+          ? { serverId: activeServerId, conversationId: conversation.conversation_id, foregroundSessionId: fallback }
+          : list[0]
+            ? { serverId: activeServerId, conversationId: list[0].conversation_id, foregroundSessionId: foregroundSessions(list[0])[0]?.id || 'main' }
+            : null);
+      }
+    } catch (error) {
+      window.alert(error?.message || '删除对话失败');
+    }
+  }, [activeServerId, selected?.conversationId, selectedSessionId]);
+
   const fetchWorkspacePath = useCallback(async (path = '', options = {}) => {
     if (!selected) return null;
     const normalized = normalizeWorkspacePath(path);
     if (!options.force && workspaceListings.has(normalized)) {
       return workspaceListings.get(normalized);
     }
+    const cacheParts = [selected.serverId, selected.conversationId, normalized, 500];
+    if (!options.force) {
+      const cached = readWorkspaceResourceCache('workspace-listing', cacheParts);
+      if (cached) {
+        setWorkspaceListings((current) => (
+          current.has(normalized) ? current : new Map(current).set(normalized, cached)
+        ));
+        return cached;
+      }
+    }
     setWorkspaceError('');
     setWorkspaceLoading((current) => new Set(current).add(normalized));
     try {
       const listing = await loadWorkspace(selected.serverId, selected.conversationId, normalized, 500);
+      writeWorkspaceResourceCache('workspace-listing', cacheParts, listing);
       setWorkspaceListings((current) => new Map(current).set(normalized, listing));
       return listing;
     } catch (error) {
@@ -1003,13 +2101,15 @@ function App() {
         return next;
       });
     }
-  }, [selected, workspaceListings]);
+  }, [selected, workspaceListings, readWorkspaceResourceCache, writeWorkspaceResourceCache]);
 
   const loadPdfPreviewIntoTab = useCallback(async (entry, options = {}) => {
     if (!selected || !entry) return;
     const path = normalizeWorkspacePath(entry.path);
     const serverId = selected.serverId;
-    const conversationId = selected.conversationId;
+    const selectedConversationId = selected.conversationId;
+    const conversationId = String(entry.conversationId || entry.conversation_id || selectedConversationId || '').trim();
+    if (!conversationId) return;
     if (!options.keepExistingPreview) {
       setOpenFiles((current) => current.map((item) => (
         item.path === path ? { ...item, loading: true, error: '' } : item
@@ -1029,7 +2129,7 @@ function App() {
       const pdfUrl = URL.createObjectURL(blob);
       if (
         selectedRef.current?.serverId !== serverId
-        || selectedRef.current?.conversationId !== conversationId
+        || selectedRef.current?.conversationId !== selectedConversationId
       ) {
         URL.revokeObjectURL(pdfUrl);
         return;
@@ -1054,6 +2154,7 @@ function App() {
               pdf_url: pdfUrl,
               pdf_buffer: preview.data,
               preview_size: preview.size,
+              loaded_at: Date.now(),
               scroll_hint: options.scrollHint || item.scroll_hint,
               loading: false,
               error: ''
@@ -1064,7 +2165,7 @@ function App() {
     } catch (error) {
       if (
         selectedRef.current?.serverId !== serverId
-        || selectedRef.current?.conversationId !== conversationId
+        || selectedRef.current?.conversationId !== selectedConversationId
       ) {
         return;
       }
@@ -1091,7 +2192,7 @@ function App() {
       setConversationLayout(null);
       return undefined;
     }
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = selectedConversationUiKey;
     const savedUi = settings.conversationUi?.[key] || {};
     const savedPanels = savedUi.panels || {};
     const savedLayout = layoutSnapshotFromValues({ ...(settings.layout || {}), ...(savedUi.layout || {}) });
@@ -1126,10 +2227,16 @@ function App() {
     queueMicrotask(() => {
       restoringUiRef.current = false;
     });
+    const rootCacheParts = [selected.serverId, selected.conversationId, '', 500];
+    const cachedRootListing = readWorkspaceResourceCache('workspace-listing', rootCacheParts);
+    if (cachedRootListing) {
+      setWorkspaceListings((current) => new Map(current).set('', cachedRootListing));
+    }
     setWorkspaceLoading((current) => new Set(current).add(''));
     loadWorkspace(selected.serverId, selected.conversationId, '', 500)
       .then((listing) => {
         if (disposed) return;
+        writeWorkspaceResourceCache('workspace-listing', rootCacheParts, listing);
         setWorkspaceListings((current) => new Map(current).set('', listing));
       })
       .catch((error) => {
@@ -1152,7 +2259,7 @@ function App() {
         loadPdfPreviewIntoTab(file);
         return;
       }
-      loadWorkspaceFile(selected.serverId, selected.conversationId, file.path)
+      loadWorkspaceFileCached(selected.serverId, selected.conversationId, file.path, undefined, { force: true, cache: false })
         .then((loaded) => {
           if (disposed) return;
           const kind = workspaceFileKind(file.path);
@@ -1168,6 +2275,7 @@ function App() {
                 language: fileExtension(file.path),
                 content: loaded?.encoding === 'utf8' ? loaded.data || '' : '',
                 data_url: kind === 'image' ? data : '',
+                loaded_at: Date.now(),
                 loading: false
               }
               : item
@@ -1183,10 +2291,10 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [selected?.serverId, selected?.conversationId, settingsReady, loadPdfPreviewIntoTab]);
+  }, [selected?.serverId, selected?.conversationId, selectedConversationUiKey, settingsReady, loadPdfPreviewIntoTab, readWorkspaceResourceCache, writeWorkspaceResourceCache, loadWorkspaceFileCached]);
 
   useEffect(() => {
-    if (!selectedKey || !settings || restoringUiRef.current) return;
+    if (!selectedConversationUiKey || !settings || restoringUiRef.current) return;
     const files = openFiles.map(fileTabSnapshot).filter(Boolean);
     const snapshot = {
       panels: {
@@ -1205,9 +2313,9 @@ function App() {
       openFiles: files,
       activeFilePath: files.some((file) => file.path === activeFilePath) ? activeFilePath : ''
     };
-    queueConversationUiSave(selectedKey, snapshot);
+    queueConversationUiSave(selectedConversationUiKey, snapshot);
   }, [
-    selectedKey,
+    selectedConversationUiKey,
     settingsReady,
     overviewPanelOpen,
     workspacePanelOpen,
@@ -1237,18 +2345,66 @@ function App() {
     });
   }, [fetchWorkspacePath]);
 
-  const openWorkspaceFile = useCallback(async (entry) => {
+  const openWorkspaceFile = useCallback(async (entry, options = {}) => {
     if (!selected || !entry) return;
     const path = normalizeWorkspacePath(entry.path);
+    const conversationId = String(entry.conversationId || entry.conversation_id || selected.conversationId || '').trim();
+    if (!conversationId) return;
     setPreviewPanelOpen(true);
     setActiveFilePath(path);
+    const entryKind = workspaceEntryKind(entry);
+    if (entryKind === 'directory') {
+      setOpenFiles((current) => {
+        if (current.some((item) => item.path === path)) {
+          return current.map((item) => (
+            item.path === path && !options.keepExistingPreview
+              ? { ...item, loading: true, error: '' }
+              : item
+          ));
+        }
+        return [...current, {
+          ...entry,
+          path,
+          name: entry.name || fileNameFromPath(path) || 'workspace',
+          kind: 'directory',
+          loading: true,
+          error: ''
+        }];
+      });
+      try {
+        const listing = await loadWorkspace(selected.serverId, conversationId, path, 500);
+        setWorkspaceListings((current) => new Map(current).set(path, listing));
+        setOpenFiles((current) => current.map((item) => (
+          item.path === path
+            ? {
+              ...item,
+              ...entry,
+              path,
+              name: entry.name || fileNameFromPath(path) || 'workspace',
+              kind: 'directory',
+              listing,
+              entries: Array.isArray(listing?.entries) ? listing.entries : [],
+              loaded_at: Date.now(),
+              loading: false,
+              error: ''
+            }
+            : item
+        )));
+      } catch (error) {
+        setOpenFiles((current) => current.map((item) => (
+          item.path === path ? { ...item, loading: false, error: error?.message || '读取目录失败' } : item
+        )));
+        if (options.throwOnError) throw error;
+      }
+      return;
+    }
     setOpenFiles((current) => {
       if (current.some((item) => item.path === path)) return current;
       return [...current, { ...entry, path, kind: workspaceFileKind(entry), loading: true }];
     });
     const initialKind = workspaceFileKind(path);
     if (initialKind === 'pdf') {
-      await loadPdfPreviewIntoTab({ ...entry, path });
+      await loadPdfPreviewIntoTab({ ...entry, path }, { keepExistingPreview: options.keepExistingPreview });
       return;
     }
     if (initialKind === 'presentation') {
@@ -1269,7 +2425,7 @@ function App() {
       return;
     }
     try {
-      const file = await loadWorkspaceFile(selected.serverId, selected.conversationId, path);
+      const file = await loadWorkspaceFileCached(selected.serverId, conversationId, path, undefined, { force: true, cache: false });
       const kind = workspaceFileKind(path);
       const data = kind === 'image'
         ? workspaceFileImageDataUrl(path, file)
@@ -1283,6 +2439,7 @@ function App() {
             language: fileExtension(path),
             content: file?.encoding === 'utf8' ? file.data || '' : '',
             data_url: kind === 'image' ? data : '',
+            loaded_at: Date.now(),
             loading: false
           }
           : item
@@ -1291,17 +2448,51 @@ function App() {
       setOpenFiles((current) => current.map((item) => (
         item.path === path ? { ...item, loading: false, error: error?.message || '读取文件失败' } : item
       )));
+      if (options.throwOnError) throw error;
     }
-  }, [selected, loadPdfPreviewIntoTab]);
+  }, [selected, loadPdfPreviewIntoTab, loadWorkspaceFileCached]);
+
+  const openWorkspacePathTarget = useCallback(async (target) => {
+    if (!selected || target?.path === undefined || target?.path === null) return;
+    const path = normalizeWorkspacePath(target.path);
+    const conversationId = String(target.conversationId || selected.conversationId || '').trim();
+    if (!conversationId) return;
+    const name = fileNameFromPath(path) || 'workspace';
+    const shouldTryDirectory = Boolean(target.explicitDirectory) || !fileExtension(path);
+    if (shouldTryDirectory) {
+      try {
+        await openWorkspaceFile({ path, name, kind: 'directory', conversationId }, { throwOnError: true });
+        return;
+      } catch (error) {
+        if (target.explicitDirectory) throw error;
+      }
+    }
+    await openWorkspaceFile({ path, name, conversationId }, { throwOnError: true });
+  }, [selected, openWorkspaceFile]);
+
+  const openChatLocalLink = useCallback((href) => {
+    if (!selected) return false;
+    const target = workspaceTargetFromLocalLink(href, selected.conversationId, messageAttachmentWorkspaceRoots);
+    if (target?.path === undefined || target?.path === null) return false;
+    openWorkspacePathTarget(target).catch((error) => {
+      window.alert(error?.message || '打开本地链接失败');
+    });
+    return true;
+  }, [selected, messageAttachmentWorkspaceRoots, openWorkspacePathTarget]);
+
+  const refreshWorkspacePreviewFile = useCallback((file) => {
+    if (!file || file.path === undefined || file.path === null) return Promise.resolve();
+    return openWorkspaceFile(file, { keepExistingPreview: true });
+  }, [openWorkspaceFile]);
 
   const resolveMarkdownAsset = useCallback(async (markdownPath, rawSrc) => {
     const source = String(rawSrc || '').trim();
     if (!source || /^(?:https?:|data:|blob:|file:)/i.test(source)) return source;
     const path = resolveWorkspaceAssetPath(markdownPath, source);
     if (!selected || !path || workspaceFileKind(path) !== 'image') return source;
-    const file = await loadWorkspaceFile(selected.serverId, selected.conversationId, path);
+    const file = await loadWorkspaceFileCached(selected.serverId, selected.conversationId, path, undefined, { force: true, cache: false });
     return workspaceFileImageDataUrl(path, file) || source;
-  }, [selected]);
+  }, [selected, loadWorkspaceFileCached]);
 
   const uploadWorkspaceItems = useCallback(async (targetPath, dataTransferItems) => {
     if (!selected || !dataTransferItems?.length) return;
@@ -1327,6 +2518,10 @@ function App() {
         path: target,
         data: archive
       });
+      removeWorkspaceResourceCache('workspace-listing', [selected.serverId, selected.conversationId, target, 500]);
+      removeWorkspaceResourceCache('workspace-listing', [selected.serverId, selected.conversationId, parentWorkspacePath(target), 500]);
+      removeWorkspaceResourceCache('workspace-file', [selected.serverId, selected.conversationId, target, 'full']);
+      removeWorkspaceResourceCache('workspace-file', [selected.serverId, selected.conversationId, target, MESSAGE_IMAGE_PREVIEW_MAX_BYTES]);
       setWorkspaceListings((current) => {
         const next = new Map(current);
         next.delete(target);
@@ -1338,18 +2533,20 @@ function App() {
     } catch (error) {
       finishTransfer(id, { state: 'failed', detail: error?.message || '上传失败' });
     }
-  }, [selected, upsertTransfer, finishTransfer, fetchWorkspacePath]);
+  }, [selected, upsertTransfer, finishTransfer, fetchWorkspacePath, removeWorkspaceResourceCache]);
 
   const downloadWorkspaceEntry = useCallback(async (entry) => {
     if (!selected || !entry) return;
     const id = `download-${Date.now()}`;
     const path = normalizeWorkspacePath(entry.path);
+    const conversationId = String(entry.conversationId || entry.conversation_id || selected.conversationId || '').trim();
+    if (!conversationId) return;
     const kind = workspaceEntryKind(entry) === 'directory' ? 'directory' : 'file';
     try {
       upsertTransfer(id, { type: 'download', title: kind === 'file' ? '下载文件' : '下载文件夹', detail: entry.name || path, state: 'running' });
       const result = await window.stellacode2.downloadWorkspace({
         serverId: selected.serverId,
-        conversationId: selected.conversationId,
+        conversationId,
         path,
         kind,
         suggestedName: entry.name || fileNameFromPath(path)
@@ -1364,44 +2561,37 @@ function App() {
   }, [selected, upsertTransfer, finishTransfer]);
 
   const openMessageAttachment = useCallback((attachment) => {
-    if (!attachment?.path) return;
+    const target = messageAttachmentWorkspaceTarget(attachment);
+    const path = target?.path || messageAttachmentWorkspacePath(attachment);
+    if (!path || !target?.conversationId) return;
     openWorkspaceFile({
       ...attachment,
-      path: attachment.path,
-      name: attachment.name || fileNameFromPath(attachment.path),
+      path,
+      conversationId: target.conversationId,
+      name: attachment.name || fileNameFromPath(path),
       type: attachment.kind
     }).catch(() => {});
-  }, [openWorkspaceFile]);
+  }, [messageAttachmentWorkspacePath, messageAttachmentWorkspaceTarget, openWorkspaceFile]);
 
   const downloadMessageAttachment = useCallback((attachment) => {
-    if (!attachment?.path) return;
+    const target = messageAttachmentWorkspaceTarget(attachment);
+    const path = target?.path || messageAttachmentWorkspacePath(attachment);
+    if (!path || !target?.conversationId) return;
     downloadWorkspaceEntry({
       ...attachment,
-      path: attachment.path,
-      name: attachment.name || fileNameFromPath(attachment.path),
+      path,
+      conversationId: target.conversationId,
+      name: attachment.name || fileNameFromPath(path),
       type: attachment.kind
     }).catch(() => {});
-  }, [downloadWorkspaceEntry]);
+  }, [downloadWorkspaceEntry, messageAttachmentWorkspacePath, messageAttachmentWorkspaceTarget]);
 
   useEffect(() => {
-    if (!selected) return;
-    const key = conversationKey(selected.serverId, selected.conversationId);
-    if (statuses.has(key)) return;
-    let disposed = false;
-    loadStatus(selected.serverId, selected.conversationId)
-      .then((status) => {
-        if (disposed) return;
-        setStatuses((prev) => new Map(prev).set(key, status));
-      })
-      .catch(() => {});
-    return () => {
-      disposed = true;
-    };
-  }, [selected, statuses]);
-
-  useEffect(() => {
-    if (!selected) return;
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    if (!selectedServerId || !selectedConversationId) return;
+    const serverId = selectedServerId;
+    const conversationId = selectedConversationId;
+    const sessionId = selectedSessionId;
+    const key = conversationKey(serverId, conversationId, sessionId);
     let disposed = false;
     let reconnectTimer = null;
 
@@ -1421,8 +2611,43 @@ function App() {
       }
     };
 
+    const cacheMessages = (next) => {
+      writeMessageCache(serverId, conversationId, sessionId, next);
+    };
+
+    const clearMessageCache = () => {
+      removeMessageCache(serverId, conversationId, sessionId);
+    };
+
+    const updateSelectedSessionSummary = (latestMessage, latestId, latestIndex) => {
+      if (!latestId || !Number.isFinite(latestIndex)) return;
+      setConversations((current) => {
+        const next = current.map((conversation) => {
+          if (conversation.conversation_id !== conversationId) return conversation;
+          const session = foregroundSessions(conversation).find((item) => (
+            String(item?.id || 'main') === sessionId
+          ));
+          const currentCount = Number(session?.message_count || conversation?.message_count || 0);
+          return patchConversationForegroundSession(conversation, sessionId, {
+            last_message_id: String(latestId),
+            last_message_time: latestMessage?.message_time || new Date().toISOString(),
+            message_count: Math.max(currentCount, latestIndex + 1)
+          });
+        });
+        conversationsRef.current = next;
+        return next;
+      });
+      markConversationRead(serverId, conversationId, sessionId, latestId);
+    };
+
     const applyIncomingMessages = (incoming) => {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
+      const protocolMismatches = committedMessageProtocolMismatches(messagesRef.current, incoming);
+      if (protocolMismatches.length > 0) {
+        console.warn('stream provisional message differed from durable commit', protocolMismatches);
+        setSessionActivity('流式消息和落盘消息不一致，已使用落盘消息');
+      }
+      const finalizedActivities = streamFinalizedActivityIds(incoming);
       const delta = usageDeltaFromMessages(key, incoming, seenUsageMessagesRef.current);
       if (delta.totalTokens > 0 || delta.cost > 0) {
         setStatusDeltas((current) => {
@@ -1434,22 +2659,20 @@ function App() {
       setMessages((current) => {
         const next = mergeMessages(current, incoming);
         messagesRef.current = next;
+        cacheMessages(next);
         return next;
       });
-      const latestId = incoming.reduce((max, message) => {
-        const id = Number(message?.id ?? message?.message_id);
-        return Number.isFinite(id) ? Math.max(max, id) : max;
-      }, -1);
-      if (latestId >= 0) {
-        setConversations((current) => current.map((conversation) => (
-          conversation.conversation_id === selected.conversationId
-            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestId + 1) }
-            : conversation
-        )));
-        markConversationRead(selected.serverId, selected.conversationId, latestId);
-      }
+      const latestMessage = incoming.reduce((latest, message) => (
+        !latest || messageIndex(message) >= messageIndex(latest) ? message : latest
+      ), null);
+      const latestId = latestMessage?.id ?? latestMessage?.message_id;
+      const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
+      updateSelectedSessionSummary(latestMessage, latestId, latestIndex);
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
+      if (finalizedActivities.size > 0) {
+        updateRunningActivities((current) => current.filter((item) => !finalizedActivities.has(item.id)));
+      }
       if (incoming.some((message) => isFinalAssistantMessage(message))) {
         setTimeout(() => {
           if (!disposed && websocketKeyRef.current === key) {
@@ -1462,76 +2685,271 @@ function App() {
     const replaceWithRecentMessages = (incoming) => {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
       messagesRef.current = incoming;
+      cacheMessages(incoming);
       setMessages(incoming);
-      const latestId = incoming.reduce((max, message) => {
-        const id = Number(message?.id ?? message?.message_id);
-        return Number.isFinite(id) ? Math.max(max, id) : max;
-      }, -1);
-      if (latestId >= 0) {
-        setConversations((current) => current.map((conversation) => (
-          conversation.conversation_id === selected.conversationId
-            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestId + 1) }
-            : conversation
-        )));
-        markConversationRead(selected.serverId, selected.conversationId, latestId);
-      }
+      const latestMessage = incoming.reduce((latest, message) => (
+        !latest || messageIndex(message) >= messageIndex(latest) ? message : latest
+      ), null);
+      const latestId = latestMessage?.id ?? latestMessage?.message_id;
+      const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
+      updateSelectedSessionSummary(latestMessage, latestId, latestIndex);
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
     };
 
+    const appendStreamBuffer = (bufferKey, delta) => {
+      if (!delta) return streamBuffersRef.current.get(bufferKey) || '';
+      const next = `${streamBuffersRef.current.get(bufferKey) || ''}${delta}`;
+      streamBuffersRef.current.set(bufferKey, next);
+      return next;
+    };
+
+    const applySessionStream = (rawEvent) => {
+      const event = normalizedStreamEvent(rawEvent);
+      const type = streamEventType(event);
+      if (!type || disposed || websocketKeyRef.current !== key) return;
+      const messageId = streamActivityBaseId(event);
+      const scopedChatState = (state) => ({ scopeKey: key, ...state });
+      const keepOrSetRunningState = (current, eventPayload) => (
+        chatSessionStateIsActive(current) && current.scopeKey === key
+          ? current
+          : scopedChatState({ state: 'running', currentTurnState: eventPayload })
+      );
+
+      if (type === 'turn_started' || type === 'stream_turn_start') {
+        setChatSessionState(scopedChatState({
+          state: 'running',
+          currentTurnState: event,
+          activeTurnId: String(event?.turn_id || event?.turnId || '').trim()
+        }));
+        setSessionActivity('正在处理');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== 'thinking'),
+          {
+            id: 'thinking',
+            title: '正在处理',
+            detail: '等待模型响应',
+            state: 'running'
+          }
+        ]);
+        return;
+      }
+
+      if (type === 'turn_completed' || type === 'stream_turn_done') {
+        setChatSessionState(scopedChatState({ state: 'idle' }));
+        setSessionActivity('已完成');
+        const turnId = String(event?.turn_id || event?.turnId || '').trim();
+        setMessages((current) => {
+          const next = removeStreamingMessagesForTurn(current, turnId);
+          if (next !== current) {
+            messagesRef.current = next;
+            cacheMessages(next);
+          }
+          return next;
+        });
+        setTimeout(() => {
+          if (!disposed && websocketKeyRef.current === key) {
+            setRunningActivities([]);
+          }
+        }, 700);
+        return;
+      }
+
+      if (type === 'plan_updated') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
+        const progress = normalizeProgressFeedback({ type: 'turn_progress', progress: event });
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
+          mergeProgressActivity(current, progress)
+        ]);
+        setSessionActivity(progress.detail || progress.title || '已更新计划');
+        return;
+      }
+
+      if (type === 'stream_assistant_message_delta') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
+        const delta = streamDeltaText(event);
+        if (!delta) return;
+        setMessages((current) => {
+          const next = appendStreamAssistantDelta(current, event);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity('正在回复');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-assistant-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-assistant-${messageId}`,
+            title: '正在回复',
+            detail: shortText(delta, 72),
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_reasoning_summary_part_added') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
+        setSessionActivity('思考中');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-reasoning-${messageId}`,
+            title: '思考中',
+            detail: '整理推理摘要',
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_reasoning_summary_delta') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
+        const summaryIndex = event?.summary_index ?? event?.summaryIndex ?? 0;
+        const bufferKey = `${key}:reasoning:${messageId}:${summaryIndex}`;
+        const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
+        setMessages((current) => {
+          const next = appendStreamReasoningSummary(current, event);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity('思考中');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-reasoning-${messageId}`,
+            title: '思考中',
+            detail: shortText(text || '整理推理摘要', 96),
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_tool_call_delta') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
+        const itemId = streamItemId(event);
+        const bufferKey = `${key}:tool:${itemId}`;
+        const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
+        setMessages((current) => {
+          const next = appendStreamToolCallDelta(current, event);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity('准备调用工具');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-tool-${itemId}`,
+            title: '准备调用工具',
+            detail: shortText(text, 96),
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_tool_result_done') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
+        const toolResult = event?.tool_result || event?.toolResult || {};
+        const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.batch_id || event?.batchId || streamItemId(event)).trim();
+        const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
+        setMessages((current) => {
+          const next = appendStreamToolResultDone(current, event);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity(`${toolName} 已返回`);
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== `stream-tool-result-${itemId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-tool-result-${itemId || toolName}`,
+            title: `${toolName} 已返回`,
+            detail: toolName,
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_error') {
+        setChatSessionState(scopedChatState({ state: 'failed', lastError: streamErrorText(event) }));
+        const error = streamErrorText(event);
+        setMessages((current) => {
+          const next = applyStreamErrorToMessages(current, event);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity(error);
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-assistant-${messageId}` && item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-error-${messageId}`,
+            title: '响应失败',
+            detail: shortText(error, 96),
+            state: 'failed'
+          })
+        ]);
+      }
+    };
+
     const loadInitialMessagePage = async () => {
-      const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
+      const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
+      const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
       const initial = await loadMessages(
-        selected.serverId,
-        selected.conversationId,
-        recentMessagePageParams(conversation)
+        serverId,
+        conversationId,
+        { ...recentMessagePageParams(session), foregroundSessionId: sessionId }
       );
       if (disposed || websocketKeyRef.current !== key) return;
       setMessages((current) => {
         const next = current.length ? mergeMessages(current, initial) : initial;
         messagesRef.current = next;
+        cacheMessages(next);
         return next;
       });
       setMessagesReady(true);
     };
 
     const reconcileAck = async (ack) => {
-      const nextId = String(ack?.next_message_id || '');
-      if (!nextId || disposed || websocketKeyRef.current !== key) return;
-      const nextIndex = Number(nextId);
-      if (!Number.isFinite(nextIndex)) return;
+      const total = Number(ack?.next_message_index ?? ack?.total ?? ack?.next_message_id);
+      if (!Number.isFinite(total) || disposed || websocketKeyRef.current !== key) return;
       const current = messagesRef.current;
-      const lastId = lastMessageId(current);
-      if (!lastId) {
-        if (nextIndex <= 0) {
+      const lastIndex = lastServerMessageIndex(current);
+      if (lastIndex === undefined) {
+        if (total <= 0) {
           messagesRef.current = [];
+          clearMessageCache();
           setMessages([]);
           setMessagesReady(true);
           return;
         }
         const initial = await loadMessages(
-          selected.serverId,
-          selected.conversationId,
-          recentMessagePageParams(null, 40, nextIndex)
+          serverId,
+          conversationId,
+          { ...recentMessagePageParams(null, 40, total), foregroundSessionId: sessionId }
         );
         if (!disposed && websocketKeyRef.current === key) {
           setMessages((current) => {
             const next = current.length ? mergeMessages(current, initial) : initial;
             messagesRef.current = next;
+            cacheMessages(next);
             return next;
           });
           setMessagesReady(true);
         }
         return;
       }
-      const lastIndex = Number(lastId);
-      if (Number.isFinite(lastIndex) && nextIndex > lastIndex + 1) {
-        const gap = nextIndex - lastIndex - 1;
+      if (total > lastIndex + 1) {
+        const gap = total - lastIndex - 1;
         const shouldJumpToTail = gap > 200;
         const params = shouldJumpToTail
-          ? recentMessagePageParams(null, 80, nextIndex)
+          ? recentMessagePageParams(null, 80, total)
           : { offset: lastIndex + 1, limit: gap };
-        const missing = await loadMessages(selected.serverId, selected.conversationId, params);
+        const missing = await loadMessages(serverId, conversationId, {
+          ...params,
+          foregroundSessionId: sessionId
+        });
         if (shouldJumpToTail) {
           replaceWithRecentMessages(missing);
         } else {
@@ -1543,11 +2961,103 @@ function App() {
       }
     };
 
+    const applyChatSnapshotLiveProjection = (snapshot) => {
+      if (!snapshot || disposed || websocketKeyRef.current !== key) return;
+      const snapshotState = chatSnapshotState(snapshot);
+      const provisional = snapshot.current_provisional_assistant_message?.message;
+      if (provisional) {
+        const turnId = String(snapshot.current_turn_state?.turn_id || snapshot.current_turn_state?.turnId || '').trim();
+        const projected = {
+          ...provisional,
+          id: provisional.id || provisional.message_id || provisional.messageId || turnId || undefined,
+          message_id: provisional.message_id || provisional.messageId || provisional.id || turnId || undefined,
+          _streamTurnId: turnId || provisional._streamTurnId || '',
+          _streaming: true
+        };
+        setMessages((current) => {
+          const next = mergeMessages(current, [projected]);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity('正在回复');
+      }
+      const toolStates = Array.isArray(snapshot.running_tool_results)
+        ? snapshot.running_tool_results
+        : [];
+      const queuedMessages = Array.isArray(snapshot.queued_outbound_messages)
+        ? snapshot.queued_outbound_messages
+        : [];
+      if (queuedMessages.length > 0) {
+        setMessages((current) => {
+          let next = current;
+          queuedMessages.forEach((queued) => {
+            next = markQueuedUserMessage(next, queued?.client_message_id || queued?.clientMessageId);
+          });
+          messagesRef.current = next;
+          return next;
+        });
+      }
+      const activities = toolStates
+        .filter((state) => !state?.committed)
+        .map((state) => state?.tool_result || state?.toolResult || state)
+        .filter(Boolean)
+        .map((toolResult) => {
+          const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || toolResult.tool_name || toolResult.toolName || '').trim();
+          const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
+          return {
+            id: `stream-tool-result-${itemId || toolName}`,
+            title: `${toolName} 已返回`,
+            detail: toolName,
+            state: 'running'
+          };
+        });
+      if (activities.length > 0) {
+        setMessages((current) => {
+          let next = current;
+          toolStates.forEach((state) => {
+            if (state?.committed) return;
+            next = appendStreamToolResultDone(next, {
+              turn_id: state?.turn_id || state?.turnId || snapshot.current_turn_state?.turn_id,
+              tool_result: state?.tool_result || state?.toolResult || state
+            });
+          });
+          messagesRef.current = next;
+          return next;
+        });
+        updateRunningActivities((current) => [
+          ...current.filter((item) => !activities.some((activity) => activity.id === item.id) && item.id !== 'thinking'),
+          ...activities
+        ]);
+        setSessionActivity(activities[activities.length - 1]?.title || '正在处理');
+      } else if (snapshotState.state === 'running' && !provisional) {
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== 'thinking'),
+          {
+            id: 'thinking',
+            title: '正在处理',
+            detail: '等待模型响应',
+            state: 'running'
+          }
+        ]);
+        setSessionActivity('正在处理');
+      } else if (snapshotState.state === 'idle') {
+        setMessages((current) => {
+          const next = removeStreamingMessagesForTurn(current);
+          if (next !== current) {
+            messagesRef.current = next;
+            cacheMessages(next);
+          }
+          return next;
+        });
+        setRunningActivities([]);
+      }
+    };
+
     const connect = async () => {
       try {
-        const info = await connectionInfo(selected.serverId);
+        const info = await connectionInfo(serverId);
         if (disposed || websocketKeyRef.current !== key) return;
-        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, selected.conversationId));
+        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, conversationId, sessionId));
         websocketRef.current = socket;
         socket.addEventListener('message', (event) => {
           let payload;
@@ -1556,39 +3066,37 @@ function App() {
           } catch {
             return;
           }
-          if (payload.type === 'subscription_ack') {
+          const payloadType = String(payload?.type || '');
+          if (payloadType === 'chat.snapshot') {
+            const snapshotState = chatSnapshotState(payload);
+            setChatSessionState({ scopeKey: key, ...snapshotState });
             setSessionActivity(payload.reason === 'session_changed' ? 'Session 已切换' : '实时连接已同步');
-            if (payload.turn_progress) {
-              const progress = normalizeProgressFeedback(payload.turn_progress);
-              setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
-              updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
-                mergeProgressActivity(current, progress)
-              ]);
-            }
             reconcileAck(payload).catch(() => {});
-          } else if (payload.type === 'messages') {
-            applyIncomingMessages(payload.messages || []);
-          } else if (payload.type === 'turn_progress') {
-            const progress = normalizeProgressFeedback(payload);
-            setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
-            if (progress.state === 'done' || progress.state === 'failed') {
-              updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
-                mergeProgressActivity(current, progress)
-              ]);
-              setTimeout(() => {
-                if (!disposed && websocketKeyRef.current === key) {
-                  setRunningActivities([]);
-                }
-              }, 900);
-            } else {
-              updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
-                mergeProgressActivity(current, progress)
-              ]);
-            }
-          } else if (payload.type === 'error') {
+            applyChatSnapshotLiveProjection(payload);
+          } else if (payloadType === 'chat.user_message_queued') {
+            setChatSessionState({ scopeKey: key, state: 'queued' });
+            setMessages((current) => {
+              const next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
+              messagesRef.current = next;
+              return next;
+            });
+            setSessionActivity('消息已排队');
+          } else if (payloadType === 'chat.user_message_started') {
+            setChatSessionState((current) => chatSessionStateIsActive(current) && current.scopeKey === key ? current : { scopeKey: key, state: 'queued' });
+            setSessionActivity('开始处理');
+          } else if (payloadType === 'chat.user_message_committed') {
+            setChatSessionState((current) => chatSessionStateIsActive(current) && current.scopeKey === key ? current : { scopeKey: key, state: 'queued' });
+            applyIncomingMessages(payload.message ? [payload.message] : []);
+            setSessionActivity('用户消息已落盘');
+          } else if (payloadType === 'chat.message_appended') {
+            applyIncomingMessages(payload.message ? [payload.message] : []);
+          } else if (
+            payloadType.startsWith('chat.stream_')
+            || payloadType === 'chat.plan_updated'
+          ) {
+            applySessionStream(payload);
+          } else if (payloadType === 'error') {
+            setChatSessionState({ scopeKey: key, state: 'failed', lastError: payload.message || payload.error || '实时连接错误' });
             setSessionActivity(payload.message || payload.error || '实时连接错误');
           }
         });
@@ -1603,13 +3111,18 @@ function App() {
         });
       } catch {
         if (!disposed) setSessionActivity('实时连接不可用，使用刷新兜底');
-        const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
-        loadMessages(selected.serverId, selected.conversationId, recentMessagePageParams(conversation))
+        const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
+        const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
+        loadMessages(serverId, conversationId, {
+          ...recentMessagePageParams(session),
+          foregroundSessionId: sessionId
+        })
           .then((initial) => {
             if (disposed || websocketKeyRef.current !== key) return;
             setMessages((current) => {
               const next = current.length ? mergeMessages(current, initial) : initial;
               messagesRef.current = next;
+              cacheMessages(next);
               return next;
             });
             setMessagesReady(true);
@@ -1625,10 +3138,13 @@ function App() {
 
     closeSocket();
     websocketKeyRef.current = key;
-    messagesRef.current = [];
-    setMessages([]);
-    setMessagesReady(false);
+    const cachedMessages = readMessageCache(serverId, conversationId, sessionId);
+    messagesRef.current = cachedMessages;
+    streamBuffersRef.current = new Map();
+    setMessages(cachedMessages);
+    setMessagesReady(cachedMessages.length > 0);
     setSessionActivity('');
+    setChatSessionState({ scopeKey: key, state: 'idle' });
     setRunningActivities([]);
     loadInitialMessagePage().catch(() => {
       if (!disposed && websocketKeyRef.current === key && messagesRef.current.length === 0) {
@@ -1643,7 +3159,7 @@ function App() {
       if (websocketKeyRef.current === key) websocketKeyRef.current = '';
       closeSocket();
     };
-  }, [selected, markConversationRead]);
+  }, [selectedServerId, selectedConversationId, selectedSessionId, markConversationRead]);
 
   const toggleSidebar = () => {
     const nextMode = sidebarMode === 'collapsed' ? 'expanded' : 'collapsed';
@@ -1786,45 +3302,103 @@ function App() {
 
   const loadOlderMessages = useCallback(async () => {
     if (!selected || loadingOlderRef.current || !hasOlderMessages(messagesRef.current)) return false;
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
     const anchorId = firstMessageId(messagesRef.current);
     if (!anchorId) return false;
     loadingOlderRef.current = true;
     try {
-      const anchorIndex = Math.max(0, Number(anchorId) || 0);
+      const anchor = messagesRef.current[0];
+      const anchorIndex = Math.max(0, messageIndex(anchor) || 0);
       const offset = Math.max(0, anchorIndex - 40);
       const limit = anchorIndex - offset;
       const older = limit > 0 ? await loadMessages(selected.serverId, selected.conversationId, {
         offset,
-        limit
+        limit,
+        foregroundSessionId: selectedSessionId
       }) : [];
       if (websocketKeyRef.current !== key || !older.length) return false;
       setMessages((current) => {
         const next = mergeMessages(current, older);
         messagesRef.current = next;
+        writeMessageCache(selected.serverId, selected.conversationId, selectedSessionId, next);
         return next;
       });
       return true;
     } finally {
       loadingOlderRef.current = false;
     }
-  }, [selected]);
+  }, [selected, selectedSessionId]);
 
   const loadAvailableModels = useCallback(async () => {
     if (!selected?.serverId) return [];
     return loadModels(selected.serverId);
   }, [selected?.serverId]);
 
+  const loadPropertiesModels = useCallback(async () => {
+    if (!activeServerId) return [];
+    setPropertiesModelsLoading(true);
+    setPropertiesModelsError('');
+    try {
+      const nextModels = await loadModels(activeServerId);
+      setPropertiesModels(Array.isArray(nextModels) ? nextModels : []);
+      return nextModels;
+    } catch (error) {
+      setPropertiesModels([]);
+      setPropertiesModelsError(error?.message || '无法读取模型列表');
+      return [];
+    } finally {
+      setPropertiesModelsLoading(false);
+    }
+  }, [activeServerId]);
+
+  const postConversationControlCommand = useCallback(async (conversation, command) => {
+    if (!activeServerId || !conversation || !command) return;
+    const targetSessionId = selected?.conversationId === conversation.conversation_id
+      ? selectedSessionId
+      : foregroundSessions(conversation).find((session) => session?.is_main)?.id || foregroundSessions(conversation)[0]?.id || 'main';
+    setPropertiesApplying(true);
+    try {
+      await postConversationMessage(activeServerId, conversation.conversation_id, command, activeUserName, [], [], targetSessionId);
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+      if (selected?.conversationId === conversation.conversation_id) {
+        setSessionActivity(controlCommandActivity(command));
+      }
+    } catch (error) {
+      window.alert(error?.message || '更新 Conversation 设置失败');
+    } finally {
+      setPropertiesApplying(false);
+    }
+  }, [activeServerId, activeUserName, selected?.conversationId, selectedSessionId]);
+
+  const switchConversationModel = useCallback((conversation, model) => {
+    const alias = String(model || '').trim();
+    if (!alias) return;
+    postConversationControlCommand(conversation, `/model ${alias}`);
+  }, [postConversationControlCommand]);
+
+  const switchConversationReasoning = useCallback((conversation, effort) => {
+    const value = String(effort || '').trim();
+    if (!value) return;
+    postConversationControlCommand(conversation, `/reasoning ${value}`);
+  }, [postConversationControlCommand]);
+
+  const switchConversationIdleCompact = useCallback((conversation, value) => {
+    const normalized = String(value || '').trim();
+    if (!normalized) return;
+    postConversationControlCommand(conversation, `/idle_compact ${normalized}`);
+  }, [postConversationControlCommand]);
+
   const sendMessage = useCallback(async (text, files = [], selections = []) => {
     const value = String(text || '').trim();
     const outgoingFiles = Array.isArray(files) ? files : [];
     const outgoingSelections = Array.isArray(selections) ? selections : [];
     if ((!value && outgoingFiles.length === 0 && outgoingSelections.length === 0) || !selected || sending) return false;
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
     const commandState = outgoingFiles.length > 0
       ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
       : slashCommandState(value);
-    const previousLastServerId = lastServerMessageId(messagesRef.current);
+    const previousLastServerIndex = lastServerMessageIndex(messagesRef.current);
     const optimistic = {
       id: `local-${Date.now()}`,
       role: 'user',
@@ -1853,7 +3427,7 @@ function App() {
       return next;
     });
     try {
-      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections);
+      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections, selectedSessionId, optimistic.id);
       setSelectionReferences((current) => current.filter((item) => !outgoingSelections.some((sent) => sent.id === item.id)));
       if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {
@@ -1881,15 +3455,17 @@ function App() {
         ]);
       }
       if (!commandState.control) {
-        const offset = previousLastServerId ? Number(previousLastServerId) + 1 : 0;
+        const offset = previousLastServerIndex !== undefined ? previousLastServerIndex + 1 : 0;
         const incoming = await loadMessages(selected.serverId, selected.conversationId, {
           offset,
-          limit: 80
+          limit: 80,
+          foregroundSessionId: selectedSessionId
         });
         if (websocketKeyRef.current === key) {
           setMessages((current) => {
             const next = mergeMessages(current, incoming);
             messagesRef.current = next;
+            writeMessageCache(selected.serverId, selected.conversationId, selectedSessionId, next);
             return next;
           });
         }
@@ -1913,7 +3489,7 @@ function App() {
     } finally {
       if (websocketKeyRef.current === key) setSending(false);
     }
-  }, [selected, sending, activeUserName]);
+  }, [selected, selectedSessionId, sending, activeUserName]);
 
   const addSelectionReference = useCallback((selection) => {
     if (!selection?.file_path || !selection?.selected_text) return;
@@ -1925,11 +3501,12 @@ function App() {
   }, []);
 
   const title = activeConversation
-    ? displayConversationName(activeConversation)
+    ? displayForegroundSessionName(activeForegroundSession, activeConversation)
     : 'Stellacode';
   const subtitle = activeConversation
-    ? [activeConversation.nickname || activeConversation.platform_chat_id, formatModel(activeConversation, selectedConversationStatus), sessionActivity].filter(Boolean).join(' · ')
+    ? [displayConversationName(activeConversation), formatModel(activeConversation, selectedConversationStatus), sessionActivity].filter(Boolean).join(' · ')
     : '选择或创建一个 Conversation';
+  const conversationListUi = settings?.conversationListUi?.[activeServerId] || {};
 
   return (
     <div
@@ -1974,16 +3551,24 @@ function App() {
         sidebarMode={sidebarMode}
         conversations={conversations}
         hiddenConversationIds={settings?.hiddenConversations?.[activeServerId] || []}
+        conversationOrder={conversationListUi.order || []}
+        openConversationIds={conversationListUi.openConversationIds || []}
         statuses={statuses}
         selected={selected}
         loading={loading}
-        activeRunning={runningActivities.length > 0}
+        activeRunningKey={runningActivities.length > 0 && chatSessionStateIsActive(chatSessionState) ? chatSessionState.scopeKey || '' : ''}
         onSelect={setSelected}
         onOpenSettings={() => setSettingsOpen(true)}
-        onRename={renameSelectedConversation}
+        onRename={openRenameConversationDialog}
+        onOpenProperties={(conversation) => setPropertiesConversation(conversation)}
         onHide={(conversation) => setConversationHidden(conversation, true)}
         onUnhide={(conversation) => setConversationHidden(conversation, false)}
         onDelete={deleteSelectedConversation}
+        onConversationOrderChange={(order) => updateConversationListUi({ order })}
+        onOpenFoldersChange={(openConversationIds) => updateConversationListUi({ openConversationIds })}
+        onCreateSession={createConversationForegroundSession}
+        onRenameSession={renameConversationForegroundSession}
+        onDeleteSession={deleteConversationForegroundSession}
       />
       {sidebarMode !== 'collapsed' && (
         <button
@@ -1996,7 +3581,7 @@ function App() {
       <main className="content-area">
         <ChatWorkspace
           title={title}
-          conversationKey={selected ? conversationKey(selected.serverId, selected.conversationId) : ''}
+          conversationKey={selectedKey}
           modelSelectionPending={Boolean(activeConversation?.model_selection_pending ?? selectedConversationStatus?.model_selection_pending)}
           messages={messages}
           messagesReady={messagesReady}
@@ -2006,11 +3591,14 @@ function App() {
           onSend={sendMessage}
           onLoadModels={loadAvailableModels}
           sending={sending}
+          processing={selectedProcessing}
           runningActivities={runningActivities}
           selectionReferences={selectionReferences}
           onRemoveSelectionReference={(id) => setSelectionReferences((current) => current.filter((item) => item.id !== id))}
           onOpenAttachment={openMessageAttachment}
           onDownloadAttachment={downloadMessageAttachment}
+          onResolveAttachmentUrl={resolveMessageAttachmentUrl}
+          onOpenLocalLink={openChatLocalLink}
         />
       </main>
       <OverviewPanel
@@ -2041,9 +3629,11 @@ function App() {
         activeFilePath={activeFilePath}
         onSelectFile={setActiveFilePath}
         onDownloadFile={downloadWorkspaceEntry}
+        onRefreshFile={refreshWorkspacePreviewFile}
         onRefreshPdfPreview={refreshPdfPreview}
         onResolveMarkdownAsset={resolveMarkdownAsset}
         onCreateSelectionReference={addSelectionReference}
+        onOpenFile={openWorkspaceFile}
         onCloseFile={(path) => {
           setOpenFiles((items) => {
             revokeFilePreviewUrls(items.filter((item) => item.path === path));
@@ -2097,6 +3687,41 @@ function App() {
         creating={creatingConversation}
         onOpenChange={setNewConversationOpen}
         onCreate={createNewConversation}
+      />
+      <RenameConversationDialog
+        open={Boolean(renamingConversation)}
+        conversation={renamingConversation}
+        saving={renamingConversationSaving}
+        onOpenChange={(open) => {
+          if (!open && !renamingConversationSaving) setRenamingConversation(null);
+        }}
+        onRename={renameSelectedConversation}
+      />
+      <RenameSessionDialog
+        open={Boolean(renamingSession)}
+        conversation={renamingSession?.conversation || null}
+        session={renamingSession?.session || null}
+        saving={renamingSessionSaving}
+        onOpenChange={(open) => {
+          if (!open && !renamingSessionSaving) setRenamingSession(null);
+        }}
+        onRename={renameSelectedForegroundSession}
+      />
+      <ConversationPropertiesDialog
+        open={Boolean(propertiesConversationCurrent)}
+        conversation={propertiesConversationCurrent}
+        status={propertiesConversationCurrent ? statuses.get(conversationKey(activeServerId, propertiesConversationCurrent.conversation_id, 'main')) : null}
+        models={propertiesModels}
+        modelsLoading={propertiesModelsLoading}
+        modelsError={propertiesModelsError}
+        applying={propertiesApplying}
+        onOpenChange={(open) => {
+          if (!open && !propertiesApplying) setPropertiesConversation(null);
+        }}
+        onLoadModels={loadPropertiesModels}
+        onSwitchModel={switchConversationModel}
+        onSwitchReasoning={switchConversationReasoning}
+        onSwitchIdleCompact={switchConversationIdleCompact}
       />
       <SettingsDialog
         open={settingsOpen}

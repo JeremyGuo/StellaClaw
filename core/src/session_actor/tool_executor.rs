@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{mpsc, Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
 };
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{select, Receiver, Sender};
 #[cfg(test)]
 use serde_json::Map;
 use serde_json::{json, Value};
@@ -14,21 +13,17 @@ use serde_json::{json, Value};
 #[cfg(test)]
 use super::tool_runtime::ExecutionTarget;
 use super::{
-    tool_catalog::{
-        execute_download_tool, execute_file_tool, execute_media_tool, execute_process_tool,
-        execute_provider_backed_media_tool, execute_skill_load_tool, execute_web_tool,
-    },
+    tool_catalog::{ToolCallContext, ToolCatalog},
     tool_runtime::{
         normalize_tool_value, parse_arguments, LocalToolError, ToolCancellationToken,
         ToolExecutionContext,
     },
-    ChatMessage, ConversationBridge, TokenEstimator, ToolBatch, ToolBatchCompletion,
-    ToolBatchError, ToolBatchExecutor, ToolBatchHandle, ToolBatchOperation, ToolConcurrency,
-    ToolExecutionOp, ToolRemoteMode, ToolResultContent, ToolResultItem,
+    ChatMessage, ConversationBridge, ProviderBackedToolModels, SearchToolModels, TokenEstimator,
+    ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle,
+    ToolBatchItem, ToolBatchOperation, ToolBatchProgress, ToolConcurrency, ToolRemoteMode,
+    ToolResultContent, ToolResultItem,
 };
 
-const TOOL_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const TOOL_COOPERATIVE_INTERRUPT_GRACE: Duration = Duration::from_millis(250);
 const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 100_000;
 const DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS: usize = 80_000;
 
@@ -38,6 +33,9 @@ pub struct LocalToolBatchExecutor {
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     token_estimator: Option<Arc<TokenEstimator>>,
+    search_tool_models: Option<SearchToolModels>,
+    provider_backed_tool_models: Option<ProviderBackedToolModels>,
+    tool_catalog: Option<ToolCatalog>,
     running_batches: Mutex<HashMap<String, RunningToolBatch>>,
 }
 
@@ -54,6 +52,9 @@ impl LocalToolBatchExecutor {
             remote_mode: ToolRemoteMode::Selectable,
             conversation_bridge: None,
             token_estimator: None,
+            search_tool_models: None,
+            provider_backed_tool_models: None,
+            tool_catalog: None,
             running_batches: Mutex::new(HashMap::new()),
         }
     }
@@ -76,21 +77,44 @@ impl LocalToolBatchExecutor {
         self
     }
 
+    pub fn with_search_tool_models(mut self, search_tool_models: SearchToolModels) -> Self {
+        self.search_tool_models = Some(search_tool_models);
+        self
+    }
+
+    pub fn with_provider_backed_tool_models(
+        mut self,
+        provider_backed_tool_models: ProviderBackedToolModels,
+    ) -> Self {
+        self.provider_backed_tool_models = Some(provider_backed_tool_models);
+        self
+    }
+
+    pub fn with_tool_catalog(mut self, tool_catalog: ToolCatalog) -> Self {
+        self.tool_catalog = Some(tool_catalog);
+        self
+    }
+
     fn spawn_batch_worker(
         &self,
         batch: ToolBatch,
         completion_tx: Sender<ToolBatchCompletion>,
-    ) -> (ToolCancellationToken, JoinHandle<()>) {
+        progress_tx: Sender<ToolBatchProgress>,
+    ) -> (Sender<()>, JoinHandle<()>) {
         let batch_id = batch.batch_id.clone();
-        let cancel_token = ToolCancellationToken::default();
+        let (interrupt_tx, interrupt_rx) = crossbeam_channel::bounded(1);
         let runner = ToolBatchRunner {
             workspace_root: self.workspace_root.clone(),
             data_root: self.data_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
             token_estimator: self.token_estimator.clone(),
-            cancel_token: cancel_token.clone(),
+            search_tool_models: self.search_tool_models.clone(),
+            provider_backed_tool_models: self.provider_backed_tool_models.clone(),
+            tool_catalog: self.tool_catalog.clone(),
+            interrupt_rx,
             operation_lock: Arc::new(RwLock::new(())),
+            progress_tx,
         };
         let join_handle = thread::spawn(move || {
             let result = runner
@@ -99,7 +123,7 @@ impl LocalToolBatchExecutor {
             let _ = completion_tx.send(ToolBatchCompletion { batch_id, result });
         });
 
-        (cancel_token, join_handle)
+        (interrupt_tx, join_handle)
     }
 
     #[cfg(test)]
@@ -128,13 +152,15 @@ impl LocalToolBatchExecutor {
             remote_mode: &self.remote_mode,
             conversation_bridge: self.conversation_bridge.as_ref(),
             token_estimator: self.token_estimator.as_deref(),
+            search_tool_models: self.search_tool_models.as_ref(),
+            provider_backed_tool_models: self.provider_backed_tool_models.as_ref(),
             cancel_token: ToolCancellationToken::default(),
         }
     }
 }
 
 struct RunningToolBatch {
-    cancel_token: ToolCancellationToken,
+    interrupt_tx: Sender<()>,
     join_handle: JoinHandle<()>,
 }
 
@@ -144,8 +170,12 @@ struct ToolBatchRunner {
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     token_estimator: Option<Arc<TokenEstimator>>,
-    cancel_token: ToolCancellationToken,
+    search_tool_models: Option<SearchToolModels>,
+    provider_backed_tool_models: Option<ProviderBackedToolModels>,
+    tool_catalog: Option<ToolCatalog>,
+    interrupt_rx: Receiver<()>,
     operation_lock: Arc<RwLock<()>>,
+    progress_tx: Sender<ToolBatchProgress>,
 }
 
 impl ToolBatchRunner {
@@ -157,19 +187,30 @@ impl ToolBatchRunner {
         let mut results = Vec::with_capacity(batch.operations.len());
         let mut index = 0;
         while index < batch.operations.len() {
-            if self.is_interrupted() {
-                results.extend(interrupted_results(&batch.operations[index..]));
+            if self.interrupt_rx.try_recv().is_ok() {
+                let interrupted = interrupted_results(&batch.operations[index..]);
+                self.emit_progress_results(&batch.batch_id, &interrupted);
+                results.extend(interrupted);
                 break;
             }
 
             if batch.operations[index].concurrency == ToolConcurrency::Serial {
                 match self.execute_operation_interruptibly(batch.operations[index].clone()) {
-                    Ok(result) => results.push(result),
-                    Err(OperationOutcome::ToolError(error)) => {
-                        results.push(tool_error_result(&batch.operations[index], error));
+                    OperationOutcome::Completed(result) => {
+                        self.emit_progress_result(&batch.batch_id, &result);
+                        results.push(result);
                     }
-                    Err(OperationOutcome::Interrupted) => {
-                        results.extend(interrupted_results(&batch.operations[index..]));
+                    OperationOutcome::ToolError(error) => {
+                        let result = tool_error_result(&batch.operations[index], error);
+                        self.emit_progress_result(&batch.batch_id, &result);
+                        results.push(result);
+                    }
+                    OperationOutcome::Interrupted(result) => {
+                        self.emit_progress_result(&batch.batch_id, &result);
+                        results.push(result);
+                        let interrupted = interrupted_results(&batch.operations[index + 1..]);
+                        self.emit_progress_results(&batch.batch_id, &interrupted);
+                        results.extend(interrupted);
                         break;
                     }
                 }
@@ -178,11 +219,15 @@ impl ToolBatchRunner {
             }
 
             let parallel_end = next_serial_operation_index(&batch.operations, index);
-            let outcome = self
-                .execute_parallel_operations_interruptibly(&batch.operations[index..parallel_end]);
+            let outcome = self.execute_parallel_operations_interruptibly(
+                &batch.batch_id,
+                &batch.operations[index..parallel_end],
+            );
             results.extend(outcome.results);
             if outcome.interrupted {
-                results.extend(interrupted_results(&batch.operations[parallel_end..]));
+                let interrupted = interrupted_results(&batch.operations[parallel_end..]);
+                self.emit_progress_results(&batch.batch_id, &interrupted);
+                results.extend(interrupted);
                 break;
             }
             index = parallel_end;
@@ -191,12 +236,25 @@ impl ToolBatchRunner {
         Ok(batch.into_result_message(results))
     }
 
-    fn execute_operation_interruptibly(
-        &self,
-        scheduled: ToolBatchOperation,
-    ) -> Result<ToolResultItem, OperationOutcome> {
-        let (result_tx, result_rx) = mpsc::channel();
-        let runner = self.operation_runner();
+    fn emit_progress_result(&self, batch_id: &str, result: &ToolResultItem) {
+        let _ = self.progress_tx.send(ToolBatchProgress {
+            batch_id: batch_id.to_string(),
+            result: result.clone(),
+        });
+    }
+
+    fn emit_progress_results(&self, batch_id: &str, results: &[ToolResultItem]) {
+        for result in results {
+            self.emit_progress_result(batch_id, result);
+        }
+    }
+
+    fn execute_operation_interruptibly(&self, scheduled: ToolBatchOperation) -> OperationOutcome {
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let (operation_interrupt_tx, operation_interrupt_rx) = crossbeam_channel::bounded(1);
+        let runner = self.operation_runner(ToolCancellationToken::from_interrupt_rx(
+            operation_interrupt_rx,
+        ));
         let operation_lock = self.operation_lock.clone();
         let join_handle = thread::spawn(move || {
             let result = execute_scheduled_operation(runner, scheduled, operation_lock);
@@ -204,15 +262,19 @@ impl ToolBatchRunner {
         });
 
         loop {
-            if self.is_interrupted() {
-                return wait_for_cooperative_interrupt(result_rx, join_handle);
-            }
-
-            match result_rx.recv_timeout(TOOL_INTERRUPT_POLL_INTERVAL) {
-                Ok(result) => return finish_operation_result(result, join_handle),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return finish_disconnected_operation(join_handle)
+            select! {
+                recv(result_rx) -> result => {
+                    return finish_operation_result(result, join_handle);
+                }
+                recv(self.interrupt_rx) -> _ => {
+                    if let Ok(result) = result_rx.try_recv() {
+                        return finish_received_operation_result(result, join_handle);
+                    }
+                    let _ = operation_interrupt_tx.send(());
+                    return match result_rx.recv() {
+                        Ok(result) => finish_received_operation_result(result, join_handle).into_interrupted(),
+                        Err(_) => finish_disconnected_operation(join_handle).into_interrupted(),
+                    };
                 }
             }
         }
@@ -220,13 +282,19 @@ impl ToolBatchRunner {
 
     fn execute_parallel_operations_interruptibly(
         &self,
+        batch_id: &str,
         operations: &[ToolBatchOperation],
     ) -> ParallelSegmentOutcome {
-        let (result_tx, result_rx) = mpsc::channel();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
         let mut join_handles = Vec::with_capacity(operations.len());
+        let mut interrupt_txs = Vec::with_capacity(operations.len());
         for (index, scheduled) in operations.iter().cloned().enumerate() {
             let result_tx = result_tx.clone();
-            let runner = self.operation_runner();
+            let (operation_interrupt_tx, operation_interrupt_rx) = crossbeam_channel::bounded(1);
+            interrupt_txs.push(Some(operation_interrupt_tx));
+            let runner = self.operation_runner(ToolCancellationToken::from_interrupt_rx(
+                operation_interrupt_rx,
+            ));
             let operation_lock = self.operation_lock.clone();
             join_handles.push(Some(thread::spawn(move || {
                 let result = execute_scheduled_operation(runner, scheduled, operation_lock);
@@ -241,34 +309,16 @@ impl ToolBatchRunner {
         let mut interrupted = false;
 
         while completed < operations.len() {
-            if self.is_interrupted() {
-                let grace_deadline = Instant::now() + TOOL_COOPERATIVE_INTERRUPT_GRACE;
-                while completed < operations.len() && Instant::now() < grace_deadline {
-                    let timeout = grace_deadline.saturating_duration_since(Instant::now());
-                    if timeout.is_zero() {
+            select! {
+                recv(result_rx) -> result => {
+                    let Ok((result_index, result)) = result else {
+                        collect_disconnected_parallel_results(
+                            operations,
+                            &mut join_handles,
+                            &mut results,
+                        );
                         break;
-                    }
-                    match result_rx.recv_timeout(timeout.min(TOOL_INTERRUPT_POLL_INTERVAL)) {
-                        Ok((result_index, result)) => {
-                            collect_parallel_result(
-                                operations,
-                                &mut join_handles,
-                                &mut results,
-                                result_index,
-                                result,
-                            );
-                            completed += 1;
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                interrupted = true;
-                break;
-            }
-
-            match result_rx.recv_timeout(TOOL_INTERRUPT_POLL_INTERVAL) {
-                Ok((result_index, result)) => {
+                    };
                     collect_parallel_result(
                         operations,
                         &mut join_handles,
@@ -276,27 +326,54 @@ impl ToolBatchRunner {
                         result_index,
                         result,
                     );
+                    if let Some(result) = results[result_index].as_ref() {
+                        self.emit_progress_result(batch_id, result);
+                    }
                     completed += 1;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    collect_disconnected_parallel_results(
-                        operations,
-                        &mut join_handles,
-                        &mut results,
-                    );
-                    break;
-                }
-            }
-        }
-
-        if interrupted {
-            for (index, result) in results.iter_mut().enumerate() {
-                if result.is_none() {
-                    *result = Some(tool_error_result(
-                        &operations[index],
-                        "tool batch interrupted before this tool completed".to_string(),
-                    ));
+                recv(self.interrupt_rx) -> _ => {
+                    interrupted = true;
+                    while let Ok((result_index, result)) = result_rx.try_recv() {
+                        collect_parallel_result(
+                            operations,
+                            &mut join_handles,
+                            &mut results,
+                            result_index,
+                            result,
+                        );
+                        if let Some(result) = results[result_index].as_ref() {
+                            self.emit_progress_result(batch_id, result);
+                        }
+                        completed += 1;
+                    }
+                    for sender in interrupt_txs.iter_mut().filter_map(Option::take) {
+                        let _ = sender.send(());
+                    }
+                    while completed < operations.len() {
+                        match result_rx.recv() {
+                            Ok((result_index, result)) => {
+                                collect_parallel_result(
+                                    operations,
+                                    &mut join_handles,
+                                    &mut results,
+                                    result_index,
+                                    result,
+                                );
+                                if let Some(result) = results[result_index].as_ref() {
+                                    self.emit_progress_result(batch_id, result);
+                                }
+                                completed += 1;
+                            }
+                            Err(_) => {
+                                collect_disconnected_parallel_results(
+                                    operations,
+                                    &mut join_handles,
+                                    &mut results,
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -315,19 +392,18 @@ impl ToolBatchRunner {
         }
     }
 
-    fn operation_runner(&self) -> ToolOperationRunner {
+    fn operation_runner(&self, cancel_token: ToolCancellationToken) -> ToolOperationRunner {
         ToolOperationRunner {
             workspace_root: self.workspace_root.clone(),
             data_root: self.data_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
             token_estimator: self.token_estimator.clone(),
-            cancel_token: self.cancel_token.clone(),
+            search_tool_models: self.search_tool_models.clone(),
+            provider_backed_tool_models: self.provider_backed_tool_models.clone(),
+            tool_catalog: self.tool_catalog.clone(),
+            cancel_token,
         }
-    }
-
-    fn is_interrupted(&self) -> bool {
-        self.cancel_token.is_cancelled()
     }
 }
 
@@ -356,7 +432,7 @@ fn execute_scheduled_operation(
                 .read()
                 .map_err(|_| "tool execution lock poisoned".to_string())?;
             runner
-                .execute_operation(&scheduled.operation)
+                .execute_operation(&scheduled.item)
                 .map_err(|error| error.to_string())
         }
         ToolConcurrency::Serial => {
@@ -364,7 +440,7 @@ fn execute_scheduled_operation(
                 .write()
                 .map_err(|_| "tool execution lock poisoned".to_string())?;
             runner
-                .execute_operation(&scheduled.operation)
+                .execute_operation(&scheduled.item)
                 .map_err(|error| error.to_string())
         }
     }
@@ -408,39 +484,46 @@ fn collect_disconnected_parallel_results(
 }
 
 enum OperationOutcome {
+    Completed(ToolResultItem),
     ToolError(String),
-    Interrupted,
+    Interrupted(ToolResultItem),
 }
 
-fn wait_for_cooperative_interrupt(
-    result_rx: mpsc::Receiver<Result<ToolResultItem, String>>,
-    join_handle: JoinHandle<()>,
-) -> Result<ToolResultItem, OperationOutcome> {
-    match result_rx.recv_timeout(TOOL_COOPERATIVE_INTERRUPT_GRACE) {
-        Ok(result) => finish_operation_result(result, join_handle),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            drop(join_handle);
-            Err(OperationOutcome::Interrupted)
+impl OperationOutcome {
+    fn into_interrupted(self) -> Self {
+        match self {
+            Self::Completed(result) => Self::Interrupted(result),
+            other => other,
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => finish_disconnected_operation(join_handle),
     }
 }
 
 fn finish_operation_result(
-    result: Result<ToolResultItem, String>,
+    result: Result<Result<ToolResultItem, String>, crossbeam_channel::RecvError>,
     join_handle: JoinHandle<()>,
-) -> Result<ToolResultItem, OperationOutcome> {
-    join_handle
-        .join()
-        .map_err(|_| OperationOutcome::ToolError("tool panicked".to_string()))?;
-    result.map_err(OperationOutcome::ToolError)
+) -> OperationOutcome {
+    match result {
+        Ok(result) => finish_received_operation_result(result, join_handle),
+        Err(_) => finish_disconnected_operation(join_handle),
+    }
 }
 
-fn finish_disconnected_operation(
+fn finish_received_operation_result(
+    result: Result<ToolResultItem, String>,
     join_handle: JoinHandle<()>,
-) -> Result<ToolResultItem, OperationOutcome> {
+) -> OperationOutcome {
+    if join_handle.join().is_err() {
+        return OperationOutcome::ToolError("tool panicked".to_string());
+    }
+    match result {
+        Ok(result) => OperationOutcome::Completed(result),
+        Err(error) => OperationOutcome::ToolError(error),
+    }
+}
+
+fn finish_disconnected_operation(join_handle: JoinHandle<()>) -> OperationOutcome {
     let _ = join_handle.join();
-    Err(OperationOutcome::ToolError("tool stopped".to_string()))
+    OperationOutcome::ToolError("tool stopped".to_string())
 }
 
 struct ToolOperationRunner {
@@ -449,133 +532,45 @@ struct ToolOperationRunner {
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     token_estimator: Option<Arc<TokenEstimator>>,
+    search_tool_models: Option<SearchToolModels>,
+    provider_backed_tool_models: Option<ProviderBackedToolModels>,
+    tool_catalog: Option<ToolCatalog>,
     cancel_token: ToolCancellationToken,
 }
 
 impl ToolOperationRunner {
-    fn execute_operation(
-        &self,
-        operation: &ToolExecutionOp,
-    ) -> Result<ToolResultItem, LocalToolError> {
-        let result = match operation {
-            ToolExecutionOp::LocalTool(tool_call) => self.execute_local_tool(tool_call),
-            ToolExecutionOp::UnsupportedTool { reason, .. } => {
+    fn execute_operation(&self, item: &ToolBatchItem) -> Result<ToolResultItem, LocalToolError> {
+        let result = match item {
+            ToolBatchItem::RegisteredTool(tool_call) => self.execute_registered_tool(tool_call),
+            ToolBatchItem::UnsupportedTool { reason, .. } => {
                 Err(LocalToolError::UnsupportedTool(reason.clone()))
             }
-            ToolExecutionOp::SkillLoad { tool_call, skill } => {
-                self.execute_skill_load_tool(tool_call, skill)
-            }
-            ToolExecutionOp::ProviderBacked {
-                tool_call,
-                kind,
-                model_config,
-            } => self.execute_provider_backed_tool(tool_call, *kind, model_config),
-            ToolExecutionOp::WebSearch { tool_call, models } => {
-                self.execute_web_search_tool(tool_call, models)
-            }
-            ToolExecutionOp::ConversationBridge(request) => match self.conversation_bridge.as_ref()
-            {
-                Some(bridge) => bridge
-                    .call(request.clone())
-                    .map(|response| response.result)
-                    .map_err(|error| LocalToolError::Bridge(error.to_string())),
-                None => Err(LocalToolError::Bridge(
-                    "conversation bridge is not configured".to_string(),
-                )),
-            },
         }?;
         Ok(self.cap_tool_result_context(result))
     }
 
-    fn execute_local_tool(
+    fn execute_registered_tool(
         &self,
         tool_call: &super::ToolCallItem,
     ) -> Result<ToolResultItem, LocalToolError> {
-        let arguments = parse_arguments(&tool_call.arguments.text)?;
-        let context = self.context();
-        let result = match execute_file_tool(&tool_call.tool_name, &arguments, &context)? {
-            Some(result) => result,
-            None => match execute_process_tool(&tool_call.tool_name, &arguments, &context)? {
-                Some(result) => result,
-                None => match execute_download_tool(&tool_call.tool_name, &arguments, &context)? {
-                    Some(result) => result,
-                    None => match execute_web_tool(&tool_call.tool_name, &arguments, None)? {
-                        Some(result) => result,
-                        None => {
-                            match execute_media_tool(&tool_call.tool_name, &arguments, &context)? {
-                                Some(result) => {
-                                    return Ok(ToolResultItem {
-                                        tool_call_id: tool_call.tool_call_id.clone(),
-                                        tool_name: tool_call.tool_name.clone(),
-                                        result,
-                                    });
-                                }
-                                None => {
-                                    return Err(LocalToolError::UnsupportedTool(
-                                        tool_call.tool_name.clone(),
-                                    ));
-                                }
-                            }
-                        }
-                    },
-                },
-            },
+        let Some(tool_catalog) = &self.tool_catalog else {
+            return Err(LocalToolError::UnsupportedTool(format!(
+                "{} requires a registered tool catalog",
+                tool_call.tool_name
+            )));
         };
-
-        Ok(ToolResultItem {
-            tool_call_id: tool_call.tool_call_id.clone(),
-            tool_name: tool_call.tool_name.clone(),
-            result: tool_result_content_from_value(result),
-        })
-    }
-
-    fn execute_provider_backed_tool(
-        &self,
-        tool_call: &super::ToolCallItem,
-        kind: super::ProviderBackedToolKind,
-        model_config: &crate::model_config::ModelConfig,
-    ) -> Result<ToolResultItem, LocalToolError> {
         let arguments = parse_arguments(&tool_call.arguments.text)?;
-        let context = self.context();
-        let result = execute_provider_backed_media_tool(
+        let execution = self.context();
+        let call_context = ToolCallContext { execution };
+        let result = tool_catalog.call_tool(
             &tool_call.tool_name,
-            kind,
-            model_config,
-            &arguments,
-            &context,
+            &call_context,
+            Value::Object(arguments),
         )?;
         Ok(ToolResultItem {
             tool_call_id: tool_call.tool_call_id.clone(),
             tool_name: tool_call.tool_name.clone(),
             result,
-        })
-    }
-
-    fn execute_web_search_tool(
-        &self,
-        tool_call: &super::ToolCallItem,
-        models: &super::SearchToolModels,
-    ) -> Result<ToolResultItem, LocalToolError> {
-        let arguments = parse_arguments(&tool_call.arguments.text)?;
-        let result = execute_web_tool(&tool_call.tool_name, &arguments, Some(models))?
-            .ok_or_else(|| LocalToolError::UnsupportedTool(tool_call.tool_name.clone()))?;
-        Ok(ToolResultItem {
-            tool_call_id: tool_call.tool_call_id.clone(),
-            tool_name: tool_call.tool_name.clone(),
-            result: tool_result_content_from_value(result),
-        })
-    }
-
-    fn execute_skill_load_tool(
-        &self,
-        tool_call: &super::ToolCallItem,
-        skill: &super::SessionSkillObservation,
-    ) -> Result<ToolResultItem, LocalToolError> {
-        let result = execute_skill_load_tool(skill)?;
-        Ok(ToolResultItem {
-            tool_call_id: tool_call.tool_call_id.clone(),
-            tool_name: tool_call.tool_name.clone(),
-            result: tool_result_content_from_value(result),
         })
     }
 
@@ -586,6 +581,8 @@ impl ToolOperationRunner {
             remote_mode: &self.remote_mode,
             conversation_bridge: self.conversation_bridge.as_ref(),
             token_estimator: self.token_estimator.as_deref(),
+            search_tool_models: self.search_tool_models.as_ref(),
+            provider_backed_tool_models: self.provider_backed_tool_models.as_ref(),
             cancel_token: self.cancel_token.clone(),
         }
     }
@@ -609,10 +606,6 @@ impl ToolOperationRunner {
         result.result.files = files;
         result
     }
-}
-
-fn tool_result_content_from_value(value: Value) -> ToolResultContent {
-    ToolResultContent::from_tool_value(value)
 }
 
 fn capped_truncated_tool_result_preview(total_chars: usize, original: &str) -> String {
@@ -674,6 +667,7 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
         &self,
         batch: ToolBatch,
         completion_tx: Sender<ToolBatchCompletion>,
+        progress_tx: Sender<ToolBatchProgress>,
     ) -> Result<ToolBatchHandle, ToolBatchError> {
         if batch.is_empty() {
             return Err(ToolBatchError::EmptyBatch(batch.batch_id));
@@ -687,11 +681,12 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
                 handle.batch_id
             )));
         }
-        let (cancel_token, join_handle) = self.spawn_batch_worker(batch, completion_tx);
+        let (interrupt_tx, join_handle) =
+            self.spawn_batch_worker(batch, completion_tx, progress_tx);
         running_batches.insert(
             handle.batch_id.clone(),
             RunningToolBatch {
-                cancel_token,
+                interrupt_tx,
                 join_handle,
             },
         );
@@ -703,7 +698,7 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
         let running = running_batches.get(&handle.batch_id).ok_or_else(|| {
             ToolBatchError::Interrupt(format!("unknown tool batch {}", handle.batch_id))
         })?;
-        running.cancel_token.cancel();
+        let _ = running.interrupt_tx.send(());
         Ok(())
     }
 
@@ -723,24 +718,12 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
 }
 
 fn tool_error_result(operation: &ToolBatchOperation, error: String) -> ToolResultItem {
-    let (tool_call_id, tool_name) = match &operation.operation {
-        ToolExecutionOp::LocalTool(tool_call) => {
+    let (tool_call_id, tool_name) = match &operation.item {
+        ToolBatchItem::RegisteredTool(tool_call) => {
             (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
         }
-        ToolExecutionOp::UnsupportedTool { tool_call, .. } => {
+        ToolBatchItem::UnsupportedTool { tool_call, .. } => {
             (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
-        }
-        ToolExecutionOp::SkillLoad { tool_call, .. } => {
-            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
-        }
-        ToolExecutionOp::ProviderBacked { tool_call, .. } => {
-            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
-        }
-        ToolExecutionOp::WebSearch { tool_call, .. } => {
-            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
-        }
-        ToolExecutionOp::ConversationBridge(request) => {
-            (request.tool_call_id.clone(), request.tool_name.clone())
         }
     };
 
@@ -772,8 +755,13 @@ mod tests {
     };
 
     use crate::session_actor::{
+        builtin_tool_catalog,
+        tool_catalog::{
+            BuiltinBaseTool, BuiltinToolCatalogOptions, ExtTool, ToolCallContext, ToolEntry,
+            WebSearchOptions,
+        },
         ChatMessageItem, ContextItem, ConversationBridgeRequest, ConversationBridgeResponse,
-        ToolCallItem,
+        ToolBackend, ToolCallItem, ToolDefinition, ToolExecutionMode,
     };
 
     use super::*;
@@ -788,14 +776,86 @@ mod tests {
         path
     }
 
-    fn tool_call(name: &str, arguments: Value) -> ToolExecutionOp {
-        ToolExecutionOp::LocalTool(ToolCallItem {
+    fn tool_call(name: &str, arguments: Value) -> ToolBatchItem {
+        ToolBatchItem::RegisteredTool(ToolCallItem {
             tool_call_id: "call_1".to_string(),
             tool_name: name.to_string(),
             arguments: ContextItem {
                 text: serde_json::to_string(&arguments).unwrap(),
             },
         })
+    }
+
+    fn builtin_test_catalog() -> ToolCatalog {
+        builtin_tool_catalog(BuiltinToolCatalogOptions {
+            web_search: WebSearchOptions {
+                enabled: true,
+                ..WebSearchOptions::default()
+            },
+            enable_native_image_view: true,
+            enable_native_pdf_view: true,
+            enable_native_audio_view: true,
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .expect("builtin test catalog should build")
+    }
+
+    fn test_executor(workspace: &PathBuf) -> LocalToolBatchExecutor {
+        LocalToolBatchExecutor::new(workspace).with_tool_catalog(builtin_test_catalog())
+    }
+
+    fn registered_tool_call(call_id: &str, name: &str, arguments: Value) -> ToolBatchItem {
+        ToolBatchItem::RegisteredTool(ToolCallItem {
+            tool_call_id: call_id.to_string(),
+            tool_name: name.to_string(),
+            arguments: ContextItem {
+                text: serde_json::to_string(&arguments).unwrap(),
+            },
+        })
+    }
+
+    fn bridge_catalog(tool_names: &[&str]) -> ToolCatalog {
+        let mut catalog = ToolCatalog::new();
+        for tool_name in tool_names {
+            catalog
+                .add(ToolDefinition::new(
+                    *tool_name,
+                    "Test conversation bridge tool.",
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                    }),
+                    ToolExecutionMode::Immediate,
+                    ToolBackend::ConversationBridge {
+                        action: (*tool_name).to_string(),
+                    },
+                ))
+                .expect("bridge tool should register");
+        }
+        catalog
+    }
+
+    fn builtin_plus_bridge_catalog(tool_names: &[&str]) -> ToolCatalog {
+        let mut catalog = builtin_test_catalog();
+        for tool_name in tool_names {
+            catalog
+                .add(ToolDefinition::new(
+                    *tool_name,
+                    "Test conversation bridge tool.",
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                    }),
+                    ToolExecutionMode::Immediate,
+                    ToolBackend::ConversationBridge {
+                        action: (*tool_name).to_string(),
+                    },
+                ))
+                .expect("bridge tool should register");
+        }
+        catalog
     }
 
     fn result_text(message: &ChatMessage, index: usize) -> String {
@@ -809,6 +869,10 @@ mod tests {
         text.lines()
             .find_map(|line| line.strip_prefix("Process running with session ID "))
             .expect("shell result should include process id")
+    }
+
+    fn shell_quote_for_test(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     fn result_file_media_type(message: &ChatMessage, index: usize) -> Option<&str> {
@@ -836,8 +900,9 @@ mod tests {
 
     fn start_and_wait(executor: &LocalToolBatchExecutor, batch: ToolBatch) -> ChatMessage {
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         let completion = completion_rx
             .recv_timeout(Duration::from_secs(2))
@@ -850,49 +915,110 @@ mod tests {
     }
 
     #[test]
-    fn executes_file_read_and_write_locally() {
+    fn executes_registered_ext_tool_from_catalog() {
+        struct ShellEchoExtTool;
+
+        impl ExtTool for ShellEchoExtTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new(
+                    "provider_shell_echo",
+                    "Provider-specific shell echo facade.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "message": {"type": "string"}
+                        },
+                        "required": ["message"],
+                        "additionalProperties": false
+                    }),
+                    ToolExecutionMode::Interruptible,
+                    ToolBackend::Local,
+                )
+            }
+
+            fn base_tool_id(&self) -> &'static str {
+                "shell_exec"
+            }
+
+            fn call(
+                &self,
+                ctx: &ToolCallContext<'_>,
+                args: Value,
+            ) -> Result<ToolResultContent, LocalToolError> {
+                let message = args.get("message").and_then(Value::as_str).ok_or_else(|| {
+                    LocalToolError::InvalidArguments("missing message".to_string())
+                })?;
+                BuiltinBaseTool::call_local(
+                    self.base_tool_id(),
+                    ctx,
+                    json!({
+                        "command": format!("printf {}", shell_quote_for_test(message)),
+                        "yield_time_ms": 250,
+                        "max_output_chars": 1000,
+                    }),
+                )
+            }
+        }
+
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let mut catalog = ToolCatalog::new();
+        catalog
+            .add_tool_entry(ToolEntry::Ext(Arc::new(ShellEchoExtTool)))
+            .expect("ext tool should register");
+        let executor = LocalToolBatchExecutor::new(&workspace).with_tool_catalog(catalog);
         let batch = ToolBatch::new(
-            "batch_1",
-            vec![
-                tool_call(
-                    "file_write",
-                    json!({"file_path": "notes/demo.txt", "content": "one\ntwo\n"}),
-                ),
-                tool_call("file_read", json!({"file_path": "notes/demo.txt"})),
-            ],
+            "batch_ext",
+            vec![ToolBatchItem::RegisteredTool(ToolCallItem {
+                tool_call_id: "call_ext".to_string(),
+                tool_name: "provider_shell_echo".to_string(),
+                arguments: ContextItem {
+                    text: serde_json::to_string(&json!({"message": "hello"})).unwrap(),
+                },
+            })],
         );
 
         let message = start_and_wait(&executor, batch);
-
-        assert_eq!(message.data.len(), 2);
-        let text = result_text(&message, 1);
-        assert!(text.contains("one"));
-        assert!(text.contains("two"));
+        let ChatMessageItem::ToolResult(result) = &message.data[0] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(result.tool_call_id, "call_ext");
+        assert_eq!(result.tool_name, "provider_shell_echo");
+        assert!(crate::session_actor::tool_result_text(result).contains("hello"));
     }
 
     #[test]
     fn tool_results_are_capped_without_saving_full_output() {
         let workspace = temp_workspace();
         let huge_line = "x".repeat(120_000);
-        fs::write(
-            workspace.join("huge.txt"),
-            format!("first\n{huge_line}\nlast\n"),
-        )
-        .unwrap();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let (request_tx, _request_rx) = mpsc::channel();
+        let bridge = Arc::new(FakeBridge {
+            request_tx,
+            response: Mutex::new(Some(ConversationBridgeResponse {
+                request_id: "req_huge".to_string(),
+                tool_call_id: "call_huge".to_string(),
+                tool_name: "cron_tasks_list".to_string(),
+                result: ToolResultItem {
+                    tool_call_id: "call_huge".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
+                    result: ToolResultContent::from_text(format!("first\n{huge_line}\nlast\n")),
+                },
+            })),
+        });
+        let executor = LocalToolBatchExecutor::new(&workspace)
+            .with_conversation_bridge(bridge)
+            .with_tool_catalog(builtin_plus_bridge_catalog(&["cron_tasks_list"]));
         let batch = ToolBatch::new(
-            "batch_huge_read",
-            vec![tool_call(
-                "file_read",
-                json!({"file_path": "huge.txt", "limit": 10}),
+            "batch_huge_bridge",
+            vec![registered_tool_call(
+                "call_huge",
+                "cron_tasks_list",
+                json!({}),
             )],
         );
 
         let message = start_and_wait(&executor, batch);
         let value: Value =
-            serde_json::from_str(&result_text(&message, 0)).expect("file_read should return JSON");
+            serde_json::from_str(&result_text(&message, 0)).expect("capped result should be JSON");
 
         assert!(value["truncated"].as_bool().unwrap());
         assert_eq!(value["limit_chars"], MAX_TOOL_RESULT_CONTEXT_CHARS);
@@ -911,7 +1037,7 @@ mod tests {
     #[test]
     fn executes_apply_patch_locally() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         fs::write(workspace.join("patch.txt"), "old\n").unwrap();
         let patch = r#"diff --git a/patch.txt b/patch.txt
 --- a/patch.txt
@@ -993,6 +1119,31 @@ mod tests {
             "created\n"
         );
 
+        fs::write(workspace.join("freeform_patch.txt"), "red\nblue\n").unwrap();
+        let freeform_patch = r#"*** Begin Patch
+*** Update File: freeform_patch.txt
+@@
+ red
+-blue
++green
+*** End Patch
+"#;
+        let freeform_patch_batch = ToolBatch::new(
+            "batch_freeform_patch",
+            vec![tool_call(
+                "apply_patch",
+                json!({"patch": freeform_patch, "format": "freeform"}),
+            )],
+        );
+
+        let message = start_and_wait(&executor, freeform_patch_batch);
+
+        assert!(result_text(&message, 0).contains("\"format\": \"freeform\""));
+        assert_eq!(
+            fs::read_to_string(workspace.join("freeform_patch.txt")).unwrap(),
+            "red\ngreen\n"
+        );
+
         fs::write(workspace.join("move_me.txt"), "one\ntwo\n").unwrap();
         fs::write(workspace.join("delete_me.txt"), "remove\n").unwrap();
         let codex_patch_auto = r#"*** Begin Patch
@@ -1022,13 +1173,13 @@ mod tests {
     }
 
     #[test]
-    fn executes_native_media_load_locally() {
+    fn executes_native_media_view_locally() {
         let workspace = temp_workspace();
         fs::write(workspace.join("image.png"), b"not validated image bytes").unwrap();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let batch = ToolBatch::new(
             "batch_media",
-            vec![tool_call("image_load", json!({"path": "image.png"}))],
+            vec![tool_call("image_view", json!({"path": "image.png"}))],
         );
 
         let message = start_and_wait(&executor, batch);
@@ -1041,11 +1192,10 @@ mod tests {
     #[test]
     fn fixed_remote_mode_rejects_local_remote_argument_selection() {
         let workspace = temp_workspace();
-        let executor =
-            LocalToolBatchExecutor::new(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
-                host: "fake-host".to_string(),
-                cwd: Some(String::new()),
-            });
+        let executor = test_executor(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
+            host: "fake-host".to_string(),
+            cwd: Some(String::new()),
+        });
 
         let target = executor
             .execution_target(&Map::from_iter([(
@@ -1066,11 +1216,10 @@ mod tests {
     #[test]
     fn fixed_remote_mode_routes_special_workspace_paths_locally() {
         let workspace = temp_workspace();
-        let executor =
-            LocalToolBatchExecutor::new(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
-                host: "fake-host".to_string(),
-                cwd: Some("/remote/project".to_string()),
-            });
+        let executor = test_executor(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
+            host: "fake-host".to_string(),
+            cwd: Some("/remote/project".to_string()),
+        });
 
         let local_target = executor
             .execution_target_for_path(
@@ -1104,11 +1253,10 @@ mod tests {
             "old\n",
         )
         .unwrap();
-        let executor =
-            LocalToolBatchExecutor::new(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
-                host: "fake-host".to_string(),
-                cwd: Some("/remote/project".to_string()),
-            });
+        let executor = test_executor(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
+            host: "fake-host".to_string(),
+            cwd: Some("/remote/project".to_string()),
+        });
         let patch = "\
 --- .stellaclaw/apply_patch_smoke_test.txt
 +++ .stellaclaw/apply_patch_smoke_test.txt
@@ -1143,7 +1291,7 @@ mod tests {
             .with_body("hello web fetch")
             .create();
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let batch = ToolBatch::new(
             "batch_web",
             vec![tool_call(
@@ -1165,7 +1313,7 @@ mod tests {
     #[test]
     fn executes_shell_and_shell_stop_locally() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1228,7 +1376,8 @@ mod tests {
     fn shell_exec_expands_tilde_workdir_locally() {
         let workspace = temp_workspace();
         let home = std::env::var("HOME").expect("HOME should be set");
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        fs::create_dir_all(&home).expect("test HOME should be a directory");
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1252,7 +1401,7 @@ mod tests {
     #[test]
     fn shell_exec_reports_missing_command() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1269,7 +1418,7 @@ mod tests {
     #[test]
     fn shell_write_empty_observes_but_non_tty_stdin_is_closed() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1318,7 +1467,7 @@ mod tests {
     #[test]
     fn shell_write_stdin_supports_tty_processes() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1362,7 +1511,7 @@ mod tests {
     #[test]
     fn shell_truncates_agent_visible_output() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1386,7 +1535,7 @@ mod tests {
     #[test]
     fn shell_exec_reports_stdout_and_stderr_separately() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1412,7 +1561,7 @@ mod tests {
     #[test]
     fn interrupting_running_shell_returns_snapshot_instead_of_error() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let batch = ToolBatch::new(
             "batch_shell_interrupt",
             vec![tool_call(
@@ -1424,8 +1573,9 @@ mod tests {
             )],
         );
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
 
         thread::sleep(Duration::from_millis(50));
@@ -1458,43 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn executes_file_download_lifecycle_locally() {
-        let mut server = mockito::Server::new();
-        let _mock = server
-            .mock("GET", "/file.txt")
-            .with_status(200)
-            .with_header("content-type", "text/plain")
-            .with_body("download body")
-            .create();
-        let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
-        let message = start_and_wait(
-            &executor,
-            ToolBatch::new(
-                "batch_download",
-                vec![tool_call(
-                    "file_download_start",
-                    json!({
-                        "url": format!("{}/file.txt", server.url()),
-                        "path": "downloads/file.txt",
-                        "overwrite": true,
-                        "wait_timeout_seconds": 2
-                    }),
-                )],
-            ),
-        );
-
-        assert!(result_text(&message, 0).contains("\"completed\": true"));
-        assert!(result_text(&message, 0).contains("\"path\": \"downloads/file.txt\""));
-        assert!(!result_text(&message, 0).contains(&workspace.display().to_string()));
-        assert!(!result_text(&message, 0).contains("\"failed\": false"));
-        assert_eq!(
-            fs::read_to_string(workspace.join("downloads/file.txt")).unwrap(),
-            "download body"
-        );
-    }
-
-    #[test]
     fn executes_web_search_with_configured_json_endpoint() {
         let mut server = mockito::Server::new();
         let _mock = server
@@ -1511,7 +1624,7 @@ mod tests {
             format!("{}/search", server.url()),
         );
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
@@ -1528,28 +1641,42 @@ mod tests {
     }
 
     #[test]
-    fn executes_skill_load_from_embedded_metadata() {
+    fn executes_skill_load_through_conversation_bridge() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let (request_tx, request_rx) = mpsc::channel();
+        let bridge = Arc::new(FakeBridge {
+            request_tx,
+            response: Mutex::new(Some(ConversationBridgeResponse {
+                request_id: "req_skill".to_string(),
+                tool_call_id: "skill_load".to_string(),
+                tool_name: "skill_load".to_string(),
+                result: ToolResultItem {
+                    tool_call_id: "skill_load".to_string(),
+                    tool_name: "skill_load".to_string(),
+                    result: ToolResultContent::from_json(json!({
+                        "name": "demo",
+                        "description": "Demo skill",
+                        "content": "# Demo\nUse demo carefully.",
+                    })),
+                },
+            })),
+        });
+        let executor = LocalToolBatchExecutor::new(&workspace)
+            .with_conversation_bridge(bridge)
+            .with_tool_catalog(bridge_catalog(&["skill_load"]));
         let batch = ToolBatch::new(
             "batch_skill",
-            vec![ToolExecutionOp::SkillLoad {
-                tool_call: ToolCallItem {
-                    tool_call_id: "call_skill".to_string(),
-                    tool_name: "skill_load".to_string(),
-                    arguments: ContextItem {
-                        text: r#"{"skill_name":"demo"}"#.to_string(),
-                    },
-                },
-                skill: super::super::SessionSkillObservation {
-                    name: "demo".to_string(),
-                    description: "Demo skill".to_string(),
-                    content: "# Demo\nUse demo carefully.".to_string(),
-                },
-            }],
+            vec![registered_tool_call(
+                "call_skill",
+                "skill_load",
+                json!({"skill_name": "demo"}),
+            )],
         );
 
         let message = start_and_wait(&executor, batch);
+        let request = request_rx.recv().unwrap();
+        assert_eq!(request.action, "skill_load");
+        assert_eq!(request.payload["skill_name"], "demo");
 
         assert!(result_text(&message, 0).contains("\"name\": \"demo\""));
         assert!(result_text(&message, 0).contains("Use demo carefully"));
@@ -1589,8 +1716,56 @@ mod tests {
         }
     }
 
+    struct CancelAwareJoinBridge {
+        request_tx: mpsc::Sender<ConversationBridgeRequest>,
+        original_response_tx: Mutex<Option<mpsc::Sender<ConversationBridgeResponse>>>,
+    }
+
+    impl ConversationBridge for CancelAwareJoinBridge {
+        fn call(
+            &self,
+            request: ConversationBridgeRequest,
+        ) -> Result<ConversationBridgeResponse, ToolBatchError> {
+            self.request_tx.send(request.clone()).unwrap();
+            if request.action == "subagent_join_cancel" {
+                if let Some(sender) = self.original_response_tx.lock().unwrap().take() {
+                    let _ = sender.send(ConversationBridgeResponse {
+                        request_id: "req_cooperative".to_string(),
+                        tool_call_id: request.tool_call_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        result: ToolResultItem {
+                            tool_call_id: request.tool_call_id.clone(),
+                            tool_name: request.tool_name.clone(),
+                            result: ToolResultContent::from_json(json!({
+                                "status": "interrupted",
+                                "agent_id": "subagent_1",
+                                "reason": "tool_interrupted",
+                            })),
+                        },
+                    });
+                }
+                return Ok(ConversationBridgeResponse {
+                    request_id: request.request_id,
+                    tool_call_id: request.tool_call_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    result: ToolResultItem {
+                        tool_call_id: request.tool_call_id,
+                        tool_name: request.tool_name,
+                        result: ToolResultContent::from_json(json!({"status": "cancelled"})),
+                    },
+                });
+            }
+
+            let (response_tx, response_rx) = mpsc::channel();
+            *self.original_response_tx.lock().unwrap() = Some(response_tx);
+            response_rx
+                .recv()
+                .map_err(|error| ToolBatchError::Bridge(error.to_string()))
+        }
+    }
+
     #[test]
-    fn executes_conversation_bridge_operations() {
+    fn executes_registered_conversation_bridge_tool() {
         let workspace = temp_workspace();
         let (request_tx, request_rx) = mpsc::channel();
         let bridge = Arc::new(FakeBridge {
@@ -1598,31 +1773,25 @@ mod tests {
             response: Mutex::new(Some(ConversationBridgeResponse {
                 request_id: "req_1".to_string(),
                 tool_call_id: "call_1".to_string(),
-                tool_name: "user_tell".to_string(),
+                tool_name: "cron_tasks_list".to_string(),
                 result: ToolResultItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
                     result: ToolResultContent::from_text("sent".to_string()),
                 },
             })),
         });
-        let executor = LocalToolBatchExecutor::new(&workspace).with_conversation_bridge(bridge);
+        let executor = LocalToolBatchExecutor::new(&workspace)
+            .with_conversation_bridge(bridge)
+            .with_tool_catalog(builtin_plus_bridge_catalog(&["cron_tasks_list"]));
         let batch = ToolBatch::new(
             "batch_2",
-            vec![ToolExecutionOp::ConversationBridge(
-                ConversationBridgeRequest {
-                    request_id: "req_1".to_string(),
-                    tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
-                    action: "user_tell".to_string(),
-                    payload: json!({"text": "working"}),
-                },
-            )],
+            vec![registered_tool_call("call_1", "cron_tasks_list", json!({}))],
         );
 
         let message = start_and_wait(&executor, batch);
 
-        assert_eq!(request_rx.recv().unwrap().tool_name, "user_tell");
+        assert_eq!(request_rx.recv().unwrap().tool_name, "cron_tasks_list");
         assert_eq!(message.data.len(), 1);
     }
 
@@ -1635,36 +1804,27 @@ mod tests {
             request_tx,
             response_rx: Mutex::new(response_rx),
         });
-        let executor = LocalToolBatchExecutor::new(&workspace).with_conversation_bridge(bridge);
+        let executor = LocalToolBatchExecutor::new(&workspace)
+            .with_conversation_bridge(bridge)
+            .with_tool_catalog(builtin_plus_bridge_catalog(&["cron_tasks_list"]));
         let batch = ToolBatch::new_scheduled(
             "batch_parallel_bridge",
             vec![
                 ToolBatchOperation::new(
-                    ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
-                        request_id: "req_parallel_1".to_string(),
-                        tool_call_id: "call_parallel_1".to_string(),
-                        tool_name: "user_tell".to_string(),
-                        action: "user_tell".to_string(),
-                        payload: json!({"text": "one"}),
-                    }),
+                    registered_tool_call("call_parallel_1", "cron_tasks_list", json!({})),
                     ToolConcurrency::Parallel,
                 ),
                 ToolBatchOperation::new(
-                    ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
-                        request_id: "req_parallel_2".to_string(),
-                        tool_call_id: "call_parallel_2".to_string(),
-                        tool_name: "user_tell".to_string(),
-                        action: "user_tell".to_string(),
-                        payload: json!({"text": "two"}),
-                    }),
+                    registered_tool_call("call_parallel_2", "cron_tasks_list", json!({})),
                     ToolConcurrency::Parallel,
                 ),
             ],
         );
 
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         let first = request_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1672,9 +1832,9 @@ mod tests {
         let second = request_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("second parallel request should start before first completes");
-        let mut request_ids = vec![first.request_id.clone(), second.request_id.clone()];
-        request_ids.sort_unstable();
-        assert_eq!(request_ids, vec!["req_parallel_1", "req_parallel_2"]);
+        assert_ne!(first.request_id, second.request_id);
+        assert_eq!(first.tool_name, "cron_tasks_list");
+        assert_eq!(second.tool_name, "cron_tasks_list");
 
         for request in [first, second] {
             response_tx
@@ -1705,16 +1865,19 @@ mod tests {
     #[test]
     fn failed_tool_does_not_skip_later_batch_operations() {
         let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
+        let executor = test_executor(&workspace);
         let batch = ToolBatch::new(
             "batch_error_isolated",
             vec![
                 tool_call("not_a_real_tool", json!({})),
                 tool_call(
-                    "file_write",
-                    json!({"file_path": "after_error.txt", "content": "still ran"}),
+                    "shell_exec",
+                    json!({"command": "printf 'still ran' > after_error.txt", "yield_time_ms": 1000}),
                 ),
-                tool_call("file_read", json!({"file_path": "after_error.txt"})),
+                tool_call(
+                    "shell_exec",
+                    json!({"command": "cat after_error.txt", "yield_time_ms": 1000}),
+                ),
             ],
         );
 
@@ -1722,7 +1885,7 @@ mod tests {
 
         assert_eq!(message.data.len(), 3);
         assert!(result_text(&message, 0).contains("unsupported tool"));
-        assert!(result_text(&message, 1).contains("\"bytes_written\": 9"));
+        assert!(result_text(&message, 1).contains("Process exited with code 0"));
         assert!(result_text(&message, 2).contains("still ran"));
         assert_eq!(
             fs::read_to_string(workspace.join("after_error.txt")).unwrap(),
@@ -1739,48 +1902,35 @@ mod tests {
             request_tx,
             response_rx: Mutex::new(response_rx),
         });
-        let executor = LocalToolBatchExecutor::new(&workspace).with_conversation_bridge(bridge);
+        let executor = LocalToolBatchExecutor::new(&workspace)
+            .with_conversation_bridge(bridge)
+            .with_tool_catalog(builtin_plus_bridge_catalog(&["cron_tasks_list"]));
         let batch = ToolBatch::new(
             "batch_interrupt",
             vec![
-                ToolExecutionOp::LocalTool(ToolCallItem {
-                    tool_call_id: "call_write_before".to_string(),
-                    tool_name: "file_write".to_string(),
-                    arguments: ContextItem {
-                        text: serde_json::to_string(
-                            &json!({"file_path": "before_interrupt.txt", "content": "written"}),
-                        )
-                        .unwrap(),
-                    },
-                }),
-                ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
-                    request_id: "req_blocking".to_string(),
-                    tool_call_id: "call_bridge".to_string(),
-                    tool_name: "user_tell".to_string(),
-                    action: "user_tell".to_string(),
-                    payload: json!({"text": "blocking"}),
-                }),
-                ToolExecutionOp::LocalTool(ToolCallItem {
-                    tool_call_id: "call_write".to_string(),
-                    tool_name: "file_write".to_string(),
-                    arguments: ContextItem {
-                        text: serde_json::to_string(
-                            &json!({"file_path": "after_interrupt.txt", "content": "should not write"}),
-                        )
-                        .unwrap(),
-                    },
-                }),
+                registered_tool_call(
+                    "call_write_before",
+                    "apply_patch",
+                    json!({"patch": "*** Begin Patch\n*** Add File: before_interrupt.txt\n+written\n*** End Patch\n"}),
+                ),
+                registered_tool_call("call_bridge", "cron_tasks_list", json!({})),
+                registered_tool_call(
+                    "call_write",
+                    "apply_patch",
+                    json!({"patch": "*** Begin Patch\n*** Add File: after_interrupt.txt\n+should not write\n*** End Patch\n"}),
+                ),
             ],
         );
 
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         let request = request_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("bridge request should be running asynchronously");
-        assert_eq!(request.request_id, "req_blocking");
+        assert_eq!(request.tool_name, "cron_tasks_list");
 
         executor
             .interrupt(&handle)
@@ -1797,43 +1947,41 @@ mod tests {
         assert!(wait_started.elapsed() < Duration::from_secs(1));
 
         assert_eq!(message.data.len(), 3);
-        assert!(result_text(&message, 0).contains("\"bytes_written\": 7"));
-        assert!(result_text(&message, 1).contains("tool batch interrupted"));
+        assert!(result_text(&message, 0).contains("\"applied\": true"));
+        assert!(result_text(&message, 1).contains("conversation bridge response"));
         assert!(result_text(&message, 2).contains("tool batch interrupted"));
         assert_eq!(
             fs::read_to_string(workspace.join("before_interrupt.txt")).unwrap(),
-            "written"
+            "written\n"
         );
         assert!(!workspace.join("after_interrupt.txt").exists());
         drop(response_tx);
     }
 
     #[test]
-    fn interrupt_uses_cooperative_result_if_current_tool_returns_quickly() {
+    fn interrupt_returns_bridge_interrupted_result_without_waiting_for_late_response() {
         let workspace = temp_workspace();
         let (request_tx, request_rx) = mpsc::channel();
-        let (response_tx, response_rx) = mpsc::channel();
-        let bridge = Arc::new(BlockingBridge {
+        let bridge = Arc::new(CancelAwareJoinBridge {
             request_tx,
-            response_rx: Mutex::new(response_rx),
+            original_response_tx: Mutex::new(None),
         });
-        let executor = LocalToolBatchExecutor::new(&workspace).with_conversation_bridge(bridge);
+        let executor = LocalToolBatchExecutor::new(&workspace)
+            .with_conversation_bridge(bridge)
+            .with_tool_catalog(bridge_catalog(&["subagent_join"]));
         let batch = ToolBatch::new(
             "batch_cooperative_interrupt",
-            vec![ToolExecutionOp::ConversationBridge(
-                ConversationBridgeRequest {
-                    request_id: "req_cooperative".to_string(),
-                    tool_call_id: "call_bridge".to_string(),
-                    tool_name: "user_tell".to_string(),
-                    action: "user_tell".to_string(),
-                    payload: json!({"text": "cooperative"}),
-                },
+            vec![registered_tool_call(
+                "call_bridge",
+                "subagent_join",
+                json!({"agent_id": "subagent_1", "timeout_seconds": 30}),
             )],
         );
 
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         request_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1842,28 +1990,23 @@ mod tests {
         executor
             .interrupt(&handle)
             .expect("interrupt should mark batch cancelled");
-        response_tx
-            .send(ConversationBridgeResponse {
-                request_id: "req_cooperative".to_string(),
-                tool_call_id: "call_bridge".to_string(),
-                tool_name: "user_tell".to_string(),
-                result: ToolResultItem {
-                    tool_call_id: "call_bridge".to_string(),
-                    tool_name: "user_tell".to_string(),
-                    result: ToolResultContent::from_text("cooperative status".to_string()),
-                },
-            })
-            .unwrap();
+        let cancel_request = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancel bridge request should be sent");
+        assert_eq!(cancel_request.action, "subagent_join_cancel");
+        assert!(cancel_request.payload["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("subagent_join_")));
 
         let completion = completion_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("cooperative result should be accepted during interrupt grace");
+            .expect("bridge interrupt result should be returned promptly");
         executor
             .finish(&completion.batch_id)
-            .expect("cooperative batch should finish");
-        let message = completion.result.expect("cooperative batch result");
+            .expect("interrupted bridge batch should finish");
+        let message = completion.result.expect("interrupted bridge batch result");
 
         assert_eq!(message.data.len(), 1);
-        assert!(result_text(&message, 0).contains("cooperative status"));
+        assert!(result_text(&message, 0).contains("\"status\": \"interrupted\""));
     }
 }

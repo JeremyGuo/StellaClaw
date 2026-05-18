@@ -1,11 +1,15 @@
+use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+
+use crate::model_config::ProviderType;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
     User,
     Assistant,
+    Compaction,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -28,6 +32,8 @@ pub struct TokenUsageCost {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default, alias = "id", skip_serializing_if = "String::is_empty")]
+    pub message_id: String,
     pub role: ChatRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
@@ -41,12 +47,32 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn new(role: ChatRole, data: Vec<ChatMessageItem>) -> Self {
         Self {
+            message_id: Self::new_message_id(),
             role,
             user_name: None,
             message_time: None,
             token_usage: None,
             data,
         }
+    }
+
+    pub fn new_message_id() -> String {
+        format!(
+            "msg_{:016x}{:016x}",
+            rand::random::<u64>(),
+            rand::random::<u64>()
+        )
+    }
+
+    pub fn ensure_message_id(&mut self) {
+        if self.message_id.is_empty() {
+            self.message_id = Self::new_message_id();
+        }
+    }
+
+    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
+        self.message_id = message_id.into();
+        self
     }
 
     pub fn with_user_name(mut self, user_name: impl Into<String>) -> Self {
@@ -80,6 +106,7 @@ impl ChatMessage {
 pub enum ChatMessageItem {
     Reasoning(ReasoningItem),
     Context(ContextItem),
+    Compaction(CompactionItem),
     SelectionReference(SelectionReferenceItem),
     File(FileItem),
     ToolCall(ToolCallItem),
@@ -87,26 +114,86 @@ pub enum ChatMessageItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionKind {
+    GenericSummary,
+    ProviderBuiltin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionItem {
+    pub kind: CompactionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<ProviderType>,
+    pub payload: Value,
+}
+
+impl CompactionItem {
+    pub fn generic_summary(text: impl Into<String>) -> Self {
+        Self {
+            kind: CompactionKind::GenericSummary,
+            provider_type: None,
+            payload: json!({ "text": text.into() }),
+        }
+    }
+
+    pub fn provider_builtin(provider_type: ProviderType, payload: Value) -> Self {
+        Self {
+            kind: CompactionKind::ProviderBuiltin,
+            provider_type: Some(provider_type),
+            payload,
+        }
+    }
+
+    pub fn generic_summary_text(&self) -> Option<&str> {
+        if self.kind != CompactionKind::GenericSummary {
+            return None;
+        }
+        self.payload.get("text").and_then(Value::as_str)
+    }
+
+    pub fn codex_encrypted_content(&self) -> Option<&str> {
+        if self.kind != CompactionKind::ProviderBuiltin
+            || self.provider_type.as_ref() != Some(&ProviderType::CodexSubscription)
+        {
+            return None;
+        }
+        self.payload
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningItem {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_summary: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reasoning_summary_parts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub codex_summary: Vec<ReasoningSummaryPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_encrypted_content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningSummaryPart {
+    pub text: String,
 }
 
 impl ReasoningItem {
     pub fn from_text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            codex_summary: None,
+            codex_summary: Vec::new(),
             codex_encrypted_content: None,
         }
     }
 
     pub fn codex(
-        codex_summary: Option<String>,
+        codex_summary: Vec<ReasoningSummaryPart>,
         codex_encrypted_content: Option<String>,
         fallback_text: Option<String>,
     ) -> Self {
@@ -122,6 +209,76 @@ impl ReasoningItem {
         self.codex_encrypted_content
             .as_deref()
             .is_some_and(|content| !content.is_empty())
+    }
+
+    pub fn codex_from_summary_text(
+        codex_summary: Option<String>,
+        codex_encrypted_content: Option<String>,
+        fallback_text: Option<String>,
+    ) -> Self {
+        Self::codex(
+            codex_summary
+                .filter(|summary| !summary.is_empty())
+                .map(|summary| vec![ReasoningSummaryPart { text: summary }])
+                .unwrap_or_default(),
+            codex_encrypted_content,
+            fallback_text,
+        )
+    }
+
+    pub fn codex_summary_text(&self) -> Option<String> {
+        let text = self
+            .codex_summary
+            .iter()
+            .map(|part| part.text.as_str())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+fn deserialize_reasoning_summary_parts<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ReasoningSummaryPart>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok((!text.is_empty())
+            .then_some(ReasoningSummaryPart { text })
+            .into_iter()
+            .collect()),
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(text) => parts.push(ReasoningSummaryPart { text }),
+                    Value::Object(mut object) => {
+                        let text = object
+                            .remove("text")
+                            .and_then(|value| value.as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        parts.push(ReasoningSummaryPart { text });
+                    }
+                    other => {
+                        return Err(D::Error::custom(format!(
+                            "invalid reasoning summary part: {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(parts)
+        }
+        other => Err(D::Error::custom(format!(
+            "invalid reasoning summary value: {other}"
+        ))),
     }
 }
 

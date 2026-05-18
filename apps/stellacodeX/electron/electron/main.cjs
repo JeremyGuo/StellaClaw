@@ -117,6 +117,7 @@ function defaultSettings() {
       }
     ],
     conversationUi: {},
+    conversationListUi: {},
     hiddenConversations: {}
   };
 }
@@ -213,6 +214,10 @@ function normalizeSettings(value) {
     conversationUi:
       value?.conversationUi && typeof value.conversationUi === 'object'
         ? value.conversationUi
+        : {},
+    conversationListUi:
+      value?.conversationListUi && typeof value.conversationListUi === 'object'
+        ? value.conversationListUi
         : {},
     hiddenConversations
   };

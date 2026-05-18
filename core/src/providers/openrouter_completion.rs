@@ -227,6 +227,13 @@ fn should_stream_openrouter_response(
 }
 
 impl ProviderBackend for OpenRouterCompletionProvider {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -273,6 +280,9 @@ impl OpenRouterRequestMessage {
     }
 
     fn from_chat_message(message: &ChatMessage) -> Vec<Self> {
+        if matches!(message.role, ChatRole::Compaction) {
+            return Vec::new();
+        }
         let text_segments = collect_visible_text_segments(message);
         let image_files = collect_image_files(message);
         let tool_calls = collect_request_tool_calls(message);
@@ -592,6 +602,11 @@ fn collect_visible_text_segments(message: &ChatMessage) -> Vec<String> {
         match item {
             ChatMessageItem::Reasoning(_) => {}
             ChatMessageItem::Context(context) => segments.push(context.text.clone()),
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    segments.push(text.to_string());
+                }
+            }
             ChatMessageItem::SelectionReference(selection) => {
                 segments.push(selection.to_prompt_text());
             }
@@ -665,6 +680,7 @@ fn openrouter_role(role: &ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Compaction => "user",
     }
 }
 
@@ -724,6 +740,7 @@ fn convert_openrouter_response(
     let _ = choice.finish_reason;
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
@@ -751,6 +768,7 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 5,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,

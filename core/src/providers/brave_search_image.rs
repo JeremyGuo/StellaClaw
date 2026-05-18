@@ -64,18 +64,18 @@ impl ProviderBackend for BraveSearchImageProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let query = request
+        let request = request
             .messages
             .iter()
             .rev()
-            .find_map(message_text)
+            .find_map(search_request_from_message)
             .ok_or_else(|| {
                 ProviderError::InvalidResponse(
                     "Brave image search provider request did not include a query message"
                         .to_string(),
                 )
             })?;
-        let result = self.search_images(model_config, &query, 5)?;
+        let result = self.search_images(model_config, &request.query, request.max_results)?;
         Ok(ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::Context(ContextItem {
@@ -83,6 +83,28 @@ impl ProviderBackend for BraveSearchImageProvider {
             })],
         ))
     }
+}
+
+struct SearchRequest {
+    query: String,
+    max_results: usize,
+}
+
+fn search_request_from_message(message: &ChatMessage) -> Option<SearchRequest> {
+    let text = message_text(message)?;
+    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+        let query = value.get("query").and_then(Value::as_str)?.to_string();
+        let max_results = value
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(5);
+        return Some(SearchRequest { query, max_results });
+    }
+    Some(SearchRequest {
+        query: text,
+        max_results: 5,
+    })
 }
 
 fn message_text(message: &ChatMessage) -> Option<String> {
@@ -300,6 +322,7 @@ mod tests {
             token_max_context: 0,
             max_tokens: 0,
             cache_timeout: 0,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 5,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,

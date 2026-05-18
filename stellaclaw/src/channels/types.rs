@@ -1,21 +1,89 @@
-use std::path::PathBuf;
-
-use crossbeam_channel::Sender;
 use serde::Serialize;
 use serde_json::Value;
-use stellaclaw_core::session_actor::ChatMessage;
+use stellaclaw_core::session_actor::{ChatMessage, FileItem, SelectionReferenceItem};
 
-use crate::conversation::IncomingConversationMessage;
+use crate::config::SandboxMode;
+
+#[derive(Debug, Clone)]
+pub struct IncomingConversationMessage {
+    pub remote_message_id: String,
+    pub user_name: Option<String>,
+    pub message_time: Option<String>,
+    pub text: Option<String>,
+    pub selection_references: Vec<SelectionReferenceItem>,
+    pub files: Vec<FileItem>,
+    pub control: Option<ConversationControl>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConversationControl {
+    Continue,
+    Cancel,
+    Compact,
+    ShowStatus,
+    ShowModel,
+    SwitchModel { model_name: String },
+    ShowReasoning,
+    SetReasoning { effort: Option<String> },
+    InvalidReasoning { reason: String },
+    ShowIdleTimeoutCompact,
+    SetIdleTimeoutCompact { enabled: Option<bool> },
+    InvalidIdleTimeoutCompact { reason: String },
+    ShowRemote,
+    SetRemote { host: String, path: String },
+    DisableRemote,
+    InvalidRemote { reason: String },
+    ShowSandbox,
+    SetSandbox { mode: Option<SandboxMode> },
+    InvalidSandbox { reason: String },
+}
+
+pub(crate) fn parse_idle_timeout_compact_control_argument(argument: &str) -> ConversationControl {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return ConversationControl::ShowIdleTimeoutCompact;
+    }
+    match argument.to_ascii_lowercase().as_str() {
+        "default" | "model" | "model_default" | "model-default" | "inherit" => {
+            ConversationControl::SetIdleTimeoutCompact { enabled: None }
+        }
+        "on" | "enable" | "enabled" | "true" | "yes" => {
+            ConversationControl::SetIdleTimeoutCompact {
+                enabled: Some(true),
+            }
+        }
+        "off" | "disable" | "disabled" | "false" | "no" => {
+            ConversationControl::SetIdleTimeoutCompact {
+                enabled: Some(false),
+            }
+        }
+        _ => ConversationControl::InvalidIdleTimeoutCompact {
+            reason: format!("未知 idle timeout compact 设置 `{argument}`。"),
+        },
+    }
+}
+
+pub(crate) fn parse_reasoning_control_argument(argument: &str) -> ConversationControl {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return ConversationControl::ShowReasoning;
+    }
+    match argument.to_ascii_lowercase().as_str() {
+        "default" | "model" | "model_default" | "model-default" | "global" => {
+            ConversationControl::SetReasoning { effort: None }
+        }
+        "minimal" | "low" | "medium" | "high" | "xhigh" => ConversationControl::SetReasoning {
+            effort: Some(argument.to_ascii_lowercase()),
+        },
+        _ => ConversationControl::InvalidReasoning {
+            reason: format!("未知 reasoning effort `{argument}`。"),
+        },
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum IncomingDispatch {
     Message(IncomingMessageDispatch),
-    DeleteConversation {
-        channel_id: String,
-        platform_chat_id: String,
-        conversation_id: String,
-        response_tx: Sender<Result<(), String>>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -37,12 +105,6 @@ pub enum OutgoingAttachmentKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct OutgoingAttachment {
-    pub path: PathBuf,
-    pub kind: OutgoingAttachmentKind,
-}
-
-#[derive(Debug, Clone)]
 pub struct OutgoingOption {
     pub label: String,
     pub value: String,
@@ -50,20 +112,7 @@ pub struct OutgoingOption {
 
 #[derive(Debug, Clone)]
 pub struct OutgoingOptions {
-    pub prompt: String,
     pub options: Vec<OutgoingOption>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutgoingDelivery {
-    pub channel_id: String,
-    pub platform_chat_id: String,
-    pub conversation_id: String,
-    pub session_id: Option<String>,
-    pub message: Option<ChatMessage>,
-    pub text: String,
-    pub attachments: Vec<OutgoingAttachment>,
-    pub options: Option<OutgoingOptions>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +123,15 @@ pub struct OutgoingMessageAppended {
     pub session_id: String,
     pub index: usize,
     pub message: ChatMessage,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutgoingSessionStream {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub conversation_id: String,
+    pub session_id: String,
+    pub event: Value,
 }
 
 #[allow(dead_code)]
@@ -128,155 +186,42 @@ pub struct OutgoingProcessing {
     pub state: ProcessingState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressFeedbackFinalState {
-    Done,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnProgressPhase {
-    Thinking,
-    Working,
-    Done,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnProgressPlanItemStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnProgressPlanItem {
-    pub step: String,
-    pub status: TurnProgressPlanItemStatus,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnProgressPlan {
-    pub explanation: Option<String>,
-    pub items: Vec<TurnProgressPlanItem>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnProgress {
-    pub phase: TurnProgressPhase,
-    pub model: String,
-    pub activity: String,
-    pub hint: Option<String>,
-    pub plan: Option<TurnProgressPlan>,
-    pub error: Option<String>,
-}
-
 #[derive(Debug, Clone)]
-pub struct OutgoingProgressFeedback {
+pub struct OutgoingHomeEvent {
     pub channel_id: String,
     pub platform_chat_id: String,
-    pub turn_id: String,
-    pub progress: TurnProgress,
-    pub final_state: Option<ProgressFeedbackFinalState>,
-    pub important: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutgoingConversationUpdated {
-    pub channel_id: String,
-    pub platform_chat_id: String,
-    pub conversation_id: String,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone)]
 pub enum ChannelEvent {
-    Delivery(OutgoingDelivery),
+    Home(OutgoingHomeEvent),
     MessageAppended(OutgoingMessageAppended),
+    SessionStream(OutgoingSessionStream),
     Processing(OutgoingProcessing),
-    ProgressFeedback(OutgoingProgressFeedback),
-    ConversationUpdated(OutgoingConversationUpdated),
-    Status(OutgoingStatus),
     Error(OutgoingError),
 }
 
 impl ChannelEvent {
     pub fn channel_id(&self) -> &str {
         match self {
-            ChannelEvent::Delivery(delivery) => &delivery.channel_id,
+            ChannelEvent::Home(home) => &home.channel_id,
             ChannelEvent::MessageAppended(appended) => &appended.channel_id,
+            ChannelEvent::SessionStream(stream) => &stream.channel_id,
             ChannelEvent::Processing(processing) => &processing.channel_id,
-            ChannelEvent::ProgressFeedback(feedback) => &feedback.channel_id,
-            ChannelEvent::ConversationUpdated(updated) => &updated.channel_id,
-            ChannelEvent::Status(status) => &status.channel_id,
             ChannelEvent::Error(error) => &error.channel_id,
         }
     }
 
     pub fn platform_chat_id(&self) -> &str {
         match self {
-            ChannelEvent::Delivery(delivery) => &delivery.platform_chat_id,
+            ChannelEvent::Home(home) => &home.platform_chat_id,
             ChannelEvent::MessageAppended(appended) => &appended.platform_chat_id,
+            ChannelEvent::SessionStream(stream) => &stream.platform_chat_id,
             ChannelEvent::Processing(processing) => &processing.platform_chat_id,
-            ChannelEvent::ProgressFeedback(feedback) => &feedback.platform_chat_id,
-            ChannelEvent::ConversationUpdated(updated) => &updated.platform_chat_id,
-            ChannelEvent::Status(status) => &status.platform_chat_id,
             ChannelEvent::Error(error) => &error.platform_chat_id,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct OutgoingStatus {
-    pub channel_id: String,
-    pub platform_chat_id: String,
-    pub conversation_id: String,
-    pub model: String,
-    pub reasoning: String,
-    pub sandbox: String,
-    pub sandbox_source: String,
-    pub remote: String,
-    pub workspace: String,
-    pub running_background: usize,
-    pub total_background: usize,
-    pub running_subagents: usize,
-    pub total_subagents: usize,
-    pub usage: OutgoingUsageSummary,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingUsageSummary {
-    pub foreground: OutgoingUsageTotals,
-    pub background: OutgoingUsageTotals,
-    pub subagents: OutgoingUsageTotals,
-    pub media_tools: OutgoingUsageTotals,
-    pub memory: OutgoingUsageTotals,
-    pub user_memory_compaction: OutgoingUsageTotals,
-    pub user_memory_compaction_daily: Vec<OutgoingDailyUsageTotals>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingDailyUsageTotals {
-    pub date: String,
-    pub usage: OutgoingUsageTotals,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingUsageTotals {
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub uncache_input: u64,
-    pub output: u64,
-    pub cost: OutgoingUsageCost,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingUsageCost {
-    pub cache_read: f64,
-    pub cache_write: f64,
-    pub uncache_input: f64,
-    pub output: f64,
 }
 
 #[derive(Debug, Clone)]

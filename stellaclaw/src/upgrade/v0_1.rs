@@ -22,8 +22,8 @@ use crate::{
         ModelSelection, SandboxConfig, SandboxMode, SessionProfile, StellaclawConfig,
         ToolModelTarget,
     },
-    conversation::{ConversationSessionBinding, ConversationState},
     conversation_id_manager::ConversationIdManager,
+    conversation_state::{ConversationSessionBinding, ConversationState},
     workspace::ensure_workspace_seed,
 };
 
@@ -682,6 +682,7 @@ fn migrate_foreground_session(
         tool_remote_mode: tool_remote_mode.clone(),
         compression_threshold_tokens: config.session_defaults.compression_threshold_tokens,
         compression_retain_recent_tokens: config.session_defaults.compression_retain_recent_tokens,
+        idle_timeout_compact_enabled: session_model.idle_timeout_compact_enabled,
         image_tool_model: resolve_tool_model_target(
             "image_tool_model",
             config.session_defaults.image_tool_model.as_ref(),
@@ -811,6 +812,10 @@ fn estimate_message_tokens(message: &ChatMessage) -> usize {
         chars = chars.saturating_add(match item {
             ChatMessageItem::Reasoning(reasoning) => reasoning.text.len(),
             ChatMessageItem::Context(context) => context.text.len(),
+            ChatMessageItem::Compaction(compaction) => compaction
+                .generic_summary_text()
+                .map(str::len)
+                .unwrap_or_default(),
             ChatMessageItem::SelectionReference(selection) => selection.to_prompt_text().len(),
             ChatMessageItem::File(file) => estimate_file_item_chars(file),
             ChatMessageItem::ToolCall(tool_call) => {

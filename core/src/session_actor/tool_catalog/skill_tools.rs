@@ -1,7 +1,5 @@
 use serde_json::json;
 
-use crate::session_actor::{tool_runtime::LocalToolError, SessionSkillObservation};
-
 use super::{
     schema::{object_schema, properties},
     ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
@@ -21,7 +19,9 @@ pub fn skill_tool_definitions(
             &["skill_name"],
         ),
         ToolExecutionMode::Immediate,
-        ToolBackend::Local,
+        ToolBackend::ConversationBridge {
+            action: "skill_load".to_string(),
+        },
     ));
 
     if enable_skill_persistence_tools {
@@ -67,20 +67,4 @@ pub fn skill_tool_definitions(
     }
 
     tools
-}
-
-pub(crate) fn execute_skill_load_tool(
-    skill: &SessionSkillObservation,
-) -> Result<serde_json::Value, LocalToolError> {
-    if skill.name.trim().is_empty() {
-        return Err(LocalToolError::InvalidArguments(
-            "skill name must not be empty".to_string(),
-        ));
-    }
-
-    Ok(json!({
-        "name": skill.name,
-        "description": skill.description,
-        "content": skill.content,
-    }))
 }

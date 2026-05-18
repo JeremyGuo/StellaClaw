@@ -65,7 +65,7 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
         };
   }
   if (item.type === 'file') {
-    return rendered?.type === 'file' ? rendered : { type: 'file', index, file: payload };
+    return rendered?.type === 'file' ? rendered : normalizeFileMessageItem(payload, index);
   }
   if (item.type === 'tool_call') {
     return {
@@ -94,6 +94,30 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
   return rendered || null;
 }
 
+function normalizeFileMessageItem(payload, index) {
+  const uri = String(payload.uri || payload.file_uri || payload.url || '').trim();
+  const path = String(payload.path || filePathFromUri(uri) || '').trim();
+  const name = String(payload.name || payload.filename || path.split(/[\\/]/).filter(Boolean).pop() || uri.split('/').filter(Boolean).pop() || 'file').trim();
+  return {
+    type: 'file',
+    index,
+    ...payload,
+    name,
+    path,
+    uri,
+    file: payload
+  };
+}
+
+function filePathFromUri(uri) {
+  if (!String(uri || '').startsWith('file://')) return '';
+  try {
+    return decodeURIComponent(new URL(uri).pathname);
+  } catch {
+    return '';
+  }
+}
+
 export function hasToolItems(message) {
   return messageItems(message).some((item) => item?.type === 'tool_call' || item?.type === 'tool_result');
 }
@@ -103,8 +127,28 @@ export function isExecutionMessage(message) {
 }
 
 export function isFinalAssistantMessage(message) {
+  if (message?._streaming) return false;
   if (String(message?.role || '').toLowerCase() !== 'assistant' || isExecutionMessage(message)) return false;
   return Boolean(messageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || '').trim()));
+}
+
+function hasVisibleMessageContent(message) {
+  if (!message) return false;
+  if (message?._streamFailed || message?.error) return true;
+  if (messageText(message).trim()) return true;
+  if (Number(message?.attachment_count || 0) > 0) return true;
+  if ((Array.isArray(message?.attachments) && message.attachments.length > 0)
+    || (Array.isArray(message?.files) && message.files.length > 0)) {
+    return true;
+  }
+  return messageItems(message).some((item) => {
+    if (!item) return false;
+    if (item.type === 'text') return Boolean(String(item.text || item.text_with_attachment_markers || item.content || '').trim());
+    if (item.type === 'reasoning') return Boolean(String(item.text || item.summary || '').trim());
+    if (item.type === 'tool_call' || item.type === 'tool_result') return true;
+    if (item.type === 'file' || item.type === 'selection_reference') return true;
+    return false;
+  });
 }
 
 export function shouldTypewriterMessage(message) {
@@ -345,17 +389,112 @@ export function stableSignature(value) {
   return JSON.stringify(value ?? null);
 }
 
+function canonicalMessageForCommitCompare(message) {
+  const items = messageItems(message)
+    .filter((item) => ['reasoning', 'text', 'tool_call', 'tool_result'].includes(item?.type))
+    .map((item) => {
+      if (item.type === 'reasoning') {
+        return {
+          type: 'reasoning',
+          text: String(item.text || item.summary || '').trim()
+        };
+      }
+      if (item.type === 'text') {
+        return {
+          type: 'text',
+          text: String(item.text_with_attachment_markers || item.text || item.content || '').trim()
+        };
+      }
+      if (item.type === 'tool_call') {
+        return {
+          type: 'tool_call',
+          tool_call_id: String(item.tool_call_id || '').trim(),
+          tool_name: String(item.tool_name || '').trim(),
+          arguments: String(item.arguments || '').trim()
+        };
+      }
+      return {
+        type: 'tool_result',
+        tool_call_id: String(item.tool_call_id || '').trim(),
+        tool_name: String(item.tool_name || '').trim(),
+        result: item.structured ?? item.context_with_attachment_markers ?? item.context ?? null
+      };
+    })
+    .filter((item) => stableSignature(item) !== stableSignature({ type: item.type, text: '' }));
+  return {
+    role: String(message?.role || '').toLowerCase(),
+    text: messageText(message).trim(),
+    items
+  };
+}
+
+function canonicalMessageHasContent(canonical) {
+  return Boolean(canonical.text || canonical.items.length > 0);
+}
+
+export function committedMessageProtocolMismatches(current, incoming) {
+  if (!Array.isArray(current) || !Array.isArray(incoming)) return [];
+  const mismatches = [];
+  for (const durable of incoming) {
+    if (durable?._streaming) continue;
+    const durableId = String(durable?.id ?? durable?.message_id ?? '').trim();
+    const durableIndex = messageIndex(durable);
+    const provisional = current.find((message) => {
+      if (!message?._streaming || message?._liveToolResult) return false;
+      if (String(message?.role || '').toLowerCase() !== 'assistant') return false;
+      const id = String(message?.id ?? message?.message_id ?? '').trim();
+      if (durableId && id === durableId) return true;
+      const index = messageIndex(message);
+      return Number.isFinite(index)
+        && Number.isFinite(durableIndex)
+        && index !== Number.MAX_SAFE_INTEGER
+        && durableIndex !== Number.MAX_SAFE_INTEGER
+        && index === durableIndex;
+    });
+    if (!provisional) continue;
+    const provisionalCanonical = canonicalMessageForCommitCompare(provisional);
+    if (!canonicalMessageHasContent(provisionalCanonical)) continue;
+    const durableCanonical = canonicalMessageForCommitCompare(durable);
+    if (stableSignature(provisionalCanonical) !== stableSignature(durableCanonical)) {
+      mismatches.push({
+        message_id: durableId || String(durable?.message_id || ''),
+        index: Number.isFinite(durableIndex) && durableIndex !== Number.MAX_SAFE_INTEGER ? durableIndex : undefined
+      });
+    }
+  }
+  return mismatches;
+}
+
+export function messageOrderFromId(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric;
+  const match = String(value).match(/^msg_(\d+)(?:_|$)/);
+  if (!match) return undefined;
+  const order = Number(match[1]);
+  return Number.isFinite(order) ? order : undefined;
+}
+
 export function messageIndex(message) {
-  const index = Number(message?.index ?? message?.id);
-  return Number.isFinite(index) ? index : Number.MAX_SAFE_INTEGER;
+  const index = Number(message?.index);
+  if (Number.isFinite(index)) return index;
+  return messageOrderFromId(message?.id ?? message?.message_id) ?? Number.MAX_SAFE_INTEGER;
 }
 
 export function lastMessageId(messages) {
   return messages.length > 0 ? String(messages[messages.length - 1]?.id ?? '') : '';
 }
 
+export function lastServerMessageIndex(messages) {
+  const last = [...messages].reverse().find((message) => {
+    const index = messageIndex(message);
+    return !message?._optimistic && Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER;
+  });
+  return last ? messageIndex(last) : undefined;
+}
+
 export function lastServerMessageId(messages) {
-  const last = [...messages].reverse().find((message) => !message?._optimistic && Number.isFinite(Number(message?.id)));
+  const last = [...messages].reverse().find((message) => !message?._optimistic && String(message?.id ?? '').trim());
   return last ? String(last.id) : '';
 }
 
@@ -370,27 +509,254 @@ export function hasOlderMessages(messages) {
 export function mergeMessages(current, incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) return current;
   const serverEchoes = incoming.filter((message) => String(message?.role || '').toLowerCase() === 'user');
+  const durableAssistantEchoes = incoming.filter((message) => (
+    String(message?.role || '').toLowerCase() === 'assistant'
+    && !message?._streaming
+    && messageText(message).trim()
+  ));
+  const durableAssistantIds = new Set(
+    incoming
+      .filter((message) => (
+        String(message?.role || '').toLowerCase() === 'assistant'
+        && !message?._streaming
+      ))
+      .map((message) => String(message?.id ?? message?.message_id ?? '').trim())
+      .filter(Boolean)
+  );
+  const committedToolResultIds = new Set(
+    incoming.flatMap((message) => (
+      messageItems(message)
+        .filter((item) => item?.type === 'tool_result')
+        .map((item) => String(item.tool_call_id || '').trim())
+        .filter(Boolean)
+    ))
+  );
+  const finalizedAssistantIndexes = new Set(
+    incoming
+      .filter((message) => String(message?.role || '').toLowerCase() === 'assistant' && !message?._streaming)
+      .map(messageIndex)
+      .filter((index) => Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER)
+  );
   const currentWithoutEchoedOptimistic = current.filter((message) => {
-    if (!message?._optimistic) return true;
-    const text = messageText(message).trim();
-    return !serverEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === text);
+    if (
+      message?._streaming
+      && String(message?.role || '').toLowerCase() === 'assistant'
+      && (
+        durableAssistantIds.has(String(message?.id ?? message?.message_id ?? '').trim())
+        || durableAssistantIds.has(String(message?.message_id ?? message?.id ?? '').trim())
+        || committedToolResultIds.has(String(message?._liveToolCallId || '').trim())
+        || committedToolResultIds.has(String(message?._streamItemId || '').trim())
+        || finalizedAssistantIndexes.has(messageIndex(message))
+        || durableAssistantEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === messageText(message).trim())
+      )
+    ) return false;
+    if (
+      message?._liveToolResult
+      && committedToolResultIds.has(String(message?._liveToolCallId || '').trim())
+    ) {
+      return false;
+    }
+    if (!message?._optimistic && !message?.queued && !message?.pending && !message?._userMessageStarted) return true;
+    if (String(message?.role || '').toLowerCase() !== 'user') return true;
+    return !serverEchoes.some((incomingMessage) => isUserMessageEcho(message, incomingMessage));
   });
   const byId = new Map(currentWithoutEchoedOptimistic.map((message) => [String(message.id ?? messageKey(message, 0)), message]));
   let changed = currentWithoutEchoedOptimistic.length !== current.length;
   for (const message of incoming) {
     const id = String(message.id ?? messageKey(message, byId.size));
-    const existing = byId.get(id);
+    const existingKey = existingMessageKey(byId, message, id);
+    const existing = byId.get(existingKey);
     if (!existing || stableSignature(existing) !== stableSignature(message)) {
+      if (existingKey !== id) byId.delete(existingKey);
       byId.set(id, message);
       changed = true;
     }
   }
-  if (!changed) return current;
-  return Array.from(byId.values()).sort((left, right) => messageIndex(left) - messageIndex(right));
+  const merged = dedupeMergedMessages(Array.from(byId.values()).sort((left, right) => messageIndex(left) - messageIndex(right)));
+  if (!changed && merged.length === current.length) return current;
+  return merged;
 }
 
-export function websocketUrl(baseUrl, token, conversationId) {
-  const url = new URL(`/api/conversations/${encodeURIComponent(conversationId)}/foreground/ws`, baseUrl);
+function existingMessageKey(byId, incoming, fallbackId) {
+  if (byId.has(fallbackId)) return fallbackId;
+  const incomingRole = String(incoming?.role || '').toLowerCase();
+  const incomingIndex = messageIndex(incoming);
+  if (Number.isFinite(incomingIndex) && incomingIndex !== Number.MAX_SAFE_INTEGER) {
+    for (const [key, message] of byId.entries()) {
+      if (String(message?.role || '').toLowerCase() === incomingRole && messageIndex(message) === incomingIndex) {
+        return key;
+      }
+    }
+  }
+  if (incomingRole === 'user') {
+    const incomingClientId = messageClientId(incoming);
+    const incomingIsProvisional = isProvisionalMessage(incoming);
+    for (const [key, message] of byId.entries()) {
+      if (String(message?.role || '').toLowerCase() !== 'user') continue;
+      if (incomingClientId && incomingClientId === messageClientId(message)) return key;
+      if ((incomingIsProvisional || isProvisionalMessage(message)) && isUserMessageEcho(message, incoming)) return key;
+    }
+  }
+  if (incomingRole === 'assistant' && incoming?._streaming) {
+    const incomingTurnId = messageStreamTurnId(incoming);
+    if (incomingTurnId) {
+      for (const [key, message] of byId.entries()) {
+        if (
+          String(message?.role || '').toLowerCase() === 'assistant'
+          && message?._streaming
+          && messageStreamTurnId(message) === incomingTurnId
+        ) {
+          return key;
+        }
+      }
+    }
+  }
+  const incomingText = messageText(incoming).trim();
+  if (incomingText) {
+    const incomingClientId = messageClientId(incoming);
+    for (const [key, message] of byId.entries()) {
+      const sameRole = String(message?.role || '').toLowerCase() === incomingRole;
+      if (!sameRole || messageText(message).trim() !== incomingText) continue;
+      const sameClient = incomingClientId && incomingClientId === messageClientId(message);
+      const provisional = isProvisionalMessage(message) || isProvisionalMessage(incoming);
+      const sameUserWithoutDurablePosition = incomingRole === 'user'
+        && (sameClient || provisional || !hasDurablePosition(message) || !hasDurablePosition(incoming));
+      if (provisional || sameUserWithoutDurablePosition) return key;
+    }
+  }
+  return fallbackId;
+}
+
+function isUserMessageEcho(current, incoming) {
+  if (String(current?.role || '').toLowerCase() !== 'user') return false;
+  if (String(incoming?.role || '').toLowerCase() !== 'user') return false;
+  const currentClientId = messageClientId(current);
+  const incomingClientId = messageClientId(incoming);
+  if (currentClientId && incomingClientId && currentClientId === incomingClientId) return true;
+  const currentText = userVisibleText(current);
+  const incomingText = userVisibleText(incoming);
+  if (currentText !== incomingText) return false;
+  const currentFiles = messageAttachmentSignature(current);
+  const incomingFiles = messageAttachmentSignature(incoming);
+  if (currentFiles || incomingFiles) return Boolean(currentFiles && incomingFiles && currentFiles === incomingFiles);
+  return Boolean(currentText);
+}
+
+function userVisibleText(message) {
+  const direct = String(message?.text || message?.preview || message?.content || '').trim();
+  if (direct) return direct;
+  return String(messageText(message) || '').trim();
+}
+
+function messageAttachmentSignature(message) {
+  const keys = [];
+  const collect = (value) => {
+    const key = attachmentSignature(value);
+    if (key) keys.push(key);
+  };
+  (Array.isArray(message?.attachments) ? message.attachments : []).forEach(collect);
+  (Array.isArray(message?.files) ? message.files : []).forEach(collect);
+  messageItems(message)
+    .filter((item) => item?.type === 'file')
+    .forEach(collect);
+  return Array.from(new Set(keys)).sort().join('|');
+}
+
+function attachmentSignature(value) {
+  if (!value || typeof value !== 'object') return '';
+  const payload = value.payload && typeof value.payload === 'object' ? value.payload : {};
+  const file = value.file && typeof value.file === 'object' ? value.file : {};
+  const uri = String(
+    value.uri
+    || value.file_uri
+    || value.url
+    || value.path
+    || file.uri
+    || file.file_uri
+    || file.url
+    || file.path
+    || payload.uri
+    || payload.file_uri
+    || payload.url
+    || payload.path
+    || ''
+  ).trim();
+  if (uri) return uri;
+  const name = String(value.name || value.filename || file.name || file.filename || payload.name || payload.filename || '').trim();
+  const mediaType = String(value.media_type || value.mime_type || value.mime || file.media_type || file.mime_type || payload.media_type || payload.mime_type || '').trim();
+  const size = String(value.size_bytes || value.size || file.size_bytes || file.size || payload.size_bytes || payload.size || '').trim();
+  const width = String(value.width || file.width || payload.width || '').trim();
+  const height = String(value.height || file.height || payload.height || '').trim();
+  return [name, mediaType, size, width, height].filter(Boolean).join(':');
+}
+
+function messageClientId(message) {
+  return String(
+    message?.client_message_id
+    || message?.clientMessageId
+    || message?._clientMessageId
+    || ''
+  ).trim();
+}
+
+function isProvisionalMessage(message) {
+  return Boolean(message?._streaming || message?._optimistic || message?.queued || message?.pending || message?._userMessageStarted);
+}
+
+function messageStreamTurnId(message) {
+  return String(message?._streamTurnId || message?.turn_id || message?.turnId || '').trim();
+}
+
+function hasDurablePosition(message) {
+  const index = messageIndex(message);
+  return Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER;
+}
+
+function dedupeMergedMessages(messages) {
+  const result = [];
+  for (const message of messages) {
+    const role = String(message?.role || '').toLowerCase();
+    const text = messageText(message).trim();
+    const index = messageIndex(message);
+    const duplicateIndex = result.findIndex((existing) => {
+      if (String(existing?.role || '').toLowerCase() !== role) return false;
+      const existingIndex = messageIndex(existing);
+      if (
+        Number.isFinite(index)
+        && Number.isFinite(existingIndex)
+        && index !== Number.MAX_SAFE_INTEGER
+        && existingIndex !== Number.MAX_SAFE_INTEGER
+        && index === existingIndex
+      ) return true;
+      if (!text || messageText(existing).trim() !== text) return false;
+      const currentProvisional = isProvisionalMessage(message);
+      const existingProvisional = isProvisionalMessage(existing);
+      if (currentProvisional || existingProvisional) return true;
+      if (role !== 'user') return false;
+      const currentClientId = messageClientId(message);
+      const existingClientId = messageClientId(existing);
+      if (currentClientId && currentClientId === existingClientId) return true;
+      return !hasDurablePosition(message) || !hasDurablePosition(existing);
+    });
+    if (duplicateIndex < 0) {
+      result.push(message);
+      continue;
+    }
+    const existing = result[duplicateIndex];
+    const existingProvisional = isProvisionalMessage(existing);
+    const currentProvisional = isProvisionalMessage(message);
+    if (
+      (existingProvisional && !currentProvisional)
+      || (!hasDurablePosition(existing) && hasDurablePosition(message))
+    ) {
+      result[duplicateIndex] = message;
+    }
+  }
+  return result;
+}
+
+export function websocketUrl(baseUrl, token, conversationId, foregroundSessionId = 'main') {
+  const url = new URL(`/api/conversations/${encodeURIComponent(conversationId)}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}/ws`, baseUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('token', token || '');
   return url.toString();
@@ -458,16 +824,19 @@ export function attachAuxiliaryMessages(messages) {
 }
 
 export function displayMessages(messages) {
-  const source = attachAuxiliaryMessages(messages);
+  const source = attachAuxiliaryMessages(messages).filter(hasVisibleMessageContent);
   const result = [];
   let forceSeparateNext = false;
   for (let index = 0; index < source.length; index += 1) {
     const message = source[index];
-    if (isExecutionMessage(message)) {
+    if (isExecutionMessage(message) || startsToolRound(source, index)) {
       const group = [];
       let cursor = index;
-      while (cursor < source.length && isExecutionMessage(source[cursor])) {
-        group.push(source[cursor]);
+      while (cursor < source.length) {
+        const current = source[cursor];
+        if (cursor > index && isFinalAssistantMessage(current)) break;
+        if (!isExecutionMessage(current) && !isRoundInterstitialMessage(current)) break;
+        group.push(current);
         cursor += 1;
       }
       const nextMessage = source[cursor];
@@ -480,4 +849,31 @@ export function displayMessages(messages) {
     forceSeparateNext = false;
   }
   return result;
+}
+
+function isRoundInterstitialMessage(message) {
+  const role = String(message?.role || '').toLowerCase();
+  if (role === 'user') return false;
+  return role === 'assistant' && !isFinalAssistantMessage(message);
+}
+
+function startsToolRound(source, index) {
+  const message = source[index];
+  if (isStreamingAssistantMessage(message)) return hasAssistantProcessItems(message);
+  if (String(message?.role || '').toLowerCase() !== 'assistant' || isFinalAssistantMessage(message)) return false;
+  for (let cursor = index + 1; cursor < source.length; cursor += 1) {
+    const current = source[cursor];
+    if (isFinalAssistantMessage(current)) return false;
+    if (isExecutionMessage(current)) return true;
+    if (!isRoundInterstitialMessage(current)) return false;
+  }
+  return false;
+}
+
+function isStreamingAssistantMessage(message) {
+  return Boolean(message?._streaming) && String(message?.role || '').toLowerCase() === 'assistant';
+}
+
+function hasAssistantProcessItems(message) {
+  return messageItems(message).some((item) => item?.type === 'reasoning' || item?.type === 'tool_call' || item?.type === 'tool_result');
 }

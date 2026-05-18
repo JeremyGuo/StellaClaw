@@ -13,8 +13,17 @@ mod openrouter_responses;
 mod output_persistor;
 mod pricing;
 
-use std::{error::Error as StdError, time::Duration};
+use std::{
+    error::Error as StdError,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::Duration,
+};
 
+use crossbeam_channel::{select, Receiver, Sender};
 #[cfg(not(test))]
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -22,7 +31,7 @@ use thiserror::Error;
 
 use crate::{
     model_config::{ModelConfig, ProviderType, RetryMode},
-    session_actor::{ChatMessage, ToolDefinition},
+    session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem, ToolDefinition, ToolSet},
 };
 
 pub use brave_search::BraveSearchProvider;
@@ -33,9 +42,9 @@ pub use claude_code::ClaudeCodeProvider;
 pub use codex_subscription::CodexSubscriptionProvider;
 pub use error_report::ProviderErrorReport;
 pub use forkserver::{
-    global_provider_fork_server, init_global_provider_fork_server, ForkServerProvider,
-    ProviderRequestAbortHandle, ProviderRequestForkServer, ProviderRequestHandle,
-    ProviderRequestOwned,
+    global_provider_fork_server, init_global_provider_fork_server, ForkServerProviderFactory,
+    ProviderForkServerEvent, ProviderRequestAbortHandle, ProviderRequestForkServer,
+    ProviderRequestHandle,
 };
 pub use openai_image_edit::OpenAiImageEditProvider;
 pub use openrouter_completion::OpenRouterCompletionProvider;
@@ -50,25 +59,95 @@ pub fn provider_from_model_config(model_config: ModelConfig) -> Box<dyn Provider
     })
 }
 
+pub fn provider_system_prompt_from_model_config(
+    model_config: &ModelConfig,
+) -> Result<Option<String>, ProviderError> {
+    provider_backend_from_model_config(model_config).system_prompt_for_model(model_config)
+}
+
 pub trait Provider {
     fn model_config(&self) -> &ModelConfig;
 
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
+    fn system_prompt(&self) -> Result<Option<String>, ProviderError> {
+        self.system_prompt_for_model(self.model_config())
+    }
+
     fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
-        messages.to_vec()
+        normalize_compaction_for_generic_provider(messages)
+    }
+
+    fn tool_set(&self) -> Option<Arc<dyn ToolSet>> {
+        None
+    }
+
+    fn compaction_mode(&self) -> ProviderCompactionMode {
+        ProviderCompactionMode::Summary
+    }
+
+    fn compact_history(
+        &self,
+        _request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        Ok(None)
     }
 
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError>;
 
+    fn send_with_stream(
+        &self,
+        request: ProviderRequest<'_>,
+        _on_stream: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ChatMessage, ProviderError> {
+        self.send(request)
+    }
+
     fn before_retry(&self, _error: &ProviderError) {}
+
+    fn start_worker_request(
+        &self,
+        _request: ProviderRequestOwned,
+    ) -> Result<Option<ProviderRequestHandle>, ProviderError> {
+        Ok(None)
+    }
 }
 
 pub(crate) trait ProviderBackend: Send + Sync {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn normalize_messages_for_provider(
         &self,
         _model_config: &ModelConfig,
         messages: &[ChatMessage],
     ) -> Vec<ChatMessage> {
-        messages.to_vec()
+        normalize_compaction_for_generic_provider(messages)
+    }
+
+    fn tool_set(&self, _model_config: &ModelConfig) -> Option<Arc<dyn ToolSet>> {
+        None
+    }
+
+    fn compaction_mode(&self, _model_config: &ModelConfig) -> ProviderCompactionMode {
+        ProviderCompactionMode::Summary
+    }
+
+    fn compact_history(
+        &self,
+        _model_config: &ModelConfig,
+        _request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        Ok(None)
     }
 
     fn send(
@@ -76,6 +155,15 @@ pub(crate) trait ProviderBackend: Send + Sync {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError>;
+
+    fn send_with_stream(
+        &self,
+        model_config: &ModelConfig,
+        request: ProviderRequest<'_>,
+        _on_stream: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ChatMessage, ProviderError> {
+        self.send(model_config, request)
+    }
 
     fn before_retry(&self, _model_config: &ModelConfig, _error: &ProviderError) {}
 }
@@ -90,13 +178,48 @@ impl Provider for ModelBoundProvider {
         &self.model_config
     }
 
+    fn system_prompt(&self) -> Result<Option<String>, ProviderError> {
+        self.system_prompt_for_model(&self.model_config)
+    }
+
+    fn system_prompt_for_model(
+        &self,
+        model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        self.backend.system_prompt_for_model(model_config)
+    }
+
     fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
         self.backend
             .normalize_messages_for_provider(&self.model_config, messages)
     }
 
+    fn tool_set(&self) -> Option<Arc<dyn ToolSet>> {
+        self.backend.tool_set(&self.model_config)
+    }
+
+    fn compaction_mode(&self) -> ProviderCompactionMode {
+        self.backend.compaction_mode(&self.model_config)
+    }
+
+    fn compact_history(
+        &self,
+        request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        self.backend.compact_history(&self.model_config, request)
+    }
+
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
         self.backend.send(&self.model_config, request)
+    }
+
+    fn send_with_stream(
+        &self,
+        request: ProviderRequest<'_>,
+        on_stream: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ChatMessage, ProviderError> {
+        self.backend
+            .send_with_stream(&self.model_config, request, on_stream)
     }
 
     fn before_retry(&self, error: &ProviderError) {
@@ -111,17 +234,37 @@ pub struct ProviderRetryEvent<'a> {
     pub error: &'a ProviderError,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCompactionMode {
+    Builtin,
+    Summary,
+    SummaryWithMemory,
+}
+
 pub fn send_provider_request_with_retry<F>(
     provider: &(dyn Provider + Send + Sync),
     request: ProviderRequest<'_>,
-    mut on_retry: F,
+    on_retry: F,
 ) -> Result<ChatMessage, ProviderError>
 where
     F: FnMut(ProviderRetryEvent<'_>),
 {
+    send_provider_request_with_retry_and_stream(provider, request, on_retry, |_| {})
+}
+
+pub fn send_provider_request_with_retry_and_stream<F, S>(
+    provider: &(dyn Provider + Send + Sync),
+    request: ProviderRequest<'_>,
+    mut on_retry: F,
+    mut on_stream: S,
+) -> Result<ChatMessage, ProviderError>
+where
+    F: FnMut(ProviderRetryEvent<'_>),
+    S: FnMut(ProviderStreamEvent),
+{
     let mut retries_used = 0_u64;
     loop {
-        match provider.send(request.clone()) {
+        match provider.send_with_stream(request.clone(), &mut on_stream) {
             Ok(response) => return Ok(response),
             Err(error) if error.is_transient() => {
                 let Some(delay) = transient_provider_retry_delay(
@@ -198,6 +341,40 @@ fn provider_backend_from_model_config(
     }
 }
 
+fn normalize_compaction_for_generic_provider(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            if message.role != ChatRole::Compaction {
+                return Some(message.clone());
+            }
+            let data = message
+                .data
+                .iter()
+                .filter_map(|item| match item {
+                    ChatMessageItem::Compaction(compaction) => compaction
+                        .generic_summary_text()
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| {
+                            ChatMessageItem::Context(ContextItem {
+                                text: text.to_string(),
+                            })
+                        }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!data.is_empty()).then(|| ChatMessage {
+                message_id: message.message_id.clone(),
+                role: ChatRole::User,
+                user_name: message.user_name.clone(),
+                message_time: message.message_time.clone(),
+                token_usage: message.token_usage.clone(),
+                data,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderRequest<'a> {
     pub system_prompt: Option<&'a str>,
@@ -223,6 +400,761 @@ impl<'a> ProviderRequest<'a> {
         self.tools = tools;
         self
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRequestOwned {
+    pub system_prompt: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolDefinition>,
+}
+
+impl ProviderRequestOwned {
+    pub fn new(messages: Vec<ChatMessage>) -> Self {
+        Self {
+            system_prompt: None,
+            messages,
+            tools: Vec::new(),
+        }
+    }
+
+    pub fn from_provider_request(request: &ProviderRequest<'_>) -> Self {
+        Self {
+            system_prompt: request.system_prompt.map(str::to_string),
+            messages: request.messages.to_vec(),
+            tools: request.tools.iter().map(|tool| (*tool).clone()).collect(),
+        }
+    }
+
+    pub fn as_provider_request(&self) -> ProviderRequest<'_> {
+        ProviderRequest {
+            system_prompt: self.system_prompt.as_deref(),
+            messages: &self.messages,
+            tools: self.tools.iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ProviderEvent {
+    Stream {
+        request_id: String,
+        event: ProviderStreamEvent,
+    },
+    Retry {
+        request_id: String,
+        retry: u64,
+        max_retries: u64,
+        delay_ms: u128,
+        error: String,
+    },
+    Result {
+        request_id: String,
+        result: Result<ChatMessage, ProviderError>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderStreamEvent {
+    KeepAlive,
+    OutputTextDelta {
+        item_id: Option<String>,
+        delta: String,
+    },
+    ToolCallInputDelta {
+        item_id: String,
+        call_id: Option<String>,
+        delta: String,
+    },
+    ReasoningSummaryDelta {
+        item_id: Option<String>,
+        delta: String,
+        summary_index: i64,
+    },
+    ReasoningSummaryPartAdded {
+        item_id: Option<String>,
+        summary_index: i64,
+    },
+    RawJson {
+        value: serde_json::Value,
+    },
+}
+
+#[derive(Debug)]
+enum ProviderCommand {
+    Start {
+        request_id: String,
+        request: ProviderRequestOwned,
+    },
+    Compact {
+        request: ProviderRequestOwned,
+        response_tx: mpsc::Sender<Result<Option<Vec<ChatMessage>>, ProviderError>>,
+    },
+    Abort,
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct ProviderCompletion {
+    request_id: String,
+    result: Result<ChatMessage, ProviderError>,
+}
+
+pub struct ProviderSession {
+    kind: ProviderSessionKind,
+    command_tx: Sender<ProviderCommand>,
+    event_rx: Receiver<ProviderEvent>,
+}
+
+#[derive(Clone)]
+enum ProviderSessionKind {
+    Direct {
+        provider: Arc<dyn Provider + Send + Sync>,
+    },
+    ForkServer {
+        model_config: ModelConfig,
+        fork_server: Arc<ProviderRequestForkServer>,
+    },
+}
+
+impl ProviderSession {
+    pub fn new(provider: Arc<dyn Provider + Send + Sync>) -> Self {
+        let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let provider_for_thread = provider.clone();
+        thread::spawn(move || {
+            direct_provider_session_loop(provider_for_thread, command_rx, event_tx)
+        });
+        Self {
+            kind: ProviderSessionKind::Direct { provider },
+            command_tx,
+            event_rx,
+        }
+    }
+
+    pub fn fork_server(
+        model_config: ModelConfig,
+        fork_server: Arc<ProviderRequestForkServer>,
+    ) -> Self {
+        let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let runtime_model_config = model_config.clone();
+        let runtime_fork_server = fork_server.clone();
+        thread::spawn(move || {
+            fork_server_provider_session_loop(
+                runtime_model_config,
+                runtime_fork_server,
+                command_rx,
+                event_tx,
+            )
+        });
+        Self {
+            kind: ProviderSessionKind::ForkServer {
+                model_config,
+                fork_server,
+            },
+            command_tx,
+            event_rx,
+        }
+    }
+
+    pub fn model_config(&self) -> &ModelConfig {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => provider.model_config(),
+            ProviderSessionKind::ForkServer { model_config, .. } => model_config,
+        }
+    }
+
+    pub fn system_prompt(&self) -> Result<Option<String>, ProviderError> {
+        self.system_prompt_for_model(self.model_config())
+    }
+
+    pub fn system_prompt_for_model(
+        &self,
+        model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => {
+                provider.system_prompt_for_model(model_config)
+            }
+            ProviderSessionKind::ForkServer { .. } => {
+                provider_backend_from_model_config(model_config)
+                    .system_prompt_for_model(model_config)
+            }
+        }
+    }
+
+    pub fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => {
+                provider.normalize_messages_for_provider(messages)
+            }
+            ProviderSessionKind::ForkServer { model_config, .. } => {
+                provider_backend_from_model_config(model_config)
+                    .normalize_messages_for_provider(model_config, messages)
+            }
+        }
+    }
+
+    pub fn tool_set(&self) -> Option<Arc<dyn ToolSet>> {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => provider.tool_set(),
+            ProviderSessionKind::ForkServer { model_config, .. } => {
+                provider_backend_from_model_config(model_config).tool_set(model_config)
+            }
+        }
+    }
+
+    pub fn start(
+        &self,
+        request_id: String,
+        request: ProviderRequestOwned,
+    ) -> Result<(), ProviderError> {
+        self.command_tx
+            .send(ProviderCommand::Start {
+                request_id,
+                request,
+            })
+            .map_err(|_| ProviderError::Subprocess("provider session stopped".to_string()))
+    }
+
+    pub fn abort(&self) -> Result<(), ProviderError> {
+        self.command_tx
+            .send(ProviderCommand::Abort)
+            .map_err(|_| ProviderError::Subprocess("provider session stopped".to_string()))
+    }
+
+    pub fn event_rx(&self) -> Receiver<ProviderEvent> {
+        self.event_rx.clone()
+    }
+}
+
+impl Provider for ProviderSession {
+    fn model_config(&self) -> &ModelConfig {
+        self.model_config()
+    }
+
+    fn system_prompt(&self) -> Result<Option<String>, ProviderError> {
+        ProviderSession::system_prompt(self)
+    }
+
+    fn system_prompt_for_model(
+        &self,
+        model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        ProviderSession::system_prompt_for_model(self, model_config)
+    }
+
+    fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        self.normalize_messages_for_provider(messages)
+    }
+
+    fn tool_set(&self) -> Option<Arc<dyn ToolSet>> {
+        ProviderSession::tool_set(self)
+    }
+
+    fn compaction_mode(&self) -> ProviderCompactionMode {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => provider.compaction_mode(),
+            ProviderSessionKind::ForkServer { model_config, .. } => {
+                provider_backend_from_model_config(model_config).compaction_mode(model_config)
+            }
+        }
+    }
+
+    fn compact_history(
+        &self,
+        request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.command_tx
+            .send(ProviderCommand::Compact {
+                request: ProviderRequestOwned::from_provider_request(&request),
+                response_tx,
+            })
+            .map_err(|_| ProviderError::Subprocess("provider session stopped".to_string()))?;
+        response_rx.recv().map_err(|_| {
+            ProviderError::Subprocess("provider compact request disconnected".to_string())
+        })?
+    }
+
+    fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => provider.send(request),
+            ProviderSessionKind::ForkServer {
+                model_config,
+                fork_server,
+            } => fork_server
+                .start(
+                    model_config.clone(),
+                    ProviderRequestOwned::from_provider_request(&request),
+                )?
+                .wait(),
+        }
+    }
+
+    fn before_retry(&self, error: &ProviderError) {
+        if let ProviderSessionKind::Direct { provider } = &self.kind {
+            provider.before_retry(error);
+        }
+    }
+
+    fn start_worker_request(
+        &self,
+        request: ProviderRequestOwned,
+    ) -> Result<Option<ProviderRequestHandle>, ProviderError> {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => provider.start_worker_request(request),
+            ProviderSessionKind::ForkServer {
+                model_config,
+                fork_server,
+            } => Ok(Some(fork_server.start(model_config.clone(), request)?)),
+        }
+    }
+}
+
+impl Drop for ProviderSession {
+    fn drop(&mut self) {
+        let _ = self.command_tx.send(ProviderCommand::Shutdown);
+    }
+}
+
+pub trait ProviderFactory: Send + Sync {
+    fn create(&self, model_config: ModelConfig) -> Result<ProviderSession, ProviderError>;
+}
+
+pub struct DirectProviderFactory;
+
+impl ProviderFactory for DirectProviderFactory {
+    fn create(&self, model_config: ModelConfig) -> Result<ProviderSession, ProviderError> {
+        Ok(ProviderSession::new(Arc::from(provider_from_model_config(
+            model_config,
+        ))))
+    }
+}
+
+fn direct_provider_session_loop(
+    provider: Arc<dyn Provider + Send + Sync>,
+    command_rx: Receiver<ProviderCommand>,
+    event_tx: Sender<ProviderEvent>,
+) {
+    let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+    let mut active: Option<ProviderActiveRequest> = None;
+
+    loop {
+        select! {
+            recv(command_rx) -> command => {
+                let Ok(command) = command else {
+                    break;
+                };
+                match command {
+                    ProviderCommand::Start { request_id, request } => {
+                        if active.is_some() {
+                            let _ = event_tx.send(ProviderEvent::Result {
+                                request_id,
+                                result: Err(ProviderError::Subprocess(
+                                    "provider session is busy".to_string(),
+                                )),
+                            });
+                            continue;
+                        }
+                        match start_provider_session_request(
+                            provider.clone(),
+                            request_id.clone(),
+                            request,
+                            event_tx.clone(),
+                            completion_tx.clone(),
+                        ) {
+                            Ok(active_request) => active = Some(active_request),
+                            Err(error) => {
+                                let _ = event_tx.send(ProviderEvent::Result {
+                                    request_id,
+                                    result: Err(error),
+                                });
+                            }
+                        }
+                    }
+                    ProviderCommand::Compact { request, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else {
+                            provider.compact_history(request.as_provider_request())
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    ProviderCommand::Abort => {
+                        if let Some(active_request) = active.take() {
+                            active_request.cancel();
+                            let _ = event_tx.send(ProviderEvent::Result {
+                                request_id: active_request.request_id,
+                                result: Err(ProviderError::Subprocess(
+                                    "provider request cancelled".to_string(),
+                                )),
+                            });
+                        }
+                    }
+                    ProviderCommand::Shutdown => {
+                        if let Some(active_request) = active.take() {
+                            active_request.cancel();
+                        }
+                        break;
+                    }
+                }
+            }
+            recv(completion_rx) -> completion => {
+                let Ok(completion) = completion else {
+                    break;
+                };
+                if active
+                    .as_ref()
+                    .is_some_and(|active| active.request_id == completion.request_id)
+                {
+                    active = None;
+                    let _ = event_tx.send(ProviderEvent::Result {
+                        request_id: completion.request_id,
+                        result: completion.result,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn fork_server_provider_session_loop(
+    model_config: ModelConfig,
+    fork_server: Arc<ProviderRequestForkServer>,
+    command_rx: Receiver<ProviderCommand>,
+    event_tx: Sender<ProviderEvent>,
+) {
+    let (fork_server_event_tx, fork_server_event_rx) = crossbeam_channel::unbounded();
+    let mut worker: Option<ProviderWorkerBinding> = None;
+    let mut active: Option<ProviderActiveRequest> = None;
+
+    loop {
+        select! {
+            recv(command_rx) -> command => {
+                let Ok(command) = command else {
+                    break;
+                };
+                match command {
+                    ProviderCommand::Start { request_id, request } => {
+                        if active.is_some() {
+                            let _ = event_tx.send(ProviderEvent::Result {
+                                request_id,
+                                result: Err(ProviderError::Subprocess(
+                                    "provider session is busy".to_string(),
+                                )),
+                            });
+                            continue;
+                        }
+                        match start_fork_server_session_request(
+                            &model_config,
+                            &fork_server,
+                            &mut worker,
+                            request_id.clone(),
+                            request,
+                            fork_server_event_tx.clone(),
+                        ) {
+                            Ok(active_request) => active = Some(active_request),
+                            Err(error) => {
+                                let _ = event_tx.send(ProviderEvent::Result {
+                                    request_id,
+                                    result: Err(error),
+                                });
+                            }
+                        }
+                    }
+                    ProviderCommand::Compact { request, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else {
+                            compact_on_fork_server_worker(
+                                &model_config,
+                                &fork_server,
+                                &mut worker,
+                                request,
+                            )
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                    ProviderCommand::Abort => {
+                        if let Some(active_request) = active.take() {
+                            active_request.cancel();
+                            let _ = event_tx.send(ProviderEvent::Result {
+                                request_id: active_request.request_id,
+                                result: Err(ProviderError::Subprocess(
+                                    "provider request cancelled".to_string(),
+                                )),
+                            });
+                        }
+                    }
+                    ProviderCommand::Shutdown => {
+                        if let Some(active_request) = active.take() {
+                            active_request.cancel();
+                        }
+                        if let Some(worker) = worker.take() {
+                            let _ = fork_server.shutdown_worker(&worker.worker_id);
+                        }
+                        break;
+                    }
+                }
+            }
+            recv(fork_server_event_rx) -> event => {
+                let Ok(event) = event else {
+                    if let Some(active_request) = active.take() {
+                        let _ = event_tx.send(ProviderEvent::Result {
+                            request_id: active_request.request_id,
+                            result: Err(ProviderError::Subprocess(
+                                "provider request runtime disconnected".to_string(),
+                            )),
+                        });
+                    }
+                    break;
+                };
+                match event {
+                    ProviderForkServerEvent::Stream { request_id, event } => {
+                        if active
+                            .as_ref()
+                            .is_some_and(|active| active.request_id == request_id)
+                        {
+                            let _ = event_tx.send(ProviderEvent::Stream {
+                                request_id,
+                                event,
+                            });
+                        }
+                    }
+                    ProviderForkServerEvent::Completed { request_id, result } => {
+                        if !active
+                            .as_ref()
+                            .is_some_and(|active| active.request_id == request_id)
+                        {
+                            continue;
+                        }
+                        active = None;
+                        if should_recreate_provider_worker(&result) {
+                            worker = None;
+                        }
+                        let _ = event_tx.send(ProviderEvent::Result {
+                            request_id,
+                            result,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn compact_on_fork_server_worker(
+    model_config: &ModelConfig,
+    fork_server: &ProviderRequestForkServer,
+    worker: &mut Option<ProviderWorkerBinding>,
+    request: ProviderRequestOwned,
+) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+    if provider_backend_from_model_config(model_config).compaction_mode(model_config)
+        != ProviderCompactionMode::Builtin
+    {
+        return Ok(None);
+    }
+    let worker_id = ensure_fork_server_worker(model_config, fork_server, worker)?;
+    fork_server
+        .compact_on_worker(worker_id, request)
+        .and_then(|handle| handle.wait().map(Some))
+}
+
+#[cfg(not(unix))]
+fn compact_on_fork_server_worker(
+    model_config: &ModelConfig,
+    _fork_server: &ProviderRequestForkServer,
+    _worker: &mut Option<ProviderWorkerBinding>,
+    request: ProviderRequestOwned,
+) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+    provider_backend_from_model_config(model_config)
+        .compact_history(model_config, request.as_provider_request())
+}
+
+#[derive(Debug, Clone)]
+struct ProviderWorkerBinding {
+    worker_id: String,
+    signature: String,
+}
+
+fn start_fork_server_session_request(
+    model_config: &ModelConfig,
+    fork_server: &ProviderRequestForkServer,
+    worker: &mut Option<ProviderWorkerBinding>,
+    request_id: String,
+    request: ProviderRequestOwned,
+    event_tx: Sender<ProviderForkServerEvent>,
+) -> Result<ProviderActiveRequest, ProviderError> {
+    let abort_handle = start_fork_server_request(
+        model_config,
+        fork_server,
+        worker,
+        &request_id,
+        request,
+        event_tx,
+    )?;
+    Ok(ProviderActiveRequest {
+        request_id,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        abort_handle: Some(abort_handle),
+    })
+}
+
+#[cfg(unix)]
+fn start_fork_server_request(
+    model_config: &ModelConfig,
+    fork_server: &ProviderRequestForkServer,
+    worker: &mut Option<ProviderWorkerBinding>,
+    request_id: &str,
+    request: ProviderRequestOwned,
+    event_tx: Sender<ProviderForkServerEvent>,
+) -> Result<ProviderRequestAbortHandle, ProviderError> {
+    let worker_id = ensure_fork_server_worker(model_config, fork_server, worker)?;
+    fork_server.start_on_worker_event(worker_id, request_id.to_string(), request, event_tx)
+}
+
+#[cfg(not(unix))]
+fn start_fork_server_request(
+    model_config: &ModelConfig,
+    fork_server: &ProviderRequestForkServer,
+    _worker: &mut Option<ProviderWorkerBinding>,
+    request_id: &str,
+    request: ProviderRequestOwned,
+    event_tx: Sender<ProviderForkServerEvent>,
+) -> Result<ProviderRequestAbortHandle, ProviderError> {
+    fork_server.start_event(
+        model_config.clone(),
+        request_id.to_string(),
+        request,
+        event_tx,
+    )
+}
+
+#[cfg(unix)]
+fn ensure_fork_server_worker(
+    model_config: &ModelConfig,
+    fork_server: &ProviderRequestForkServer,
+    worker: &mut Option<ProviderWorkerBinding>,
+) -> Result<String, ProviderError> {
+    let signature = provider_worker_signature(model_config);
+    if let Some(binding) = worker.as_ref() {
+        if binding.signature == signature {
+            return Ok(binding.worker_id.clone());
+        }
+        let _ = fork_server.shutdown_worker(&binding.worker_id);
+    }
+
+    let worker_id = fork_server.start_worker(model_config.clone())?;
+    *worker = Some(ProviderWorkerBinding {
+        worker_id: worker_id.clone(),
+        signature,
+    });
+    Ok(worker_id)
+}
+
+fn provider_worker_signature(model_config: &ModelConfig) -> String {
+    serde_json::to_string(model_config).unwrap_or_else(|_| {
+        format!(
+            "{:?}:{}:{}",
+            model_config.provider_type, model_config.model_name, model_config.url
+        )
+    })
+}
+
+fn should_recreate_provider_worker(result: &Result<ChatMessage, ProviderError>) -> bool {
+    matches!(
+        result,
+        Err(ProviderError::Subprocess(message))
+            if message.contains("unknown provider worker")
+                || message.contains("provider worker")
+                    && message.contains("exited before completing request")
+    )
+}
+
+struct ProviderActiveRequest {
+    request_id: String,
+    cancelled: Arc<AtomicBool>,
+    abort_handle: Option<ProviderRequestAbortHandle>,
+}
+
+impl ProviderActiveRequest {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(abort_handle) = &self.abort_handle {
+            let _ = abort_handle.abort();
+        }
+    }
+}
+
+fn start_provider_session_request(
+    provider: Arc<dyn Provider + Send + Sync>,
+    request_id: String,
+    request: ProviderRequestOwned,
+    event_tx: Sender<ProviderEvent>,
+    completion_tx: Sender<ProviderCompletion>,
+) -> Result<ProviderActiveRequest, ProviderError> {
+    if let Some(handle) = provider.start_worker_request(request.clone())? {
+        let abort_handle = handle.abort_handle();
+        let thread_request_id = request_id.clone();
+        thread::spawn(move || {
+            let result = handle.wait();
+            let _ = completion_tx.send(ProviderCompletion {
+                request_id: thread_request_id,
+                result,
+            });
+        });
+        return Ok(ProviderActiveRequest {
+            request_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            abort_handle: Some(abort_handle),
+        });
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let thread_cancelled = cancelled.clone();
+    let thread_request_id = request_id.clone();
+    thread::spawn(move || {
+        let stream_event_tx = event_tx.clone();
+        let result = send_provider_request_with_retry_and_stream(
+            provider.as_ref(),
+            request.as_provider_request(),
+            |retry| {
+                let _ = event_tx.send(ProviderEvent::Retry {
+                    request_id: thread_request_id.clone(),
+                    retry: retry.retry,
+                    max_retries: retry.max_retries,
+                    delay_ms: retry.delay.as_millis(),
+                    error: retry.error.to_string(),
+                });
+            },
+            |event| {
+                let _ = stream_event_tx.send(ProviderEvent::Stream {
+                    request_id: thread_request_id.clone(),
+                    event,
+                });
+            },
+        );
+        if !thread_cancelled.load(Ordering::SeqCst) {
+            let _ = completion_tx.send(ProviderCompletion {
+                request_id: thread_request_id,
+                result,
+            });
+        }
+    });
+
+    Ok(ProviderActiveRequest {
+        request_id,
+        cancelled,
+        abort_handle: None,
+    })
 }
 
 #[derive(Debug, Error)]

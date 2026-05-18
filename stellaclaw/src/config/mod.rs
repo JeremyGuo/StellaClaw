@@ -19,7 +19,8 @@ pub const CONFIG_VERSION_0_8: &str = "0.8";
 pub const CONFIG_VERSION_0_9: &str = "0.9";
 pub const CONFIG_VERSION_0_10: &str = "0.10";
 pub const CONFIG_VERSION_0_11: &str = "0.11";
-pub const LATEST_CONFIG_VERSION: &str = "0.12";
+pub const CONFIG_VERSION_0_12: &str = "0.12";
+pub const LATEST_CONFIG_VERSION: &str = "0.13";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
@@ -89,13 +90,6 @@ impl ModelSelection {
                 .map(|model| model.model_name.clone())
                 .unwrap_or_else(|| alias.clone()),
             Self::Inline(model) => model.model_name.clone(),
-        }
-    }
-
-    pub fn alias_name(&self) -> Option<&str> {
-        match self {
-            Self::Alias(alias) => Some(alias),
-            Self::Inline(_) => None,
         }
     }
 }
@@ -392,12 +386,6 @@ impl StellaclawConfig {
 
     pub fn resolve_named_model(&self, name: &str) -> Option<ModelConfig> {
         self.models.get(name).cloned()
-    }
-
-    pub fn is_available_agent_model(&self, name: &str) -> bool {
-        self.available_agent_models()
-            .iter()
-            .any(|(alias, _model)| alias.as_str() == name)
     }
 
     pub fn available_agent_models(&self) -> Vec<(&String, &ModelConfig)> {

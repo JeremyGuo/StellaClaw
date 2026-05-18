@@ -12,7 +12,7 @@ use crate::model_config::ModelConfig;
 
 use super::{
     ChatMessage, ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse,
-    ToolBatchError,
+    ToolBatchError, ToolResultItem,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +40,10 @@ impl Default for ToolRemoteMode {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInitial {
     pub session_id: String,
@@ -50,6 +54,8 @@ pub struct SessionInitial {
     pub compression_threshold_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_retain_recent_tokens: Option<u64>,
+    #[serde(default = "default_true")]
+    pub idle_timeout_compact_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_tool_model: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +86,7 @@ impl SessionInitial {
             tool_remote_mode: ToolRemoteMode::Selectable,
             compression_threshold_tokens: None,
             compression_retain_recent_tokens: None,
+            idle_timeout_compact_enabled: true,
             image_tool_model: None,
             pdf_tool_model: None,
             audio_tool_model: None,
@@ -189,6 +196,58 @@ pub enum SessionEvent {
     PlanUpdated {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan: Option<TaskPlanView>,
+    },
+    StreamAssistantMessageDelta {
+        message_id: String,
+        turn_id: String,
+        in_message_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_index: Option<usize>,
+    },
+    StreamToolCallDelta {
+        message_id: String,
+        turn_id: String,
+        in_message_index: u64,
+        item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        delta: String,
+    },
+    StreamReasoningSummaryDelta {
+        message_id: String,
+        turn_id: String,
+        in_message_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        summary_index: i64,
+        delta: String,
+    },
+    StreamReasoningSummaryPartAdded {
+        message_id: String,
+        turn_id: String,
+        in_message_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        summary_index: i64,
+    },
+    StreamError {
+        message_id: String,
+        turn_id: String,
+        in_message_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_index: Option<usize>,
+        error: String,
+        error_detail: SessionErrorDetail,
+    },
+    StreamToolResultDone {
+        turn_id: String,
+        batch_id: String,
+        tool_result: ToolResultItem,
     },
     TurnCompleted {
         message: ChatMessage,
@@ -510,9 +569,9 @@ mod tests {
         let request = ConversationBridgeRequest {
             request_id: "req_1".to_string(),
             tool_call_id: "call_1".to_string(),
-            tool_name: "user_tell".to_string(),
-            action: "user_tell".to_string(),
-            payload: serde_json::json!({"text": "working"}),
+            tool_name: "cron_tasks_list".to_string(),
+            action: "cron_tasks_list".to_string(),
+            payload: serde_json::json!({}),
         };
 
         let bridge_thread = thread::spawn(move || bridge.call_session_rpc(request));
@@ -535,10 +594,10 @@ mod tests {
             response: ConversationBridgeResponse {
                 request_id: "req_1".to_string(),
                 tool_call_id: "call_1".to_string(),
-                tool_name: "user_tell".to_string(),
+                tool_name: "cron_tasks_list".to_string(),
                 result: ToolResultItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
                     result: ToolResultContent::from_text("sent".to_string()),
                 },
             },

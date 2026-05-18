@@ -244,6 +244,13 @@ fn fnv1a_write(hash: &mut u64, bytes: &[u8]) {
 }
 
 impl ProviderBackend for OpenRouterResponsesProvider {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -258,6 +265,7 @@ fn build_responses_input(messages: &[ChatMessage], model_config: &ModelConfig) -
 
     for message in messages {
         match message.role {
+            ChatRole::Compaction => {}
             ChatRole::User => {
                 let content = user_responses_content(message);
                 if !content.is_empty() {
@@ -375,6 +383,7 @@ fn responses_value_to_chat_message(
     }
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
@@ -389,6 +398,14 @@ fn user_responses_content(message: &ChatMessage) -> Vec<Value> {
     for item in &message.data {
         match item {
             ChatMessageItem::Reasoning(_) | ChatMessageItem::ToolResult(_) => {}
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    content.push(json!({
+                        "type": "input_text",
+                        "text": text,
+                    }));
+                }
+            }
             ChatMessageItem::Context(context) => {
                 content.push(json!({
                     "type": "input_text",
@@ -427,6 +444,14 @@ fn assistant_responses_content(message: &ChatMessage) -> Vec<Value> {
                     "type": "output_text",
                     "text": context.text,
                 }));
+            }
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    content.push(json!({
+                        "type": "output_text",
+                        "text": text,
+                    }));
+                }
             }
             ChatMessageItem::SelectionReference(selection) => {
                 content.push(json!({
@@ -655,6 +680,7 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 5,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -689,8 +715,8 @@ mod tests {
                         {
                             "type": "function_call",
                             "call_id": "call_1",
-                            "name": "file_read",
-                            "arguments": "{\"path\":\"README.md\"}"
+                            "name": "shell_exec",
+                            "arguments": "{\"command\":\"cat README.md\"}"
                         }
                     ],
                     "usage": {
@@ -895,7 +921,7 @@ mod tests {
             ChatRole::User,
             vec![ChatMessageItem::ToolResult(ToolResultItem {
                 tool_call_id: "call_1".to_string(),
-                tool_name: "file_read".to_string(),
+                tool_name: "shell_exec".to_string(),
                 result: ToolResultContent::from_text("loaded".to_string()),
             })],
         )];

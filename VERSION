@@ -1,10 +1,180 @@
-version: 1.27.0
+version: 1.29.0
 ---
 
-# 1.27.0
+# 1.29.0
+
+- 重构 SessionActor context compaction 的 Provider 边界：
+  `ChatRole` 新增 `Compaction`，压缩结果不再伪装成普通 assistant 消息；`ChatMessageItem` 新增 `CompactionItem`，区分可跨 Provider 复用的 `generic_summary` 和 Provider 专用的 `provider_builtin` opaque payload。Provider trait 新增 compaction mode 和 builtin compact 入口，非 Codex provider 默认把通用 summary materialize 成 user context、过滤不匹配的 Provider 专用压缩块，避免把 Codex compact state 计入上下文或发送给不支持的模型。Codex subscription provider 新增 builtin `/responses/compact` 调用路径，按当前 Responses input 翻译、system instructions、工具 schema、reasoning、service tier 和 prompt cache key 构造 compact 请求，HTTP header 补齐 installation id，并把 user-agent 改为 `stellaclaw`；返回的 `compaction` / `context_compaction` item 会 materialize 为 `ChatRole::Compaction` + Codex `provider_builtin` compaction item。通用 summary compact 仍保留为 fallback，但移除 cybersecurity policy retry/reduction fallback。本次不改变 `config` schema，改变 `workdir` schema 至 `0.24`。
+
+- 新增 Conversation 级 idle timeout compact 覆盖开关：
+  `ModelConfig` 新增 `idle_timeout_compact_enabled` 作为每个模型的系统默认值，默认 `true`；Conversation runtime config 新增可选 `idle_timeout_compact_enabled`，`null` 表示继承当前模型默认值，`true` / `false` 表示覆盖。AgentSession 启动时会把最终生效值写入 `SessionInitial`，SessionActor 的 idle timeout compaction 会按该值决定是否运行；Web / Telegram 控制命令新增 `/idle_compact` / `/idle_timeout_compact`，支持 `on`、`off`、`default`，Web conversation summary 同步返回 override 和 effective 状态。本次改变 `config` schema 至 `0.13`，改变 `workdir` schema 至 `0.23`。
+
+- 修复 AgentSession bridge 工具控制路径潜在阻塞：
+  `AgentSessionService` 向 `agent_server` 投递普通 session request 时不再同步等待 JSON-RPC ack，而是通过专用 writer thread 发送 notification，避免 background agent / subagent 的 host coordination resolve、child session event、cancel 等事件在 service 主 `select!` 循环里被 30s request timeout 阻塞；AgentSessionService 转发 memory / skill / tool_binary / cron / kernel 请求时改用内部 service request id 做 pending correlation；`subagent_join` 的 cancel 路径在 cancel ack 后不再阻塞等待原 join response，未即时返回时直接生成 interrupted 工具结果；background agent / subagent 的生命周期仍由父 AgentSessionService 管理，父 session 在 child completed / failed / crashed 终态保存结果并向 child service 发送 shutdown，`subagent_kill` 对已终态 child 直接返回 failure 且不会重复 shutdown；background `terminate` 会先通知父 session 标记 killed，再关闭自身 runner；Kernel service runner 会在 service run 返回错误时投影 `ServiceOutput::Failed`，且 `StopService` 对不存在服务返回 `service_not_found`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 升级本地 `web_fetch` 工具：
+  响应体读取改为先按 `max_bytes` 硬上限截断，再做文本/HTML/二进制分类，避免大响应在 `max_chars` 截断前被完整读入内存；HTML auto 模式会提取 title、description、链接和更接近 Markdown 的可读正文，二进制响应默认返回 metadata 而不是乱码正文；结果新增 content length、redirect、截断原因、选定响应头和 bytes read 等结构化字段，同时保留旧的 `body` / `truncated` 字段。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补充 SessionActor 工具结果落盘链路诊断日志：
+  在工具 batch 完成到 durable `MessageAppended` 之间增加 `mark_loaded_skills`、`append_history_message`、session state persist 和 emit 的分段耗时日志；同时在 append 内部记录 system prompt 构造、would-compress 判断和 compression append 边界，便于定位工具结果已完成但前端仍停在工具执行中的卡点。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复最终 assistant 消息落盘后 live turn 未结束：
+  SessionActor 在无工具调用的最终 assistant 消息 durable append 后会先发出 `TurnCompleted`，再清理当前 plan；plan 清理或其持久化失败只记录 `clear_current_plan_after_turn_completed_failed`，不再阻断完成事件，避免 WebChannel snapshot 在重新进入 Session 时仍保留上一轮 `running_tool_results`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 core 测试环境隔离：
+  Codex subscription models / token refresh 相关单测会串行化修改全局认证环境变量，shell `~` workdir 单测会确保测试 HOME 目录存在，避免并发测试时临时 HOME 和 mock models URL 互相污染导致假失败。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.28.3
+
+- 修复 SessionActor 工具结果落盘被同步压缩阻塞：
+  `tool_result` / `tool_result_repair` 追加到 durable history 时不再在同一同步路径触发 context compression，避免工具已经完成但工具结果尚未 `MessageAppended` 时，压缩请求、memory context lookup 或 provider summary 阻塞整轮状态推进，表现为前端一直停在某个工具执行中。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron final 消息图片附件渲染：
+  Durable `FileItem` 中的 `file://` / 本地路径图片不再直接作为 `<img src>` 使用；Electron 会按当前 Conversation workspace root 映射成 workspace 相对路径，通过现有 workspace file API 拉取图片内容并缓存为 data URL 后展示，避免历史 final assistant 消息里的图片附件显示为破图。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron 右键菜单重命名入口：
+  Conversation 重命名改为应用内 Dialog，不再依赖右键菜单选中事件里触发原生 `window.prompt`，避免 ContextMenu 关闭 / 焦点恢复和浏览器用户激活策略导致点击“重命名 Conversation”没有任何输入框；Session 右键菜单中的 prompt / confirm 类操作也会在菜单关闭后的下一轮事件循环触发。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron 用户消息重复和附件源 Conversation 解析：
+  `chat.user_message_queued` / `chat.user_message_started` 不再把同一条用户消息再次插入消息列表，只更新本地 pending / queued 状态，落盘后的 durable 用户消息会替换临时消息；消息合并逻辑会按 durable index、client message id 和临时状态清理用户消息回声，避免发送后出现两份或多份用户气泡。chat snapshot 里的 provisional assistant message 和后续 stream delta 会按 turn id / message id 合并到同一条流式消息，避免切换 / 重连后同一段 assistant 文本临时显示两份。历史 final 消息附件若携带跨 Conversation 的绝对 `file://` 路径，预览、打开和下载都会解析路径中的源 Conversation id 再调用 workspace file API，避免使用当前 Conversation id 访问不存在的文件。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 StellaCodeX Electron 发送和流式回复显示：
+  用户消息刚发送时会保留 pending/queued 可见状态和轻量高光，等待响应状态不再被隐藏；assistant streaming 文本和工具 round 中间文本会在前端按当前 delta 缓冲做平滑打字机显示，后端仍按原始 `chat.stream_assistant_message_delta` 逐事件转发，不改变 stream 协议。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.28.2
+
+- 适配 StellaCodeX Electron 到新的 WebChannel 协议：
+  Conversation / foreground session 初始化改为通过 `home.snapshot` websocket 获取，不再依赖已删除的 conversation list、foreground session list 和 status REST 读接口；前端会归一化 `conversation_name`、`session_name`、`last_committed_message_*` 和 foreground session state 字段，并处理 `home.foreground_session_*` 增量事件。Chat websocket 新增处理 `chat.user_message_started` / `chat.user_message_committed`，stream tool result 会优先合并回当前 provisional assistant 消息，避免工具结果单独渲染成空消息。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.28.1
+
+- 删除 Web debug 读接口和旧 StatusService 链路：
+  移除 `/api/debug/conversations`、`/api/debug/conversations/{conversation_id}/foreground_sessions` 和 `/api/debug/conversations/{conversation_id}/status`，Web 读取初始化只保留 home / chat websocket snapshot 与 message history/detail REST 边界；同时删除 `ChannelIngress::Status` / `StatusSnapshot`、StatusService 和 status service protocol，不再保留旧兼容壳。新增 workdir `0.21 -> 0.22` upgrade，从旧 service manifest 中移除 status service entry 和 `local__status` 存储目录。本次不改变 `config` schema，改变 `workdir` schema 至 `0.22`。
+
+# 1.28.0
+
+- 新增 Web stream 协议重写骨架和工具结果流式事件：
+  WebChannel 目录拆分为 `channels/web/{channel,main,protocol,history,ids,control}.rs`，删除旧单文件实现并以新的 HTTP/WebSocket channel 入口承接 conversation list、message append、session stream 和 conversation stream；旧 `.stellaclaw/channels/<channel>/web_state.json` 已读状态迁移到 `.stellaclaw/web/<channel>/seen_state.json`。WebChannel 连接订阅、home 序号、chat live state、seen state 和 processing state 改由串行 `WebChannelMain` actor 统一维护，chat stream 对外投影为扁平的 `chat.*` typed events，不再向前端暴露嵌套 `event` payload；临时 `TODO_NewWeb.md` 和未接入的 Web state 草稿模块已删除，避免协议文档与实现继续分叉。Provider message 内的 stream assistant/tool-call/reasoning/error 事件现在从 SessionActor 起携带单调 `in_message_index`，Web 投影同时带 `next_message_id`，前端可以按 message id + index 检查连续性；`chat.message_appended` 明确带 `committed: true`，作为 durable timeline 边界。Web message history paging / detail REST 入口不再由 WebChannel 直接读取 `all_messages.jsonl`，改为通过 `ChannelIngress::QueryMessageHistory` / `QueryMessageDetail` 转给 ChannelService，再向对应 AgentSessionService 查询当前 foreground session 的持久化历史；home / chat snapshot 和 conversation / foreground session summary 的 message count / last committed message 也改为同一路径查询 SessionService，不再由 WebChannel 直接读取消息日志。同时新增 home / chat / terminal websocket snapshot、30s heartbeat 和 live foreground session projection 的 typed protocol/state 基础；core `LocalToolBatchExecutor` 在每个独立工具完成时发送 `ToolBatchProgress`，`SessionActor` 会先投影 `StreamToolResultDone` live 事件，再等待完整 tool batch 落盘为 durable `MessageAppended`，该事件已贯通到 AgentSession / Channel stream，并补充顺序单测。本次不改变 `config` schema，改变 `workdir` schema 至 `0.21`。
+
+- 清理旧 Channel 层状态 / 进度事件死代码：
+  删除不再由新 `conversation_new` service-tree 生产的旧 `ChannelEvent::ProgressFeedback`、`ConversationUpdated` 和 `Status` 事件，以及对应的 Web / Telegram 进度消息缓存、状态文本渲染和旧 token usage 汇总结构；Web 状态查询继续走 `ChannelIngress::QueryForegroundStatus` / StatusService，前台实时渲染继续走 session stream typed events，避免旧兼容分支和新消息 API 并存。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 清理旧 Channel delivery 壳和冗余 warning：
+  删除旧 `OutgoingDelivery` / `OutgoingAttachment` 输出结构、通用 `Channel::send_delivery` trait 方法和已无生产方的 `DeleteConversation` ingress variant；Telegram 改为直接从 durable `message_appended` 渲染 assistant 消息，Web 继续按 typed message / session / home events 投影。同时删除旧 delivery 清理后暴露出的 dead code warning，包括未使用的 caption 常量、`OutgoingOptions.prompt`、`is_available_agent_model`、`ConversationIdManager::remove_mapping` 和 `WorkdirLayout::runtime_shared_root`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收口 Web stream / home 事件协议：
+  WebChannel 的 home / chat snapshot、conversation/session mutation、message append、stream error 和 session stream 投影开始统一通过 `channels/web/protocol.rs` 的固定 builder 生成，避免事件名和字段形态散落在多个 `json!` 调用中；foreground session 创建、重命名、删除分别投影为 `home.foreground_session_upserted`、`home.foreground_session_updated` 和 `home.foreground_session_deleted`，不再用整包 conversation upsert 伪装 session mutation。WebChannelMain 会按 `message_id + in_message_index` 校验 stream 连续性，发现缺口时立即撤销当前 provisional message 并发送 `chat.stream_error`；最终 durable assistant message 到达时会对比已累积的 stream 文本 / tool call 参数 / reasoning summary，不一致时先报告 `stream_commit_mismatch`，再让 durable `chat.message_appended` 替换页面内容。SessionActor 对新用户消息抢占 active provider stream 增加 200ms 活跃保护，最近仍有 provider stream delta 到达时不会立刻 abort，只有超过 grace window 后才用 `superseded_by_user_message` 取消。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛 Web 读取接口到 websocket snapshot：
+  Conversation list、foreground session list 和 conversation status snapshot 不再保留在正式 REST 路径；首页和 session 列表初始化应通过 `GET /api/ws/home` 的 `home.snapshot`，后续通过 `home.*` 增量事件更新。为了调试保留只读入口，但统一移动到 `/api/debug/conversations`、`/api/debug/conversations/{conversation_id}/foreground_sessions` 和 `/api/debug/conversations/{conversation_id}/status`；create / rename / delete 等 mutation REST 继续保留。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛用户消息生命周期和旧 delivery/progress 投影：
+  ChannelService 收到平台输入后会先发 `UserMessageQueued`，AgentSessionService 在开始处理用户消息和用户消息落盘后分别投影 `UserMessageStarted` / `UserMessageCommitted`，Web chat stream 对应新增 `chat.user_message_queued`、`chat.user_message_started` 和 `chat.user_message_committed` typed events；同时删除旧 Channel `Deliver` request / `Delivery` event、`chat.delivery` 投影和 AgentSession 层 `Progress` 事件，计划更新只走 `PlanUpdated`，普通进度文本不再伪装成协议消息。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛 Web metadata / runtime config 查询边界：
+  Kernel 协议新增只读 `QueryRuntimeConfig`，ChannelService 新增对应 `ChannelIngress::QueryRuntimeConfig` 和 typed `KernelRuntimeConfig` event；WebChannel 的 conversation list、conversation rename、foreground session list/create/rename/delete、message append summary 和 status summary 不再直接读取或修改 conversation metadata / runtime config 文件，而是通过 `WebChannel -> ChannelService -> Kernel` 查询或更新。新建 conversation 的初始 metadata 写入和删除 conversation 的目录移除仍保留在 Host/Web REST 生命周期边界。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐 home websocket 的 metadata / runtime config 动态事件：
+  通用 ChannelEvent 新增 Web 专用 home event 投影；Kernel metadata 更新会投影为 `home.conversation_updated`，携带 conversation name、foreground session id、model selection pending 和 session nickname patch；runtime config 更新会同步投影为 `home.conversation_updated`，携带 model、reasoning、sandbox、remote 和精简 runtime_config patch，避免前端必须靠 REST 回读才能看到模型 / 推理强度 / remote / sandbox 变化。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 FixedSSH workspace remote helper 启动：
+  WorkspaceService 不再把整段 Python helper 作为裸 `ssh host python3 -c <script>` 参数发送给远端 shell；现在会把 helper 脚本 base64 编码后作为 shell-safe 参数传给远端 `python3 -c` loader，JSON request 仍通过 stdin 传输，避免 zsh 等远端登录 shell 把 Python 函数体当 shell 语法解析并报 `parse error near ')'`。远端 listing 也改为用 `lstat` 和 symlink 优先识别，避免断开的远端 symlink 让 workspace list 失败。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Web workspace / file API 的 WorkspaceResponse 分发：
+  ChannelService 发起 WorkspaceService 请求时会把平台 workspace request id 写入 `ServiceCall.request_id`，WorkspaceService 回包后通过 `response_id` 找回对应 pending 请求，不再依赖 FIFO；同时 workspace response 会优先按 `response_id` / workspace 来源走 workspace decoder，避免 `listing` / `file` 响应被当作普通 Channel payload 报 `bad_channel_payload`。`WorkspaceEntry.modified_ms` / file `modified_ms` 从 `u128` 收敛为 JSON 可稳定反序列化的 `u64` 毫秒时间戳，修复线上 workspace listing decode 失败。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Web workspace / file API 在 Channel 重启后的响应订阅：
+  WebChannel 发起 workspace list/read/write/upload/download 请求时仍按 `WebChannel -> ChannelService -> WorkspaceService` 路径走，但现在由 HostRuntime 在发送 Channel ingress 的同时建立事件订阅；如果发现 main Channel ingress 已关闭，会重启 conversation、重新订阅新 Channel 的事件后再重试请求，避免请求已经发到新 Channel、HTTP 却仍等待旧订阅而超时。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 AgentSession bridge 响应分发串服务：
+  `ServiceCall` 新增可选 `request_id` / `response_id` correlation 字段；AgentSessionService 发起 memory / skill / tool_binary / cron / kernel bridge 子请求时写入 `request_id` 并记录 pending 请求类型，各服务回复时回填 `response_id`，AgentSessionService 再按 `response_id` 找回原始 pending 请求和协议类型，避免 `{"type":"accepted"}` 这类通用响应被 memory response 误吞，导致 `cron_task_create` 已创建任务但前台 turn 永久卡在 open tool call。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐 Web / StellaCodeX 多 foreground session 会话支持：
+  `ChannelIngress` 的前台消息、状态查询、cancel / continue / compact、host coordination resolve 和删除前台 session 等操作都带上可选 `foreground_session_id`，Web API 新增按 Conversation 管理、列出、创建、重命名、删除 foreground session 以及按 session 拉取消息 / 建立 websocket 的接口；Web seen 状态改为按 foreground session 记录，conversation stream 会返回每个 foreground session 的摘要。StellaCodeX Electron 的 Conversation Bar 改成文件夹 + 子对话结构，发送消息、实时 websocket、消息分页、已读和标题状态都按选中的 foreground session 走，保留 workspace / terminal 的 Conversation 级共享语义。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛 WebChannel 的 Conversation metadata 读取边界：
+  WebChannel 列表、按 platform chat 查找和 `load_web_state` 不再直接读取 `ConversationMetadataStore` 中的 JSON 内容，而是通过 `ChannelIngress::QueryKernelMetadata` 交给 ChannelService 向 Kernel 查询当前 `ConversationMetadata`；磁盘 store 只保留为创建 / 删除和已知 conversation id 的持久化边界。ConversationKernel 挂载任意 AgentSession 时会补齐 `session_nicknames` 默认值，确保每个 session 的名字由 Kernel metadata 维护。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron 多 Session 侧栏交互：
+  Session 行右键菜单改为 Session 级操作，支持重命名 Session，文件夹行右键菜单保留 Conversation 级重命名 / 隐藏 / 删除；Conversation 文件夹展开状态改为只由显式点击切换控制，避免选中项或少量子会话强制展开导致折叠失效；新建 Session 入口移到文件夹行右侧，并仅在悬浮 / 聚焦时显示，同时移除文件夹行上的 session 数字。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Web Conversation ingress stale sender：
+  当某个 ConversationKernel 或 ChannelService 已经退出但 HostRuntime 仍保留该 conversation 的 main channel ingress sender 时，Web / Electron 再次发送消息会收到 `channel ingress is closed`；HostRuntime 现在会在发送发现 ingress 关闭时记录 warning、移除旧 kernel、重新启动该 conversation 并重试一次请求，避免用户必须重启整个 stellaclaw 服务。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐 workdir 级错误和警告日志：
+  Host logger 现在除继续写 `.stellaclaw/host.log` 外，会把 `warn` 和 `error` 级别日志分别镜像到 `<workdir>/logs/warn.log` 和 `<workdir>/logs/error.log`；ConversationKernel 主循环遇到会导致 kernel 退出的 fatal output / dispatch 错误时，会在返回前写入 `conversation_kernel_failed` 到 `<workdir>/logs/error.log`，包含 conversation id 和完整错误，避免后台线程失败原因丢失。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 ChannelService bad payload 杀死 kernel：
+  ChannelService 收到无法识别的 inbox payload 时不再发 `ServiceOutput::Failed` 并导致 ConversationKernel 退出，而是投影 `channel.bad_payload` 错误事件和 `bad_channel_payload` 状态，记录来源 service 与原始 payload，保证错误 payload 不会中断当前 conversation 的消息流 / websocket 事件链路。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 升级 Codex reasoning summary 持久化和 provider stream 事件：
+  `ReasoningItem.codex_summary` 从单个字符串升级为有序 summary part 数组，保留 Codex reasoning summary 的分段顺序，并新增 workdir `0.19 -> 0.20` upgrade 迁移旧 session history；`ChatMessage` 新增稳定 `message_id`，SessionActor 写入 `all_messages.jsonl` 时同步生成 `messages_index.json`，WebChannel 的消息详情、summary 和 seen 合并开始基于 `message_id` / index 文件定位消息，不再把裸数字行号当作消息 ID；provider stream delta 不再写入历史，最终仍以 completed / done 后生成的完整 `ChatMessage` 为准，同时 core SessionEvent / conversation_new AgentSessionEvent 新增 `Stream*` 流式事件用于 assistant 文本、工具调用参数、reasoning summary delta、reasoning summary part added 和带 `message_id` 的 stream error 实时投影。本次不改变 `config` schema，改变 `workdir` schema 至 `0.20`。
+
+- 新增 provider native system prompt 查询接口：
+  Provider / ProviderSession 可以基于 `ModelConfig` 返回 provider 原生 system prompt；SessionActor 构造 system prompt 时会优先把 provider 原生 prompt 作为 common section，只有 provider 没有返回 prompt 时才使用 StellaClaw 默认 `common_prompt()`，后续工具协议、session kind、remote/runtime metadata 和 tool efficiency sections 仍会继续追加。Codex subscription 会在缺少内存/磁盘缓存时请求 Codex `/models` endpoint，读取匹配模型的 `model_messages.instructions_template`，并把完整 models payload 缓存到 `.stellaclaw/codex/models.json`，后续会优先复用进程内缓存和磁盘缓存；如果需要在线请求且请求失败，则直接返回 provider error。本次不改变 `config` schema，workdir schema 仍为 `0.20`。
+
+- 注入 Codex Pragmatic personality：
+  Codex subscription provider 在渲染 `/models` 返回的 `model_messages.instructions_template` 时会替换 `{{ personality }}`，优先使用同一 payload 中的 `personality_pragmatic`，缺失时使用 Codex Pragmatic personality 文本兜底，避免 provider 原生 prompt 缺少 Codex 风格协作约束。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛工具 prompt 协议：
+  删除按 enabled tools 动态注入的 `PromptProtocol` 系统；`file.discovery`、`file.editing`、`host.update_plan`、`process.shell` 和 `host.memory` 的稳定指导进入 common system prompt，单工具依赖的 `shell_make_visible`、`attachment_make_visible` 和 `subagent_start` 指导合并进各自工具 description。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛 Fixed SSH 远端 workspace 指令快照：
+  Fixed SSH 模式启动时读取到的远端 workspace `AGENTS.md` 不再作为 `SessionInitial.remote_workspace_instructions` 直接拼进 system prompt，而是进入 `RuntimeMetadataState` 的 `remote_workspace` prompt component，并由 `[Remote Workspace Snapshot]` 渲染；压缩后会和 identity、user metadata、memory、skills、remote aliases 一样作为 canonical snapshot 保留。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛工具效率提示词：
+  原本独立追加在 session kind / runtime snapshot 后面的 `Tool Efficiency Prompt` 合并进 common system prompt，system prompt 构造链路不再有独立工具效率 section。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整工具 batch 中断语义：
+  `LocalToolBatchExecutor` 不再由 batch worker 轮询共享 cancel token 后放弃等待 operation 线程，而是由 SessionActor 通过 batch interrupt channel 通知 worker，worker 再向当前运行的 operation fan-out 独立 interrupt channel；已收集的工具结果会保留，正在运行的工具需要返回 normal / interrupted / partial result，尚未启动的工具由 worker 合成 interrupted result，并且中断后不再启动后续工具。`subagent_join` 被中断时不再由 AgentSessionService 偷看用户消息或 CancelTurn 清理 pending join，而是由 core 发送显式 `subagent_join_cancel` bridge request，service 收到后 resolve 原始 join 为 interrupted；普通 ConversationBridge 工具在没有专用 cancel 协议时仍会快速返回结构化 interrupted 结果，避免前台 turn 被 host coordination 阻塞。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 改造 shell 工具输出等待为事件驱动：
+  `shell_exec` / `shell_write_stdin` 的输出收集不再使用固定 sleep 轮询；ShellSession 现在通过 bounded wake channel 在 reader 写入输出、waiter 标记退出时唤醒 collector，collector 在输出事件、工具中断和 yield deadline 之间 select，并在进程退出后保留短暂 trailing output grace window。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 引入 BaseTool / ExtTool / ProviderNativeTool 工具注册抽象：
+  ToolCatalog 开始保存 enabled tool entry，新增 `BaseTool`、`ExtTool`、`ProviderNativeTool` 和 `ToolSet` 抽象；默认 `BuiltinToolSet` 兼容现有工具定义路径，Provider / ProviderSession 可以可选返回自己的 ToolSet 来替换默认工具注册。LocalToolBatchExecutor 现在持有 enabled ToolCatalog，operator 可以通过 `RegisteredTool` 直接调用 enabled Base/Ext tool 的 `call(ctx,args)`；普通本地 BaseTool 和 Provider ExtTool 已接入这条执行路径，ExtTool 可以在转换 provider-specific schema 后复用 `BuiltinBaseTool::call_local`，并会继承其 `base_tool_id()` 对应 base tool 的启用条件；Codex subscription 已用 provider ToolSet 显式注册自身可见工具集合，把 shell 暴露为 Codex 风格的 `exec_command` / `write_stdin` facade，把 `apply_patch` 暴露为更接近 Codex freeform patch 语义的简化 schema，执行时默认补 `format=freeform` 后复用 base `apply_patch`，同时保留当前 session 启用的 host、memory、cron、skill、media、web 和 Fixed SSH visibility 工具；`update_plan` 不再由 core SessionActor immediate 特判维护 plan，而是作为 ConversationBridge 工具交给 AgentSessionService 更新内存态 `current_plan` 并投影 `PlanUpdated` 事件，plan 不写入 service state；`skill_load`、`web_search`、provider-backed、其它 bridge 和 provider-native 工具仍保留各自需要 actor/provider/service 上下文的专用路径。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 继续收敛 Codex subscription 工具 facade：
+  Codex provider ToolSet 不再直接暴露底层 `shell_stop` 和 `shell_make_visible`，改为暴露 `exec_stop` 和 Fixed SSH 下的 `exec_make_visible`，参数命名与 `exec_command` / `write_stdin` 的 `session_id` 语义保持一致，内部仍复用对应 base tool。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 `web_fetch` 工具：
+  `web_fetch` 现在只要求 `url` 参数，`timeout_seconds`、`max_chars`、`method` 和 `format` 都有默认值；工具会校验 HTTP/HTTPS URL，默认设置 User-Agent，支持 GET/HEAD、raw/text/auto 格式，并在 auto 模式下把 HTML 去除 script/style/noscript 后转成可读文本。返回结果新增 `kind`、`ok`、`body_format`、`max_chars` 等结构化字段。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 重命名原生媒体查看工具：
+  模型可见的 `image_load`、`pdf_load`、`audio_load` 分别改名为 `image_view`、`pdf_view`、`audio_view`，使工具名更贴近其“把媒体放入下一次模型请求供检查”的语义；README、核心文档和相关测试同步更新。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 新增 `conversation_new` service-state workdir 升级：
+  新增 workdir `0.18 -> 0.19` upgrade，把旧 `conversations/<id>/conversation.json` 中的 conversation 运行配置、foreground session 轻量状态和 managed agent 记录拆到 workdir 级 `services/<conversation_id>/` 下的 `manifest.json`、`runtime_config.json` 和 `local__agent__foreground__main/service_state.json`；旧 foreground SessionActor 日志目录会迁移到新 foreground service session id，避免历史消息丢失；旧全局 `.stellaclaw/cron_tasks.json` 会按 conversation 拆到各自 `local__cron/tasks.json`，并把任务归属映射到默认 foreground/channel。legacy script cron task 暂时迁移为 disabled prompt task 并保留错误说明，避免在新 CronService 尚未支持 script 模式时静默运行不等价逻辑。本次不改变 `config` schema，改变 `workdir` schema 至 `0.19`。
+
+- 新增实验性 `conversation_new` service-tree 骨架：
+  新实现先不接入现有运行链路，新增 `ConversationKernel`、具体 `ServiceAddr` 动态路由表、线程式 `ConversationService` 生命周期、保留 `kernel` 目标、固定 `channel` 服务边界，以及 `service_protos/*` typed payload，作为后续重写 conversation / service 的工作基础；骨架同时记录 `services/<conversation_id>/manifest.json`，支持按 manifest 恢复已挂载的 skeleton service，并为 `cron`、`memory`、`skill`、`tool_binary`、`workspace`、`status` 建立独立 service/proto 文件和标准挂载入口，`control` proto/service 骨架暂保留但不再作为标准服务挂载；Kernel 现在也有正式主循环，可在线程内同时接收 shutdown 输入和各 service 的 `ServiceOutput`；`ChannelService` 自己拥有平台 ingress receiver，并负责把平台输入转换成 service call，`ChannelIngress` 现在只接受 normalized `ChatMessage` 用户内容，并覆盖 foreground context/status、foreground 创建/删除、cancel/continue/compact、host coordination resolve、conversation-wide runtime config update 和 workspace 请求，同时可向自身拥有的平台 adapter 队列输出 typed `ChannelEvent`，避免 Web/Telegram 反向解析 generic status；前台 AgentSession 地址改为 `agent/foreground/<id>`，默认 `main`，同一个 conversation 可以挂载多个 foreground session，Channel 地址也改为 `channel/<id>` 并与同 id foreground 一对一绑定，`channel/<id>` 会拒绝来自其它 foreground id 的 session event；AgentSession 输出路由改为 Kernel 创建时写入的显式 binding metadata，binding 收敛为单一 `event_sink` 和可选 `parent_addr`，foreground sink 指向同 id channel，Cron-owned background sink 指向 cron，subagent 继承父 session sink；`AgentSessionService` 协议补齐 enqueue message、cancel/continue/compact、host coordination resolve、context query、status、shutdown 和 session event，并开始把轻量 service lifecycle/context state 持久化到自身 storage 的 `service_state.json`，完整 session history 仍由 core SessionActor 自己持久化；`AgentSessionService` 也新增 service protocol 到 core `SessionRequest` / `SessionEvent` 的转换边界，Kernel 负责持有 AgentSession 启动所需的运行配置视图并在 mount 时注入快照（conversation root、agent server path、session profile、models、session defaults、memory、remote mode、sandbox、reasoning effort），`workspace_root` 只作为 core launch 参数由 Kernel 根据 conversation root 和 remote mode 派生，不作为独立运行配置字段，也不额外引入独立 `session_root` 概念；当 launch config 具备 agent server path 和 chat-capable model 时，`AgentSessionService` 会启动真实 `agent_server`、初始化 core `SessionActor`，把 service request 转成 core `SessionRequest` 并把 core `SessionEvent` 投影回 binding 的 event sink；未提供 agent server path 时仍保留 skeleton runner 方便新协议单测；`ChannelService` 协议收敛为 delivery、session event projection、status/error、foreground context query 转发、runtime config update ingress 和 workspace ingress；Kernel 新增单一 `UpdateRuntimeConfig` 请求，负责修改并持久化 conversation-wide runtime config 到 `services/<conversation_id>/runtime_config.json`，模型/profile、reasoning、remote mode、sandbox、memory 等影响后续 AgentSession 创建的配置不再经过独立 ControlService；WorkspaceService 由 Kernel 创建时注入 runtime config snapshot，并在 runtime config 更新时和 AgentSession 一起接收广播，并新增 OverlayFS 风格的 workspace list/read/write/delete/move 协议，Selectable 下 `auto` 访问本地 conversation workspace，FixedSSH 下 `auto` 会把 `.stellaclaw/**` 路由到本地 overlay、其它路径路由到 remote workspace，跨边界 move 会被拒绝；ChannelService 现在会把平台 workspace 请求转发给 WorkspaceService，并把 typed workspace response 投影为 `ChannelEvent::Workspace`；带 `data:` FileItem 的 incoming message 会先交给 WorkspaceService 落盘到 `.stellaclaw/attachments/incoming` 并转换成稳定 `file://` 后再投递给 foreground AgentSession；MemoryService 不再是 skeleton，新增 typed search/write/update/delete/prompt-context/maintain 协议，并复用现有 Memory v1 backend 和 workdir memory manager，conversation scope 继续写 `.stellaclaw/memory_v1/conversation`，user/public scope 继续写 `rundir/memory_v1/{user,public}`；AgentSession 会拦截 core `memory_search` / `memory_write` / `memory_update` / `memory_delete` host bridge request，转发给 MemoryService，并把响应转换回 core `ConversationBridgeResponse`，保持旧 memory tool JSON result 形态；SkillService 不再是 skeleton，启动时会把现有 `rundir/.stellaclaw/skill` runtime skill store 同步到当前 conversation workspace 的 `.stellaclaw/skill`，并提供 typed reconcile、create/update/delete persist、list 和 load 协议；AgentSession 会拦截 core `skill_create` / `skill_update` / `skill_delete` host bridge request，转发给 SkillService，并保持旧 skill tool JSON result 形态；`CronService` 注册任务时记录 `registered_by`、`channel_addr`、可选 foreground session、schedule 和 payload，避免多 foreground 下丢失任务归属，并会在持久化前拒绝空 `task_id`、非法 interval、foreground/channel id 不一致等无效注册；手动触发 cron 的协议命名为 `TriggerTaskNow`，触发后 CronService 会请求 Kernel 创建带 binding 的 background AgentSession，并以 system-origin 消息投递 task payload，同一 task 已有 pending 或 active background run 时会拒绝手动触发，interval 到点则跳过该次触发；CronService 自己也开始维护 schedule timer，当前支持 typed `CronSchedule::Manual` 和 `CronSchedule::IntervalSeconds` 两种注册；Cron-owned background session 会把 session event 回传给 CronService，Cron 记录 run completed / failed、last error 和 consecutive failure count，Kernel 拒绝 background AgentSession 创建时也会把对应 pending run 标记为 failed，并把成功结果按 `forward_result_to_foreground` 输出策略包装成 user-role actor message 投递给对应 foreground session，`store_only` 策略则只记录结果不转发；Cron task prompt payload 也从裸 JSON 收敛为 typed `CronTaskPayload`；CronService 现在把 task registry/status 持久化到自身 storage 的 `tasks.json`，并新增 `GetTaskStatus` 协议返回 active run、next due、last result/error 和 failure count。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 移除单轮 model/tool loop 步数上限：
   `SessionActor` 不再用固定 200 步限制截断同一个 turn 的模型/工具循环，长链路任务会继续运行直到模型自然完成、外部取消、provider/tool/context 等真实错误发生，避免达到内部兜底上限后需要 `/continue` 手动续跑。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐实验性 `conversation_new` ToolBinaryService：
+  新 ToolBinaryService 提供 typed ensure 协议并复用现有全局 ToolBinaryManager；AgentSession 会拦截 core `tool_binary_ensure` host bridge request，转发给 ToolBinaryService，并保持 core `ToolBinaryEnsureResponse` JSON 结果形态。ToolBinaryService 不订阅 runtime sandbox update，managed tool 目录视为稳定挂载边界。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐实验性 `conversation_new` subagent bridge：
+  AgentSessionService 现在拦截 core `subagent_start` / `subagent_kill` / `subagent_join` host bridge request；`subagent_start` 通过 Kernel 动态创建 Subagent AgentSession，并把子 session event sink 指回父 AgentSession，由父 AgentSession 维护子任务状态、投递初始任务消息并按旧 subagent tool JSON 形态返回 start/join/kill 结果；pending subagent join 会在新用户消息或显式 cancel 到达父 AgentSession 时解析为 interrupted，避免前台交互被过期 join 卡住。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐实验性 `conversation_new` background_agent_start bridge：
+  AgentSessionService 现在拦截 core `background_agent_start` host bridge request，通过 Kernel 动态创建 parent-bound Background AgentSession，并把初始 task 投递给 background；background 成功完成后，父 AgentSession 会把结果发给对应 channel，并作为 actor message 重新注入父 session context。Cron-owned background 仍保持 event sink 指向 CronService 的独立路径。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 强化实验性 `conversation_new` AgentSession 查询状态：
+  AgentSessionService 现在在内存中维护当前 task plan，`QueryStatus` 返回的 `AgentSessionStatus` 会带上 `current_plan`；turn completed、turn failed 和 runtime crashed 等终态事件会清空当前 plan。该状态不写入 `service_state.json`，避免把运行中 UI 状态持久化为恢复状态。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐实验性 `conversation_new` cron 和 managed agent host bridge：
+  AgentSessionService 现在拦截 `cron_tasks_list` / `cron_task_get` / `cron_task_create` / `cron_task_update` / `cron_task_remove`，并以当前 AgentSession 地址作为 owner 边界转发给 CronService；CronService 新增 owner-scoped list/get/update/remove、enabled/name/description/schedule/payload patch、持久化 cron expression payload，以及 `DisableTasksForOwner`，确保每个 session 只能看到和修改自己创建的任务；Kernel 删除 AgentSession 时会先通知 CronService 禁用该 session 创建的 cron 任务。AgentSessionService 同时新增 `background_agents_list`，从自身维护的 parent-bound background/subagent 状态返回当前任务、状态、最近消息和错误。core host tool catalog 删除 `user_tell` 和冗余的单 agent 详情工具，system prompt 改为让工具调用前的 preamble / progress 消息承担面向用户的工作中回复；core 测试里也移除旧的 `snapshot_save` bridge 工具占位。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛实验性 `conversation_new` CronService 调度语义：
+  CronService 不再把每个 task 的 `next_due` 当作运行队列状态维护；服务每轮根据当前时间扫描 enabled task，动态计算最近未来 wakeup。Interval task 从服务启动、注册、更新或上次触发时的内存 anchor 往后计算，持久化恢复后从当前时间重新开始，不补跑停机期间错过的 interval；cron-expression task 复用现有 `cron` + `chrono-tz` 依赖按 `expression` 和 `timezone` 计算下一次未来墙钟时间，重启后同样只调度未来触发点，不执行错过的 cron。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐实验性 `conversation_new` TerminalService：
+  新 TerminalService 提供 list/get/create/terminate/input/resize/replay/attach/detach typed 协议，复用现有 PTY terminal manager，并接收 Kernel runtime config 广播以在 Selectable / FixedSSH 模式变化时清理不匹配的 terminal；attach 后的 PTY 输出会作为 typed terminal output response 推回调用方，ChannelService 也新增 terminal ingress 转发和 typed terminal event 投影，后续 WebChannel 可以直接把 HTTP/WebSocket terminal 操作投影到 channel service 请求，不再持有 terminal manager。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整实验性 `conversation_new` host 启动模式：
+  新增 ConversationHostRuntime，服务启动时先启动全局 ToolBinary manager，再枚举已有 conversation 并 eager restore/spawn 对应 ConversationKernel；标准 bootstrap 现在包含默认 `agent/foreground/main`，确保 ChannelService、CronService 和 foreground AgentSession 都在 Channel ingress 开始前拥有 live runtime owner，避免按消息懒加载导致 cron 或 session 生命周期缺席。HostRuntime 现在也保存每个 conversation 的 `channel/main` ingress sender 和 typed event receiver；WebChannel 新增 session-scoped `POST /conversations/{id}/foreground_sessions/main/messages` 入口，直接把 normalized `ChatMessage` 投递给 ChannelService，并把 ChannelService typed events 桥接回 Web websocket subscriber。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 新增 `stellaclaw setup <config> <workdir> [--systemd [--user]]` 配置向导：
   向导按模型、Tooling、Memory System、Channel、确认创建五个阶段生成当前 `config` schema 的配置文件，并在 TTY 中使用轻量 ANSI 颜色区分阶段、菜单、提示、警告和成功状态；非终端、`NO_COLOR` 或 `TERM=dumb` 时自动退回纯文本。向导会在开始时检查 config 目录、workdir 和可选 systemd unit 目录权限，避免最后保存时才失败；`--dry-run` 会完整跑向导并打印 config / systemd 预览，但不写文件、不创建 workdir、不安装服务。模型阶段支持添加多个 chat model，并按 provider 只暴露对应参数；Codex subscription 会复用 Codex auth.json / `CHATGPT_ACCESS_TOKEN` 约定，并可辅助运行 `codex login --device-auth`。Tooling 阶段解释并支持 `alias:self` 工具模型目标，Brave Search 和 OpenAI image helper 会生成独立工具模型；compression 配置在向导中标为高级 override，默认显示按当前默认模型 context window 90% 计算的压缩阈值和 10% retain 预算，但不写入固定 override。Memory System 阶段说明长期记忆用途，并提示 dedupe / user compaction 应优先选择便宜可靠的 chat 模型，也允许保持本地 fallback。Channel 阶段支持 Web / Telegram 多实例。`--systemd --user` 会写入 user service 并 enable/start，`--systemd` 会写入 system service。本次不改变 `config` schema，不改变 `workdir` schema。

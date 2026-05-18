@@ -1,10 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -13,24 +13,19 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use stellaclaw_core::session_actor::{FileItem, FileState};
+use stellaclaw_core::session_actor::{
+    ChatMessage, ChatMessageItem, ChatRole, FileItem, FileState, ToolCallItem,
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{
-    conversation::{
-        parse_reasoning_control_argument, render_chat_message, ConversationControl,
-        IncomingConversationMessage,
-    },
-    conversation_id_manager::ConversationIdManager,
-    logger::StellaclawLogger,
-};
+use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLogger};
 
 use super::{
     types::{
-        IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
-        OutgoingDelivery, OutgoingError, OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus,
-        OutgoingUsageSummary, OutgoingUsageTotals, ProcessingState, ProgressFeedbackFinalState,
-        TurnProgressPhase, TurnProgressPlanItemStatus,
+        parse_idle_timeout_compact_control_argument, parse_reasoning_control_argument,
+        ConversationControl, IncomingConversationMessage, IncomingDispatch,
+        IncomingMessageDispatch, OutgoingAttachmentKind, OutgoingError, OutgoingMessageAppended,
+        OutgoingOptions, ProcessingState,
     },
     Channel,
 };
@@ -69,21 +64,10 @@ pub struct TelegramChannel {
     workdir: PathBuf,
     security_path: PathBuf,
     security: Mutex<SecurityState>,
-    progress_messages: Mutex<HashMap<String, TelegramProgressMessage>>,
-}
-
-#[derive(Debug, Clone)]
-struct TelegramProgressMessage {
-    message_id: i64,
-    last_text: String,
-    last_update: Instant,
-    started_at: Instant,
 }
 
 impl TelegramChannel {
     const MAX_MESSAGE_CHARS: usize = 4096;
-    const MAX_CAPTION_CHARS: usize = 1024;
-    const MIN_PROGRESS_EDIT_INTERVAL: Duration = Duration::from_secs(1);
 
     pub fn new(
         id: String,
@@ -131,14 +115,9 @@ impl TelegramChannel {
             workdir: workdir.to_path_buf(),
             security_path,
             security: Mutex::new(security),
-            progress_messages: Mutex::new(HashMap::new()),
         };
         instance.save_security_state()?;
         Ok(instance)
-    }
-
-    fn progress_message_key(platform_chat_id: &str, turn_id: &str) -> String {
-        format!("{platform_chat_id}:{}", turn_id)
     }
 
     fn run_loop(
@@ -602,119 +581,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    fn send_progress_text(&self, platform_chat_id: &str, text: &str) -> Result<i64> {
-        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| TelegramRenderedText {
-                text: text.to_string(),
-                entities: Vec::new(),
-            });
-        let payload = build_send_text_payload(platform_chat_id, rendered, None)?;
-        let message: TelegramMessage = self.call_api("sendMessage", &payload)?;
-        Ok(message.message_id)
-    }
-
-    fn edit_progress_text(
-        &self,
-        platform_chat_id: &str,
-        message_id: i64,
-        text: &str,
-    ) -> Result<()> {
-        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| TelegramRenderedText {
-                text: text.to_string(),
-                entities: Vec::new(),
-            });
-        let payload = build_edit_text_payload(platform_chat_id, message_id, rendered)?;
-        let _: serde_json::Value = self.call_api("editMessageText", &payload)?;
-        Ok(())
-    }
-
-    fn send_attachment(
-        &self,
-        platform_chat_id: &str,
-        attachment: &OutgoingAttachment,
-        caption: Option<&str>,
-    ) -> Result<()> {
-        let chat_id = platform_chat_id.to_string();
-        let bytes = fs::read(&attachment.path)
-            .with_context(|| format!("failed to read {}", attachment.path.display()))?;
-        let file_name = attachment
-            .path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name);
-        let field = match attachment.kind {
-            OutgoingAttachmentKind::Image => "photo",
-            OutgoingAttachmentKind::Audio => "audio",
-            OutgoingAttachmentKind::Voice => "voice",
-            OutgoingAttachmentKind::Video => "video",
-            OutgoingAttachmentKind::Animation => "animation",
-            OutgoingAttachmentKind::Document => "document",
-        };
-        let method = match attachment.kind {
-            OutgoingAttachmentKind::Image => "sendPhoto",
-            OutgoingAttachmentKind::Audio => "sendAudio",
-            OutgoingAttachmentKind::Voice => "sendVoice",
-            OutgoingAttachmentKind::Video => "sendVideo",
-            OutgoingAttachmentKind::Animation => "sendAnimation",
-            OutgoingAttachmentKind::Document => "sendDocument",
-        };
-        let mut trailing_text_chunks = Vec::new();
-        let form = reqwest::blocking::multipart::Form::new()
-            .text("chat_id", chat_id.clone())
-            .part(field.to_string(), part);
-        let form = if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
-            let mut rendered =
-                render_markdown_chunks_to_telegram_entities(caption, Self::MAX_CAPTION_CHARS)
-                    .into_iter();
-            let first = rendered.next().unwrap_or_else(|| TelegramRenderedText {
-                text: String::new(),
-                entities: Vec::new(),
-            });
-            trailing_text_chunks = rendered.collect();
-            let mut form = form.text("caption", first.text);
-            if !first.entities.is_empty() {
-                form = form.text(
-                    "caption_entities",
-                    serde_json::to_string(&first.entities)
-                        .context("failed to encode telegram caption entities")?,
-                );
-            }
-            form
-        } else {
-            form
-        };
-        let response = self
-            .client
-            .post(self.method_url(method))
-            .multipart(form)
-            .send()
-            .with_context(|| format!("telegram API call {method} failed"))?;
-        let envelope = response
-            .json::<TelegramEnvelope<serde_json::Value>>()
-            .with_context(|| format!("telegram API {method} returned invalid JSON"))?;
-        if !envelope.ok {
-            return Err(anyhow!(
-                "telegram API {} failed: {}",
-                method,
-                envelope
-                    .description
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
-        }
-        for chunk in trailing_text_chunks {
-            let payload = build_send_text_payload(&chat_id, chunk, None)?;
-            let _: serde_json::Value = self.call_api("sendMessage", &payload)?;
-        }
-        Ok(())
-    }
-
     fn save_security_state(&self) -> Result<()> {
         let security = self
             .security
@@ -851,84 +717,6 @@ impl TelegramChannel {
     }
 }
 
-fn telegram_progress_text(feedback: &OutgoingProgressFeedback) -> String {
-    let progress = &feedback.progress;
-    let mut text = match progress.phase {
-        TurnProgressPhase::Thinking => format!(
-            "⚙️ 正在执行\n🤖 模型：{}\n🧠 状态：{}",
-            progress.model, progress.activity
-        ),
-        TurnProgressPhase::Working => format!(
-            "⚙️ 正在执行\n🤖 模型：{}\n📌 阶段：{}",
-            progress.model, progress.activity
-        ),
-        TurnProgressPhase::Done => {
-            format!("✅ 已完成\n🤖 模型：{}", progress.model)
-        }
-        TurnProgressPhase::Failed => {
-            let mut text = format!("❌ 本轮失败\n🤖 模型：{}", progress.model);
-            if let Some(error) = progress
-                .error
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                text.push_str("\n📌 ");
-                text.push_str(error);
-            }
-            text
-        }
-    };
-    if let Some(hint) = progress
-        .hint
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        text.push_str("\n\n💡 ");
-        text.push_str(hint);
-    }
-    append_telegram_progress_plan(&mut text, feedback);
-    text
-}
-
-fn append_telegram_progress_plan(text: &mut String, feedback: &OutgoingProgressFeedback) {
-    let Some(plan) = &feedback.progress.plan else {
-        return;
-    };
-    if plan.explanation.is_none() && plan.items.is_empty() {
-        return;
-    }
-    text.push_str("\n\n计划");
-    if let Some(explanation) = plan
-        .explanation
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        text.push('\n');
-        text.push_str(explanation);
-    }
-    for item in &plan.items {
-        let step = item.step.trim();
-        if step.is_empty() {
-            continue;
-        }
-        text.push('\n');
-        text.push_str(telegram_progress_plan_status_marker(item.status));
-        text.push(' ');
-        text.push_str(step);
-    }
-}
-
-fn telegram_progress_plan_status_marker(status: TurnProgressPlanItemStatus) -> &'static str {
-    match status {
-        TurnProgressPlanItemStatus::Pending => "☐",
-        TurnProgressPlanItemStatus::InProgress => "◐",
-        TurnProgressPlanItemStatus::Completed => "☑",
-    }
-}
-
 impl Channel for TelegramChannel {
     fn id(&self) -> &str {
         &self.id
@@ -947,114 +735,6 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
-    fn update_progress_feedback(&self, feedback: &OutgoingProgressFeedback) -> Result<()> {
-        let key = Self::progress_message_key(&feedback.platform_chat_id, &feedback.turn_id);
-        let text = telegram_progress_text(feedback);
-        if feedback.final_state == Some(ProgressFeedbackFinalState::Done) {
-            let existing = self.progress_messages.lock().unwrap().remove(&key);
-            if let Some(existing) = existing {
-                let elapsed = Instant::now().duration_since(existing.started_at);
-                let summary = format!("{}\n⏱️ 用时：{}", text, format_duration(elapsed));
-                if let Err(error) = self.edit_progress_text(
-                    &feedback.platform_chat_id,
-                    existing.message_id,
-                    &summary,
-                ) {
-                    eprintln!("telegram progress completion edit failed: {error:#}");
-                }
-            }
-            return Ok(());
-        }
-
-        let now = Instant::now();
-        let is_final = feedback.final_state.is_some();
-        let existing = self.progress_messages.lock().unwrap().get(&key).cloned();
-        let Some(existing) = existing else {
-            let message_id = self.send_progress_text(&feedback.platform_chat_id, &text)?;
-            if is_final {
-                return Ok(());
-            }
-            self.progress_messages.lock().unwrap().insert(
-                key,
-                TelegramProgressMessage {
-                    message_id,
-                    last_text: text,
-                    last_update: now,
-                    started_at: now,
-                },
-            );
-            return Ok(());
-        };
-
-        if existing.last_text == text && !is_final {
-            return Ok(());
-        }
-        if !feedback.important
-            && !is_final
-            && now.duration_since(existing.last_update) < Self::MIN_PROGRESS_EDIT_INTERVAL
-        {
-            return Ok(());
-        }
-
-        if let Err(error) =
-            self.edit_progress_text(&feedback.platform_chat_id, existing.message_id, &text)
-        {
-            eprintln!("telegram progress edit failed: {error:#}");
-            if is_final {
-                self.progress_messages.lock().unwrap().remove(&key);
-            }
-            return Ok(());
-        }
-
-        if is_final {
-            self.progress_messages.lock().unwrap().remove(&key);
-        } else {
-            self.progress_messages.lock().unwrap().insert(
-                key,
-                TelegramProgressMessage {
-                    message_id: existing.message_id,
-                    last_text: text,
-                    last_update: now,
-                    started_at: existing.started_at,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()> {
-        let options = delivery.options.as_ref();
-        let rendered_message = delivery.message.as_ref().map(render_chat_message);
-        let text = if !delivery.text.trim().is_empty() {
-            delivery.text.as_str()
-        } else if let Some(rendered) = rendered_message
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-        {
-            rendered
-        } else if let Some(options) = options {
-            options.prompt.as_str()
-        } else {
-            ""
-        };
-        if !text.trim().is_empty() && (delivery.attachments.is_empty() || options.is_some()) {
-            self.send_text(&delivery.platform_chat_id, text, options)?;
-        }
-        let mut attachment_caption = (!text.trim().is_empty() && options.is_none()).then_some(text);
-        for attachment in &delivery.attachments {
-            self.send_attachment(
-                &delivery.platform_chat_id,
-                attachment,
-                attachment_caption.take(),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn send_status(&self, status: &OutgoingStatus) -> Result<()> {
-        self.send_text(&status.platform_chat_id, &render_status_text(status), None)
-    }
-
     fn send_error(&self, error: &OutgoingError) -> Result<()> {
         let mut text = error.message.clone();
         if let Some(action) = error
@@ -1066,6 +746,17 @@ impl Channel for TelegramChannel {
             text.push_str(action);
         }
         self.send_text(&error.platform_chat_id, &text, None)
+    }
+
+    fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
+        if appended.message.role != ChatRole::Assistant {
+            return Ok(());
+        }
+        let text = render_chat_message(&appended.message);
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        self.send_text(&appended.platform_chat_id, &text, None)
     }
 
     fn spawn_ingress(
@@ -1237,82 +928,53 @@ fn render_message_time(unix_timestamp: i64) -> Option<String> {
         .ok()
 }
 
-fn render_status_text(status: &OutgoingStatus) -> String {
-    format!(
-        "当前状态\nconversation: `{}`\nmodel: `{}`\nreasoning: `{}`\nsandbox: `{}` ({})\nremote: {}\nworkspace: `{}`\nbackground: {} running / {} total\nsubagents: {} running / {} total\n\n{}",
-        status.conversation_id,
-        status.model,
-        status.reasoning,
-        status.sandbox,
-        status.sandbox_source,
-        status.remote,
-        status.workspace,
-        status.running_background,
-        status.total_background,
-        status.running_subagents,
-        status.total_subagents,
-        render_usage_summary(&status.usage),
-    )
+fn render_chat_message(message: &ChatMessage) -> String {
+    let mut parts = Vec::new();
+    for item in &message.data {
+        match item {
+            ChatMessageItem::Context(context) => parts.push(context.text.clone()),
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    parts.push(text.to_string());
+                }
+            }
+            ChatMessageItem::SelectionReference(selection) => {
+                parts.push(selection.to_prompt_text());
+            }
+            ChatMessageItem::File(file) => parts.push(render_file_item(file)),
+            ChatMessageItem::Reasoning(_) => {}
+            ChatMessageItem::ToolCall(ToolCallItem {
+                tool_name,
+                arguments,
+                ..
+            }) => parts.push(format!("[tool_call {tool_name}] {}", arguments.text)),
+            ChatMessageItem::ToolResult(tool_result) => {
+                let mut line = format!("[tool_result {}]", tool_result.tool_name);
+                let text = stellaclaw_core::session_actor::tool_result_text(tool_result);
+                if !text.trim().is_empty() {
+                    line.push('\n');
+                    line.push_str(&text);
+                }
+                for file in &tool_result.result.files {
+                    line.push('\n');
+                    line.push_str(&render_file_item(file));
+                }
+                parts.push(line);
+            }
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n\n")
+    }
 }
 
-fn render_usage_summary(summary: &OutgoingUsageSummary) -> String {
-    let mut total = OutgoingUsageTotals::default();
-    add_usage_totals(&mut total, &summary.foreground);
-    add_usage_totals(&mut total, &summary.background);
-    add_usage_totals(&mut total, &summary.subagents);
-    add_usage_totals(&mut total, &summary.media_tools);
-    add_usage_totals(&mut total, &summary.memory);
-    add_usage_totals(&mut total, &summary.user_memory_compaction);
-    let compaction_daily = summary
-        .user_memory_compaction_daily
-        .iter()
-        .rev()
-        .take(7)
-        .map(|item| render_usage_line(&format!("user memory compact {}", item.date), &item.usage))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "token usage\n{}\n{}\n{}\n{}\n{}\n{}\n{}{}",
-        render_usage_line("total", &total),
-        render_usage_line("foreground", &summary.foreground),
-        render_usage_line("background", &summary.background),
-        render_usage_line("subagents", &summary.subagents),
-        render_usage_line("media tools", &summary.media_tools),
-        render_usage_line("memory", &summary.memory),
-        render_usage_line("user memory compaction", &summary.user_memory_compaction),
-        if compaction_daily.is_empty() {
-            String::new()
-        } else {
-            format!("\n{compaction_daily}")
-        },
-    )
-}
-
-fn render_usage_line(label: &str, totals: &OutgoingUsageTotals) -> String {
-    format!(
-        "- {label}: read {} (${:.3}), write {} (${:.3}), input {} (${:.3}), output {} (${:.3}), total ${:.3}",
-        totals.cache_read,
-        totals.cost.cache_read,
-        totals.cache_write,
-        totals.cost.cache_write,
-        totals.uncache_input,
-        totals.cost.uncache_input,
-        totals.output,
-        totals.cost.output,
-        totals.cost.cache_read + totals.cost.cache_write + totals.cost.uncache_input + totals.cost.output,
-    )
-}
-
-fn add_usage_totals(target: &mut OutgoingUsageTotals, source: &OutgoingUsageTotals) {
-    target.cache_read = target.cache_read.saturating_add(source.cache_read);
-    target.cache_write = target.cache_write.saturating_add(source.cache_write);
-    target.uncache_input = target.uncache_input.saturating_add(source.uncache_input);
-    target.output = target.output.saturating_add(source.output);
-    target.cost.cache_read += source.cost.cache_read;
-    target.cost.cache_write += source.cost.cache_write;
-    target.cost.uncache_input += source.cost.uncache_input;
-    target.cost.output += source.cost.output;
+fn render_file_item(file: &FileItem) -> String {
+    match &file.name {
+        Some(name) => format!("[file] {name} ({})", file.uri),
+        None => format!("[file] {}", file.uri),
+    }
 }
 
 fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
@@ -1336,6 +998,9 @@ fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
             model_name: argument.to_string(),
         }),
         "/reasoning" => Some(parse_reasoning_control_argument(argument)),
+        "/idle_compact" | "/idle_timeout_compact" => {
+            Some(parse_idle_timeout_compact_control_argument(argument))
+        }
         "/remote" if argument.is_empty() => Some(ConversationControl::ShowRemote),
         "/remote" if argument.eq_ignore_ascii_case("off") => {
             Some(ConversationControl::DisableRemote)
@@ -1616,29 +1281,6 @@ fn build_send_text_payload(
             object.insert(
                 "reply_markup".to_string(),
                 build_inline_keyboard_markup(options),
-            );
-        }
-    }
-    Ok(payload)
-}
-
-fn build_edit_text_payload(
-    chat_id: &str,
-    message_id: i64,
-    rendered: TelegramRenderedText,
-) -> Result<serde_json::Value> {
-    let mut payload = json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": rendered.text,
-        "disable_web_page_preview": true,
-    });
-    if !rendered.entities.is_empty() {
-        if let Some(object) = payload.as_object_mut() {
-            object.insert(
-                "entities".to_string(),
-                serde_json::to_value(rendered.entities)
-                    .context("failed to encode telegram entities")?,
             );
         }
     }
@@ -3043,17 +2685,6 @@ fn infer_media_type(path: &Path) -> Option<String> {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
-    let total_secs = duration.as_secs();
-    let minutes = total_secs / 60;
-    let seconds = total_secs % 60;
-    if minutes > 0 {
-        format!("{minutes}m{seconds:02}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
 fn kind_label(kind: OutgoingAttachmentKind) -> &'static str {
     match kind {
         OutgoingAttachmentKind::Image => "image",
@@ -3073,14 +2704,9 @@ mod tests {
         telegram_text_len, ChatAuthorization, SecurityState, TelegramChannel, TelegramChat,
         TelegramMessage, TelegramMessageEntity, TelegramRenderedText, TelegramUser,
     };
-    use crate::channels::types::{OutgoingOption, OutgoingOptions};
+    use crate::channels::types::{ConversationControl, OutgoingOption, OutgoingOptions};
     use crate::config::SandboxMode;
-    use crate::conversation::ConversationControl;
-    use std::{
-        collections::{BTreeMap, HashMap},
-        path::PathBuf,
-        sync::Mutex,
-    };
+    use std::{collections::BTreeMap, path::PathBuf, sync::Mutex};
 
     #[test]
     fn parses_model_control_commands() {
@@ -3165,7 +2791,6 @@ mod tests {
                 admin_user_ids: Vec::new(),
                 chats: BTreeMap::<String, ChatAuthorization>::new(),
             }),
-            progress_messages: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -3254,7 +2879,6 @@ mod tests {
                 }],
             },
             Some(&OutgoingOptions {
-                prompt: "Choose".to_string(),
                 options: vec![
                     OutgoingOption {
                         label: "One".to_string(),

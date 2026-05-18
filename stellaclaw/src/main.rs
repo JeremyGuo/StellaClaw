@@ -1,13 +1,15 @@
-mod cache;
 mod channels;
 mod config;
-mod conversation;
+mod conversation_host;
 mod conversation_id_manager;
-mod cron;
+mod conversation_metadata;
+mod conversation_new;
+mod conversation_state;
 mod logger;
 mod memory;
-mod remote_actor;
 mod sandbox;
+mod service_protos;
+mod services;
 mod session_client;
 mod setup;
 mod tool_binary_manager;
@@ -25,21 +27,29 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use channels::{
     types::{
-        ChannelEvent, IncomingDispatch, OutgoingDispatch, OutgoingError, OutgoingErrorScope,
-        OutgoingErrorSeverity,
+        ChannelEvent, ConversationControl, IncomingConversationMessage, IncomingDispatch,
+        OutgoingDispatch, OutgoingError, OutgoingErrorScope, OutgoingErrorSeverity,
+        OutgoingHomeEvent, OutgoingMessageAppended, OutgoingProcessing, OutgoingSessionStream,
+        ProcessingState,
     },
     Channel, TelegramChannel, WebChannel,
 };
-use config::{ChannelConfig, StellaclawConfig};
-use conversation::{
-    load_or_create_conversation_state, push_configured_skill_sync_on_startup, spawn_conversation,
-    ConversationCommand,
-};
+use config::{ChannelConfig, ModelSelection, SessionProfile, StellaclawConfig};
+use conversation_host::ConversationHostRuntime;
 use conversation_id_manager::ConversationIdManager;
-use cron::CronManager;
+use conversation_metadata::ConversationMetadataStore;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use logger::StellaclawLogger;
 use sandbox::bubblewrap_support_error;
+use service_protos::{
+    agent_session::{AgentMessageOrigin, AgentSessionEvent},
+    channel::ChannelIngress,
+    kernel::{KernelResponse, KernelRuntimeConfigPatch},
+};
+use services::skill_sync::push_configured_skill_sync_on_startup;
+use stellaclaw_core::session_actor::{
+    ChatMessage, ChatMessageItem, ChatRole, ContextItem, ToolRemoteMode,
+};
 use upgrade::upgrade_workdir;
 
 fn main() {
@@ -106,7 +116,12 @@ fn run() -> Result<()> {
     let id_manager = Arc::new(Mutex::new(
         ConversationIdManager::load_under(&args.workdir).map_err(anyhow::Error::msg)?,
     ));
-    let cron_manager = Arc::new(CronManager::load_under(&args.workdir)?);
+    let conversation_host_runtime = Arc::new(ConversationHostRuntime::start_existing(
+        args.workdir.clone(),
+        config.clone(),
+        agent_server_path.clone(),
+        logger.clone(),
+    )?);
     let (incoming_tx, incoming_rx) = unbounded::<IncomingDispatch>();
     let (outgoing_tx, outgoing_rx) = unbounded::<OutgoingDispatch>();
 
@@ -137,6 +152,7 @@ fn run() -> Result<()> {
                     web.resolve_token().map_err(anyhow::Error::msg)?,
                     args.workdir.clone(),
                     config.clone(),
+                    conversation_host_runtime.clone(),
                     logger.clone(),
                 ));
                 instance.clone().spawn_ingress(
@@ -149,6 +165,21 @@ fn run() -> Result<()> {
         }
     }
 
+    let bridge_runtime = conversation_host_runtime.clone();
+    let bridge_workdir = args.workdir.clone();
+    let bridge_config = config.clone();
+    let bridge_outgoing_tx = outgoing_tx.clone();
+    let bridge_logger = logger.clone();
+    thread::spawn(move || {
+        run_conversation_event_bridge(
+            bridge_workdir,
+            bridge_config,
+            bridge_runtime,
+            bridge_outgoing_tx,
+            bridge_logger,
+        );
+    });
+
     let send_channels = channels.clone();
     let outgoing_logger = logger.clone();
     thread::spawn(move || {
@@ -157,13 +188,11 @@ fn run() -> Result<()> {
         }
     });
 
-    run_dispatcher_loop(
+    run_channel_ingress_loop(
         args.workdir,
         config,
-        agent_server_path,
-        cron_manager,
+        conversation_host_runtime,
         incoming_rx,
-        outgoing_tx,
         logger,
     )
 }
@@ -201,32 +230,19 @@ fn run_outgoing_loop(
     Ok(())
 }
 
-fn run_dispatcher_loop(
+fn run_channel_ingress_loop(
     workdir: PathBuf,
     config: Arc<StellaclawConfig>,
-    agent_server_path: PathBuf,
-    cron_manager: Arc<CronManager>,
+    conversation_runtime: Arc<ConversationHostRuntime>,
     incoming_rx: Receiver<IncomingDispatch>,
-    outgoing_tx: Sender<OutgoingDispatch>,
     logger: Arc<StellaclawLogger>,
 ) -> Result<()> {
-    let mut conversations: HashMap<String, Sender<ConversationCommand>> = HashMap::new();
-    loop {
-        match incoming_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(IncomingDispatch::Message(dispatch)) => {
-                if let Err(error) = send_conversation_command(
-                    &mut conversations,
-                    &workdir,
-                    &config,
-                    &agent_server_path,
-                    &cron_manager,
-                    &outgoing_tx,
-                    &logger,
-                    &dispatch.conversation_id,
-                    &dispatch.channel_id,
-                    &dispatch.platform_chat_id,
-                    ConversationCommand::Incoming(dispatch.message),
-                ) {
+    while let Ok(dispatch) = incoming_rx.recv() {
+        match dispatch {
+            IncomingDispatch::Message(dispatch) => {
+                if let Err(error) =
+                    handle_incoming_message(&workdir, &config, &conversation_runtime, &dispatch)
+                {
                     logger.warn(
                         "incoming_dispatch_failed",
                         serde_json::json!({
@@ -236,211 +252,493 @@ fn run_dispatcher_loop(
                             "error": format!("{error:#}"),
                         }),
                     );
-                    let _ = outgoing_tx.send(OutgoingDispatch::Event(ChannelEvent::Error(
-                        OutgoingError {
-                            channel_id: dispatch.channel_id,
-                            platform_chat_id: dispatch.platform_chat_id,
-                            conversation_id: dispatch.conversation_id,
-                            scope: OutgoingErrorScope::Runtime,
-                            severity: OutgoingErrorSeverity::Error,
-                            code: "incoming_dispatch_failed".to_string(),
-                            message: "Message accepted by Web API, but the conversation runtime did not receive it.".to_string(),
-                            detail: Some(serde_json::json!({
-                                "error": format!("{error:#}"),
-                            })),
-                            can_continue: true,
-                            suggested_action: Some("Reload this conversation or restart the Stellaclaw service, then try sending again.".to_string()),
-                        },
-                    )));
                 }
             }
-            Ok(IncomingDispatch::DeleteConversation {
-                channel_id,
-                platform_chat_id,
-                conversation_id,
-                response_tx,
-            }) => {
-                let result = shutdown_active_conversation(
-                    &mut conversations,
-                    &conversation_id,
-                    &channel_id,
-                    &platform_chat_id,
-                    &logger,
-                )
-                .and_then(|_| {
-                    cron_manager
-                        .remove_tasks_for_conversation(&conversation_id)
-                        .map(|_| ())
-                })
-                .map_err(|error| format!("{error:#}"));
-                let _ = response_tx.send(result);
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
-
-        for task in cron_manager.collect_due_tasks(chrono::Utc::now())? {
-            logger.info(
-                "cron_task_due",
-                serde_json::json!({
-                    "id": task.id,
-                    "conversation_id": task.conversation_id,
-                    "name": task.name,
-                    "next_run_at": task.next_run_at,
-                }),
-            );
-            let conversation_id = task.conversation_id.clone();
-            let channel_id = task.channel_id.clone();
-            let platform_chat_id = task.platform_chat_id.clone();
-            if let Err(error) = send_conversation_command(
-                &mut conversations,
-                &workdir,
-                &config,
-                &agent_server_path,
-                &cron_manager,
-                &outgoing_tx,
-                &logger,
-                &conversation_id,
-                &channel_id,
-                &platform_chat_id,
-                ConversationCommand::RunCronTask { task },
-            ) {
-                logger.warn(
-                    "cron_dispatch_failed",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "channel_id": channel_id,
-                        "platform_chat_id": platform_chat_id,
-                        "error": format!("{error:#}"),
-                    }),
-                );
-            }
         }
     }
     Ok(())
 }
 
-fn shutdown_active_conversation(
-    conversations: &mut HashMap<String, Sender<ConversationCommand>>,
-    conversation_id: &str,
-    channel_id: &str,
-    platform_chat_id: &str,
-    logger: &Arc<StellaclawLogger>,
-) -> Result<()> {
-    let Some(sender) = conversations.remove(conversation_id) else {
-        return Ok(());
-    };
-    let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-    if sender
-        .send(ConversationCommand::Shutdown {
-            reason: "conversation deleted",
-            ack_tx,
-        })
-        .is_err()
-    {
-        return Ok(());
-    }
-    ack_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .with_context(|| {
-            format!("timed out waiting for conversation {conversation_id} to stop before delete")
-        })?;
-    logger.info(
-        "conversation_shutdown_for_delete",
-        serde_json::json!({
-            "conversation_id": conversation_id,
-            "channel_id": channel_id,
-            "platform_chat_id": platform_chat_id,
-        }),
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn send_conversation_command(
-    conversations: &mut HashMap<String, Sender<ConversationCommand>>,
+fn handle_incoming_message(
     workdir: &PathBuf,
     config: &Arc<StellaclawConfig>,
-    agent_server_path: &PathBuf,
-    cron_manager: &Arc<CronManager>,
-    outgoing_tx: &Sender<OutgoingDispatch>,
-    logger: &Arc<StellaclawLogger>,
-    conversation_id: &str,
-    channel_id: &str,
-    platform_chat_id: &str,
-    command: ConversationCommand,
+    conversation_runtime: &Arc<ConversationHostRuntime>,
+    dispatch: &channels::types::IncomingMessageDispatch,
 ) -> Result<()> {
-    let mut last_error = None;
-    for attempt in 0..2 {
-        let sender = ensure_conversation_sender(
-            conversations,
-            workdir,
-            config,
-            agent_server_path,
-            cron_manager,
-            outgoing_tx,
-            logger,
-            conversation_id,
-            channel_id,
-            platform_chat_id,
-        )?;
-        match sender.send(command.clone()) {
-            Ok(()) => return Ok(()),
-            Err(_) => {
-                conversations.remove(conversation_id);
-                let error = anyhow!("conversation thread stopped before command delivery");
-                logger.warn(
-                    "conversation_command_send_failed",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "channel_id": channel_id,
-                        "platform_chat_id": platform_chat_id,
-                        "attempt": attempt + 1,
-                        "will_retry": attempt == 0,
-                        "error": format!("{error:#}"),
-                    }),
-                );
-                last_error = Some(error);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow!("conversation command was not delivered")))
+    ensure_conversation_state(workdir, config, dispatch)?;
+    conversation_runtime.ensure_conversation_started(&dispatch.conversation_id)?;
+    let ingress = incoming_message_to_channel_ingress(config, &dispatch.message)?;
+    conversation_runtime.send_main_channel_ingress(&dispatch.conversation_id, ingress)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ensure_conversation_sender(
-    conversations: &mut HashMap<String, Sender<ConversationCommand>>,
+fn ensure_conversation_state(
     workdir: &PathBuf,
-    config: &Arc<StellaclawConfig>,
-    agent_server_path: &PathBuf,
-    cron_manager: &Arc<CronManager>,
-    outgoing_tx: &Sender<OutgoingDispatch>,
-    logger: &Arc<StellaclawLogger>,
-    conversation_id: &str,
-    channel_id: &str,
-    platform_chat_id: &str,
-) -> Result<Sender<ConversationCommand>> {
-    if let Some(sender) = conversations.get(conversation_id) {
-        return Ok(sender.clone());
-    }
-    let state = load_or_create_conversation_state(
-        workdir,
-        conversation_id,
-        channel_id,
-        platform_chat_id,
-        config,
+    _config: &Arc<StellaclawConfig>,
+    dispatch: &channels::types::IncomingMessageDispatch,
+) -> Result<()> {
+    let store = ConversationMetadataStore::new(workdir);
+    let mut metadata = store.load_or_create(
+        &dispatch.conversation_id,
+        &dispatch.channel_id,
+        &dispatch.platform_chat_id,
     )?;
-    let sender = spawn_conversation(
-        workdir.clone(),
-        state,
-        config.clone(),
-        agent_server_path.clone(),
-        cron_manager.clone(),
-        outgoing_tx.clone(),
-        logger.clone(),
+    metadata.channel_id = dispatch.channel_id.clone();
+    metadata.platform_chat_id = dispatch.platform_chat_id.clone();
+    store.persist(&metadata)
+}
+
+fn incoming_message_to_channel_ingress(
+    config: &StellaclawConfig,
+    message: &IncomingConversationMessage,
+) -> Result<ChannelIngress> {
+    if let Some(control) = &message.control {
+        return control_to_channel_ingress(config, control);
+    }
+
+    let mut items = Vec::new();
+    if let Some(text) = message.text.as_ref().filter(|text| !text.is_empty()) {
+        items.push(ChatMessageItem::Context(ContextItem { text: text.clone() }));
+    }
+    items.extend(
+        message
+            .selection_references
+            .iter()
+            .cloned()
+            .map(ChatMessageItem::SelectionReference),
     );
-    conversations.insert(conversation_id.to_string(), sender.clone());
-    Ok(sender)
+    items.extend(message.files.iter().cloned().map(ChatMessageItem::File));
+    if items.is_empty() {
+        return Err(anyhow!("incoming message is empty"));
+    }
+
+    Ok(ChannelIngress::IncomingMessage {
+        foreground_session_id: None,
+        platform_message_id: Some(message.remote_message_id.clone()),
+        origin: Some(AgentMessageOrigin::User),
+        message: ChatMessage::new(ChatRole::User, items)
+            .with_user_name_option(message.user_name.clone())
+            .with_message_time_option(message.message_time.clone()),
+        metadata: serde_json::json!({}),
+    })
+}
+
+fn control_to_channel_ingress(
+    config: &StellaclawConfig,
+    control: &ConversationControl,
+) -> Result<ChannelIngress> {
+    match control {
+        ConversationControl::Continue => Ok(ChannelIngress::ContinueForegroundTurn {
+            foreground_session_id: None,
+            reason: Some("user requested continue".to_string()),
+        }),
+        ConversationControl::Cancel => Ok(ChannelIngress::CancelForegroundTurn {
+            foreground_session_id: None,
+            reason: Some("user requested cancel".to_string()),
+        }),
+        ConversationControl::Compact => Ok(ChannelIngress::CompactForegroundNow {
+            foreground_session_id: None,
+        }),
+        ConversationControl::ShowStatus => Ok(ChannelIngress::QueryForegroundStatus {
+            foreground_session_id: None,
+        }),
+        ConversationControl::SwitchModel { model_name } => {
+            if !config.models.contains_key(model_name) {
+                return Err(anyhow!("unknown model alias {model_name}"));
+            }
+            Ok(ChannelIngress::UpdateRuntimeConfig {
+                patch: KernelRuntimeConfigPatch {
+                    session_profile: Some(Some(SessionProfile {
+                        main_model: ModelSelection::alias(model_name.clone()),
+                    })),
+                    ..Default::default()
+                },
+            })
+        }
+        ConversationControl::SetReasoning { effort } => Ok(ChannelIngress::UpdateRuntimeConfig {
+            patch: KernelRuntimeConfigPatch {
+                reasoning_effort: Some(effort.clone()),
+                ..Default::default()
+            },
+        }),
+        ConversationControl::SetIdleTimeoutCompact { enabled } => {
+            Ok(ChannelIngress::UpdateRuntimeConfig {
+                patch: KernelRuntimeConfigPatch {
+                    idle_timeout_compact_enabled: Some(*enabled),
+                    ..Default::default()
+                },
+            })
+        }
+        ConversationControl::SetRemote { host, path } => Ok(ChannelIngress::UpdateRuntimeConfig {
+            patch: KernelRuntimeConfigPatch {
+                tool_remote_mode: Some(ToolRemoteMode::FixedSsh {
+                    host: host.clone(),
+                    cwd: Some(path.clone()),
+                }),
+                ..Default::default()
+            },
+        }),
+        ConversationControl::DisableRemote => Ok(ChannelIngress::UpdateRuntimeConfig {
+            patch: KernelRuntimeConfigPatch {
+                tool_remote_mode: Some(ToolRemoteMode::Selectable),
+                ..Default::default()
+            },
+        }),
+        ConversationControl::ShowModel
+        | ConversationControl::ShowReasoning
+        | ConversationControl::ShowIdleTimeoutCompact
+        | ConversationControl::ShowRemote
+        | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus {
+            foreground_session_id: None,
+        }),
+        ConversationControl::SetSandbox { mode } => Err(anyhow!(
+            "sandbox runtime switching to {} is not exposed through the new channel protocol yet",
+            mode.as_ref()
+                .map(|mode| format!("{mode:?}"))
+                .unwrap_or_else(|| "default".to_string())
+        )),
+        ConversationControl::InvalidReasoning { reason }
+        | ConversationControl::InvalidIdleTimeoutCompact { reason }
+        | ConversationControl::InvalidRemote { reason }
+        | ConversationControl::InvalidSandbox { reason } => Err(anyhow!(reason.clone())),
+    }
+}
+
+fn run_conversation_event_bridge(
+    workdir: PathBuf,
+    config: Arc<StellaclawConfig>,
+    conversation_runtime: Arc<ConversationHostRuntime>,
+    outgoing_tx: Sender<OutgoingDispatch>,
+    logger: Arc<StellaclawLogger>,
+) {
+    let mut subscriptions = HashMap::new();
+    loop {
+        for conversation_id in conversation_runtime.conversation_ids() {
+            if !subscriptions.contains_key(&conversation_id) {
+                match conversation_runtime.subscribe_main_channel_events(&conversation_id) {
+                    Ok(rx) => {
+                        subscriptions.insert(conversation_id.clone(), rx);
+                    }
+                    Err(error) => {
+                        logger.warn(
+                            "conversation_event_bridge_subscribe_failed",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "error": format!("{error:#}"),
+                            }),
+                        );
+                        continue;
+                    }
+                }
+            }
+            let Some(rx) = subscriptions.get(&conversation_id) else {
+                continue;
+            };
+            for event in rx.try_iter() {
+                match project_channel_event(&workdir, &config, &conversation_id, event) {
+                    Ok(events) => {
+                        for event in events {
+                            let _ = outgoing_tx.send(OutgoingDispatch::Event(event));
+                        }
+                    }
+                    Err(error) => {
+                        logger.warn(
+                            "conversation_event_bridge_project_failed",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "error": format!("{error:#}"),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn project_channel_event(
+    workdir: &PathBuf,
+    config: &StellaclawConfig,
+    conversation_id: &str,
+    event: service_protos::channel::ChannelEvent,
+) -> Result<Vec<ChannelEvent>> {
+    let metadata = ConversationMetadataStore::new(workdir).load(conversation_id)?;
+    let mut events = Vec::new();
+    match event {
+        service_protos::channel::ChannelEvent::SessionEvent {
+            session_addr,
+            event,
+        } => match event {
+            event @ (AgentSessionEvent::UserMessageStarted { .. }
+            | AgentSessionEvent::UserMessageCommitted { .. }) => {
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::to_value(event)?,
+                }));
+            }
+            AgentSessionEvent::MessageAppended { index, message } => {
+                events.push(ChannelEvent::MessageAppended(OutgoingMessageAppended {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    index,
+                    message,
+                }));
+            }
+            event @ AgentSessionEvent::TurnStarted { .. } => {
+                events.push(ChannelEvent::Processing(OutgoingProcessing {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    state: ProcessingState::Typing,
+                }));
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::to_value(event)?,
+                }));
+            }
+            event @ (AgentSessionEvent::StreamAssistantMessageDelta { .. }
+            | AgentSessionEvent::StreamToolCallDelta { .. }
+            | AgentSessionEvent::StreamReasoningSummaryDelta { .. }
+            | AgentSessionEvent::StreamReasoningSummaryPartAdded { .. }
+            | AgentSessionEvent::StreamError { .. }
+            | AgentSessionEvent::StreamToolResultDone { .. }
+            | AgentSessionEvent::PlanUpdated { .. }) => {
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::to_value(event)?,
+                }));
+            }
+            event @ AgentSessionEvent::TurnCompleted { .. } => {
+                events.push(ChannelEvent::Processing(OutgoingProcessing {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    state: ProcessingState::Idle,
+                }));
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::to_value(event)?,
+                }));
+            }
+            AgentSessionEvent::TurnFailed {
+                error,
+                error_detail,
+                can_continue,
+            } => {
+                events.push(ChannelEvent::Processing(OutgoingProcessing {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    state: ProcessingState::Idle,
+                }));
+                events.push(ChannelEvent::Error(OutgoingError {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    scope: OutgoingErrorScope::Runtime,
+                    severity: OutgoingErrorSeverity::Error,
+                    code: "agent_session_failed".to_string(),
+                    message: error.clone(),
+                    detail: Some(serde_json::to_value(&error_detail)?),
+                    can_continue,
+                    suggested_action: None,
+                }));
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::json!({
+                        "type": "stream_error",
+                        "error": error,
+                        "error_detail": error_detail,
+                        "can_continue": can_continue,
+                        "scope": "turn_failed",
+                    }),
+                }));
+            }
+            AgentSessionEvent::RuntimeCrashed {
+                error,
+                error_detail,
+            } => {
+                events.push(ChannelEvent::Processing(OutgoingProcessing {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    state: ProcessingState::Idle,
+                }));
+                events.push(ChannelEvent::Error(OutgoingError {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    scope: OutgoingErrorScope::Runtime,
+                    severity: OutgoingErrorSeverity::Error,
+                    code: "agent_session_crashed".to_string(),
+                    message: error,
+                    detail: Some(serde_json::to_value(error_detail)?),
+                    can_continue: false,
+                    suggested_action: None,
+                }));
+            }
+            _ => {}
+        },
+        service_protos::channel::ChannelEvent::UserMessageQueued {
+            session_addr,
+            platform_message_id,
+            message,
+            metadata: event_metadata,
+        } => {
+            let client_message_id = event_metadata
+                .get("client_message_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or(platform_message_id)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| message.message_id.clone());
+            events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                channel_id: metadata.channel_id.clone(),
+                platform_chat_id: metadata.platform_chat_id.clone(),
+                conversation_id: metadata.conversation_id.clone(),
+                session_id: service_addr_storage_component(&session_addr),
+                event: serde_json::json!({
+                    "type": "user_message_queued",
+                    "client_message_id": client_message_id,
+                    "message_id": message.message_id,
+                    "message": message,
+                }),
+            }));
+        }
+        service_protos::channel::ChannelEvent::Error {
+            code,
+            message,
+            detail,
+        } => {
+            events.push(ChannelEvent::Error(OutgoingError {
+                channel_id: metadata.channel_id.clone(),
+                platform_chat_id: metadata.platform_chat_id.clone(),
+                conversation_id: metadata.conversation_id.clone(),
+                scope: OutgoingErrorScope::Runtime,
+                severity: OutgoingErrorSeverity::Error,
+                code,
+                message,
+                detail: detail.map(serde_json::Value::String),
+                can_continue: true,
+                suggested_action: None,
+            }));
+        }
+        service_protos::channel::ChannelEvent::KernelMetadata {
+            response: KernelResponse::MetadataUpdated { metadata },
+            ..
+        } => {
+            events.push(ChannelEvent::Home(OutgoingHomeEvent {
+                channel_id: metadata.channel_id.clone(),
+                platform_chat_id: metadata.platform_chat_id.clone(),
+                payload: serde_json::json!({
+                    "type": "home.conversation_updated",
+                    "conversation_id": metadata.conversation_id,
+                    "patch": {
+                        "conversation_name": if metadata.nickname.trim().is_empty() { metadata.conversation_id.clone() } else { metadata.nickname.clone() },
+                        "nickname": if metadata.nickname.trim().is_empty() { metadata.conversation_id.clone() } else { metadata.nickname.clone() },
+                        "foreground_session_id": metadata.foreground_session_id,
+                        "model_selection_pending": metadata.model_selection_pending,
+                        "session_nicknames": metadata.session_nicknames,
+                    },
+                }),
+            }));
+        }
+        service_protos::channel::ChannelEvent::KernelRuntimeConfig {
+            response:
+                KernelResponse::RuntimeConfigUpdated {
+                    config: runtime_config,
+                    ..
+                },
+            ..
+        } => {
+            events.push(ChannelEvent::Home(OutgoingHomeEvent {
+                channel_id: metadata.channel_id.clone(),
+                platform_chat_id: metadata.platform_chat_id.clone(),
+                payload: serde_json::json!({
+                    "type": "home.conversation_updated",
+                    "conversation_id": metadata.conversation_id,
+                    "patch": runtime_config_home_patch(&runtime_config, config),
+                }),
+            }));
+        }
+        _ => {}
+    }
+    Ok(events)
+}
+
+fn runtime_config_home_patch(
+    runtime_config: &conversation_new::ConversationRuntimeConfig,
+    config: &StellaclawConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": runtime_config
+            .session_profile
+            .as_ref()
+            .map(|profile| profile.main_model.display_name(&config.models))
+            .unwrap_or_else(|| "unconfigured".to_string()),
+        "reasoning": runtime_config
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("model default"),
+        "idle_timeout_compact_enabled": runtime_config_idle_timeout_compact_enabled(runtime_config, config),
+        "idle_timeout_compact_override": runtime_config.idle_timeout_compact_enabled,
+        "sandbox": runtime_config
+            .sandbox
+            .as_ref()
+            .map(|sandbox| format!("{:?}", sandbox.mode))
+            .unwrap_or_else(|| "default".to_string()),
+        "remote": format!("{:?}", runtime_config.tool_remote_mode),
+        "runtime_config": {
+            "agent_server_configured": runtime_config.agent_server_path.is_some(),
+            "has_session_profile": runtime_config.session_profile.is_some(),
+            "memory_enabled": runtime_config.memory_enabled,
+            "tool_remote_mode": runtime_config.tool_remote_mode,
+            "has_sandbox_override": runtime_config.sandbox.is_some(),
+            "reasoning_effort": runtime_config.reasoning_effort,
+            "idle_timeout_compact_enabled": runtime_config_idle_timeout_compact_enabled(runtime_config, config),
+            "idle_timeout_compact_override": runtime_config.idle_timeout_compact_enabled,
+        },
+    })
+}
+
+fn runtime_config_idle_timeout_compact_enabled(
+    runtime_config: &conversation_new::ConversationRuntimeConfig,
+    config: &StellaclawConfig,
+) -> bool {
+    if let Some(override_value) = runtime_config.idle_timeout_compact_enabled {
+        return override_value;
+    }
+    runtime_config
+        .session_profile
+        .as_ref()
+        .or(config.default_profile.as_ref())
+        .and_then(|profile| profile.main_model.resolve(&config.models))
+        .or_else(|| config.initial_main_model())
+        .map(|model| model.idle_timeout_compact_enabled)
+        .unwrap_or(true)
+}
+
+fn service_addr_storage_component(addr: &conversation_new::ServiceAddr) -> String {
+    let scope = match &addr.scope {
+        conversation_new::ServiceScope::Local => "local".to_string(),
+        conversation_new::ServiceScope::Conversation(conversation_id) => {
+            format!("conversation_{conversation_id}")
+        }
+    };
+    format!("{scope}__{}", addr.path.join("__"))
 }
 
 struct Args {
