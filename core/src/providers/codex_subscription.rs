@@ -1060,7 +1060,9 @@ fn send_response_create(
                                 "codex websocket completed without response".to_string(),
                             )
                         })?;
-                        for event in accumulator.missing_tool_call_stream_events(&response) {
+                        let missing_tool_call_events =
+                            accumulator.missing_tool_call_stream_events(&response);
+                        for event in missing_tool_call_events {
                             on_stream(event);
                         }
                         merge_streamed_response_output(&mut response, accumulator);
@@ -2111,9 +2113,14 @@ impl StreamAccumulator {
         else {
             return;
         };
-        let key = tool_input_stream_key(item_id, call_id.as_deref());
-        if !self.streamed_tool_inputs.iter().any(|existing| existing == &key) {
-            self.streamed_tool_inputs.push(key);
+        for key in tool_input_stream_keys(item_id, call_id.as_deref()) {
+            if !self
+                .streamed_tool_inputs
+                .iter()
+                .any(|existing| existing == &key)
+            {
+                self.streamed_tool_inputs.push(key);
+            }
         }
     }
 
@@ -2149,11 +2156,15 @@ impl StreamAccumulator {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| call_id.clone())?;
-        let key = tool_input_stream_key(&item_id, call_id.as_deref());
-        if self.streamed_tool_inputs.iter().any(|existing| existing == &key) {
+        let keys = tool_input_stream_keys(&item_id, call_id.as_deref());
+        if keys.iter().any(|key| {
+            self.streamed_tool_inputs
+                .iter()
+                .any(|existing| existing == key)
+        }) {
             return None;
         }
-        self.streamed_tool_inputs.push(key);
+        self.streamed_tool_inputs.extend(keys);
         let tool_name = item.get("name").and_then(Value::as_str).map(str::to_string);
         let delta = item
             .get("arguments")
@@ -2188,11 +2199,18 @@ impl StreamAccumulator {
     }
 }
 
-fn tool_input_stream_key(item_id: &str, call_id: Option<&str>) -> String {
-    call_id
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(item_id)
-        .to_string()
+fn tool_input_stream_keys(item_id: &str, call_id: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+    let trimmed_item_id = item_id.trim();
+    if !trimmed_item_id.is_empty() {
+        keys.push(trimmed_item_id.to_string());
+    }
+    if let Some(call_id) = call_id.map(str::trim).filter(|value| !value.is_empty()) {
+        if !keys.iter().any(|existing| existing == call_id) {
+            keys.push(call_id.to_string());
+        }
+    }
+    keys
 }
 
 fn merge_streamed_response_output(response: &mut Value, mut accumulator: StreamAccumulator) {
@@ -3003,6 +3021,31 @@ mod tests {
         }));
 
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn completed_function_call_matches_streamed_item_id_without_call_id() {
+        let mut accumulator = StreamAccumulator::default();
+        let streamed = ProviderStreamEvent::ToolCallInputDelta {
+            item_id: "fc_1".to_string(),
+            call_id: None,
+            tool_name: Some("apply_patch".to_string()),
+            delta: "{\"patch\"".to_string(),
+        };
+        accumulator.record_streamed_tool_input(&streamed);
+
+        let events = accumulator.missing_tool_call_stream_events(&serde_json::json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "arguments": {"patch": "*** Begin Patch\n*** End Patch\n"}
+            }]
+        }));
+
+        assert!(events.is_empty());
     }
 
     #[test]

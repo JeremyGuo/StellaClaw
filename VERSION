@@ -5,6 +5,8 @@ version: 1.29.3
 
 - 修复 Codex websocket 在 `response.completed` 才返回工具调用参数时仍触发 `stream_commit_mismatch`：
   Codex subscription provider 会在最终 response 落盘前扫描完整 `output`，对没有通过 `response.function_call_arguments.delta` 或 `response.output_item.done` 流出的 `function_call.arguments` 补发一次 `ToolCallInputDelta`，避免 `apply_patch` 等工具调用只出现在 durable assistant message 中、但 provisional stream message 缺少 tool call。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复 Codex websocket 工具调用参数重复补发：
+  Codex 的 `response.function_call_arguments.delta` 可能只携带 `item_id`，而最终 `response.completed.output` 同一 `function_call` 同时携带 `item_id` 和 `call_id`；provider 现在会把两者作为同一工具输入流的别名记录，避免 completed fallback 把已经流过的参数再次补发，从而造成同一 streaming assistant message 内出现两份 tool call input 并触发 `stream_commit_mismatch`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.29.2
 
