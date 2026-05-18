@@ -3,8 +3,10 @@ version: 1.29.5
 
 # 1.29.5
 
-- 修复 Codex subscription tool call stream/durable 不一致：
-  当 Codex websocket 只发送 `response.function_call_arguments.delta`，但 `response.completed.output` 未包含对应 `function_call` item 时，provider 会从已流出的 tool call delta 合成最终 `function_call` output item，再交给 SessionActor 落盘；避免前端 provisional assistant 已显示工具调用、durable `MessageAppended` 却只有文本，从而触发 `stream_commit_mismatch`。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复 StellaCodeX Electron stream commit mismatch 误报：
+  前端 durable/provisional 提交比较会优先使用工具调用的 provider item id，再退回 tool call id；调试摘要也统一通过 `messageItems()` 读取 `data` 中的落盘结构，避免 Codex durable 消息同时携带 `item_id=fc_*` 和 `tool_call_id=call_*` 时被误判为 stream/durable 不一致。本次不改变 `config` schema，不改变 `workdir` schema。
+- 收敛 WebChannel stream 细粒度日志开关：
+  WebChannel 默认只记录 turn start/done、stream error、stream index invalid 和 commit mismatch 等边界/异常日志；高频 assistant/tool/reasoning delta 只有设置 `STELLACLAW_WEB_STREAM_DEBUG=1` 时才写详细日志，便于复现 stream 协议问题时临时打开，平时避免刷日志。本次不改变 `config` schema，不改变 `workdir` schema。
 - 补齐 StellaCodeX Electron stream 文本淡入：
   参考 Codex VSCode 扩展 markdown 渲染中的短 opacity fade，plain streaming 文本会把稳定前缀和最新追加 suffix 分开渲染，只对新增 suffix 做 180ms 淡入；不做位移、不重新解析 Markdown，降低 RAF 分帧后文本出现过硬的问题。本次不改变 `config` schema，不改变 `workdir` schema。
 - 优化 StellaCodeX Electron stream 渲染性能：

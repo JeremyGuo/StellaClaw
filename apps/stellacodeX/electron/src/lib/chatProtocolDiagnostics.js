@@ -1,4 +1,4 @@
-import { messageIndex } from './messageUtils';
+import { messageIndex, messageItems } from './messageUtils';
 import { messageText } from './fileUtils';
 
 const STORAGE_KEY = 'stellacode.chatProtocolDiagnostics.v3';
@@ -100,7 +100,7 @@ export function summarizeStreamingAssistants(messages) {
 
 export function summarizeMessage(message) {
   if (!message || typeof message !== 'object') return null;
-  const items = Array.isArray(message.items) ? message.items : [];
+  const items = messageItems(message);
   return compactObject({
     id: message.id || message.message_id || message.messageId,
     index: messageIndex(message),

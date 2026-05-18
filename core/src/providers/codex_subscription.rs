@@ -74,15 +74,6 @@ struct StreamAccumulator {
     active_output_item_id: Option<String>,
     active_reasoning_item_id: Option<String>,
     streamed_tool_inputs: Vec<String>,
-    streamed_tool_input_drafts: Vec<StreamedToolInputDraft>,
-}
-
-#[derive(Debug, Clone)]
-struct StreamedToolInputDraft {
-    item_id: String,
-    call_id: Option<String>,
-    tool_name: Option<String>,
-    arguments: String,
 }
 
 #[derive(Debug, Default)]
@@ -2117,45 +2108,20 @@ impl StreamAccumulator {
 
     fn record_streamed_tool_input(&mut self, event: &ProviderStreamEvent) {
         let ProviderStreamEvent::ToolCallInputDelta {
-            item_id,
-            call_id,
-            tool_name,
-            delta,
+            item_id, call_id, ..
         } = event
         else {
             return;
         };
-        let keys = tool_input_stream_keys(item_id, call_id.as_deref());
-        for key in &keys {
+        for key in tool_input_stream_keys(item_id, call_id.as_deref()) {
             if !self
                 .streamed_tool_inputs
                 .iter()
-                .any(|existing| existing == key)
+                .any(|existing| existing == &key)
             {
-                self.streamed_tool_inputs.push(key.clone());
+                self.streamed_tool_inputs.push(key);
             }
         }
-        if let Some(draft) = self.streamed_tool_input_drafts.iter_mut().find(|draft| {
-            tool_input_stream_keys(&draft.item_id, draft.call_id.as_deref())
-                .iter()
-                .any(|existing| keys.iter().any(|key| key == existing))
-        }) {
-            draft.arguments.push_str(delta);
-            if draft.call_id.is_none() {
-                draft.call_id = call_id.clone();
-            }
-            if draft.tool_name.is_none() {
-                draft.tool_name = tool_name.clone();
-            }
-            return;
-        }
-        self.streamed_tool_input_drafts
-            .push(StreamedToolInputDraft {
-                item_id: item_id.clone(),
-                call_id: call_id.clone(),
-                tool_name: tool_name.clone(),
-                arguments: delta.clone(),
-            });
     }
 
     fn completed_tool_call_stream_event(&mut self, event: &Value) -> Option<ProviderStreamEvent> {
@@ -2267,43 +2233,6 @@ fn merge_streamed_response_output(response: &mut Value, mut accumulator: StreamA
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-
-    for draft in std::mem::take(&mut accumulator.streamed_tool_input_drafts) {
-        let Some(tool_name) = draft
-            .tool_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let draft_keys = tool_input_stream_keys(&draft.item_id, draft.call_id.as_deref());
-        let already_present = merged_output
-            .iter()
-            .chain(accumulator.output_items.iter())
-            .any(|item| {
-                draft_keys.iter().any(|key| {
-                    item.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| id == key)
-                        || item
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| id == key)
-                })
-            });
-        if already_present {
-            continue;
-        }
-        let call_id = draft.call_id.as_deref().unwrap_or(&draft.item_id);
-        accumulator.output_items.push(json!({
-            "type": "function_call",
-            "id": draft.item_id,
-            "call_id": call_id,
-            "name": tool_name,
-            "arguments": draft.arguments,
-        }));
-    }
 
     for item in std::mem::take(&mut accumulator.output_items) {
         let item_id = item.get("id").and_then(Value::as_str);
@@ -3232,48 +3161,6 @@ mod tests {
         assert_eq!(
             response["output"][1]["content"][0]["text"],
             "completed stream item"
-        );
-    }
-
-    #[test]
-    fn merge_streamed_response_output_appends_delta_only_tool_call() {
-        let mut response = serde_json::json!({
-            "id": "resp_1",
-            "output": [{
-                "type": "message",
-                "id": "msg_1",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": "I will call a tool."
-                }]
-            }]
-        });
-        let mut accumulator = StreamAccumulator::default();
-        accumulator.record_streamed_tool_input(&ProviderStreamEvent::ToolCallInputDelta {
-            item_id: "fc_1".to_string(),
-            call_id: Some("call_1".to_string()),
-            tool_name: Some("apply_patch".to_string()),
-            delta: "{\"patch\":\"*** Begin Patch".to_string(),
-        });
-        accumulator.record_streamed_tool_input(&ProviderStreamEvent::ToolCallInputDelta {
-            item_id: "fc_1".to_string(),
-            call_id: Some("call_1".to_string()),
-            tool_name: Some("apply_patch".to_string()),
-            delta: " *** End Patch\"}".to_string(),
-        });
-
-        merge_streamed_response_output(&mut response, accumulator);
-
-        let output = response["output"].as_array().unwrap();
-        assert_eq!(output.len(), 2);
-        assert_eq!(output[1]["type"], "function_call");
-        assert_eq!(output[1]["id"], "fc_1");
-        assert_eq!(output[1]["call_id"], "call_1");
-        assert_eq!(output[1]["name"], "apply_patch");
-        assert_eq!(
-            output[1]["arguments"],
-            "{\"patch\":\"*** Begin Patch *** End Patch\"}"
         );
     }
 

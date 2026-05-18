@@ -1483,21 +1483,33 @@ fn append_text_delta(existing_text: &str, delta: &str) -> String {
     format!("{existing_text}{delta}")
 }
 
-fn should_log_chat_stream_event(event_type: &str, event: &Value) -> bool {
+fn should_log_chat_stream_event(event_type: &str, _event: &Value) -> bool {
+    if matches!(event_type, "turn_started" | "turn_completed" | "stream_error") {
+        return true;
+    }
+    if !web_stream_debug_enabled() {
+        return false;
+    }
     matches!(
         event_type,
-        "turn_started"
-            | "turn_completed"
-            | "stream_error"
-            | "stream_assistant_message_delta"
+        "stream_assistant_message_delta"
             | "stream_tool_call_delta"
             | "stream_reasoning_summary_part_added"
             | "stream_reasoning_summary_delta"
             | "stream_tool_result_done"
-    ) || event
-        .get("in_message_index")
-        .and_then(Value::as_u64)
-        .is_some()
+    )
+}
+
+fn web_stream_debug_enabled() -> bool {
+    std::env::var("STELLACLAW_WEB_STREAM_DEBUG")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn message_text(message: &Value) -> &str {

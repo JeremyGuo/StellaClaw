@@ -89,6 +89,7 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
     return {
       type: 'tool_call',
       index,
+      item_id: payload.item_id || '',
       tool_call_id: payload.tool_call_id || '',
       tool_name: payload.tool_name || 'tool',
       arguments: payload.arguments?.text || payload.arguments || ''
@@ -99,6 +100,7 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
     return {
       type: 'tool_result',
       index,
+      item_id: payload.item_id || '',
       tool_call_id: payload.tool_call_id || '',
       tool_name: payload.tool_name || 'tool',
       context: rendered?.context || result.context?.text || null,
@@ -499,14 +501,14 @@ function canonicalMessageForCommitCompare(message) {
       if (item.type === 'tool_call') {
         return {
           type: 'tool_call',
-          tool_call_id: String(item.tool_call_id || '').trim(),
+          tool_id: String(item.item_id || item._item_id || item.tool_call_id || item.call_id || '').trim(),
           tool_name: String(item.tool_name || '').trim(),
           arguments: String(item.arguments || '').trim()
         };
       }
       return {
         type: 'tool_result',
-        tool_call_id: String(item.tool_call_id || '').trim(),
+        tool_id: String(item.item_id || item._item_id || item.tool_call_id || item.call_id || '').trim(),
         tool_name: String(item.tool_name || '').trim(),
         result: item.structured ?? item.context_with_attachment_markers ?? item.context ?? null
       };
