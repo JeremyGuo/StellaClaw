@@ -2140,11 +2140,15 @@ impl StreamAccumulator {
         if item.get("type").and_then(Value::as_str) != Some("function_call") {
             return None;
         }
-        let item_id = item.get("id").and_then(Value::as_str)?.to_string();
         let call_id = item
             .get("call_id")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| call_id.clone())?;
         let key = tool_input_stream_key(&item_id, call_id.as_deref());
         if self.streamed_tool_inputs.iter().any(|existing| existing == &key) {
             return None;
@@ -3030,6 +3034,31 @@ mod tests {
         assert_eq!(call_id.as_deref(), Some("call_1"));
         assert_eq!(tool_name.as_deref(), Some("apply_patch"));
         assert!(delta.contains("Begin Patch"));
+    }
+
+    #[test]
+    fn completed_response_tool_input_can_use_call_id_as_item_id() {
+        let mut accumulator = StreamAccumulator::default();
+
+        let events = accumulator.missing_tool_call_stream_events(&serde_json::json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "arguments": "{\"patch\":\"*** Begin Patch\\n*** End Patch\\n\"}"
+            }]
+        }));
+
+        assert_eq!(events.len(), 1);
+        let ProviderStreamEvent::ToolCallInputDelta {
+            item_id, call_id, ..
+        } = &events[0]
+        else {
+            panic!("expected tool call input delta event");
+        };
+        assert_eq!(item_id, "call_1");
+        assert_eq!(call_id.as_deref(), Some("call_1"));
     }
 
     #[test]
