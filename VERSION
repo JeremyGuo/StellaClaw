@@ -3,6 +3,9 @@ version: 1.29.0
 
 # 1.29.0
 
+- 收敛 StellaCodeX Electron 前端数据面边界：
+  将 chat stream 协议解析、顺序追踪、临时 assistant/tool/reasoning 消息投影和 stream error 撤销逻辑从 `App.jsx` 拆入独立 `chatStreamDataPlane` 模块；将消息本地缓存和通用 localStorage cache 拆入独立模块，避免实时 websocket、历史分页和 workspace 资源缓存继续共享散落在顶层组件里的隐式 Map 状态。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 重构 SessionActor context compaction 的 Provider 边界：
   `ChatRole` 新增 `Compaction`，压缩结果不再伪装成普通 assistant 消息；`ChatMessageItem` 新增 `CompactionItem`，区分可跨 Provider 复用的 `generic_summary` 和 Provider 专用的 `provider_builtin` opaque payload。Provider trait 新增 compaction mode 和 builtin compact 入口，非 Codex provider 默认把通用 summary materialize 成 user context、过滤不匹配的 Provider 专用压缩块，避免把 Codex compact state 计入上下文或发送给不支持的模型。Codex subscription provider 新增 builtin `/responses/compact` 调用路径，按当前 Responses input 翻译、system instructions、工具 schema、reasoning、service tier 和 prompt cache key 构造 compact 请求，HTTP header 补齐 installation id，并把 user-agent 改为 `stellaclaw`；返回的 `compaction` / `context_compaction` item 会 materialize 为 `ChatRole::Compaction` + Codex `provider_builtin` compaction item。通用 summary compact 仍保留为 fallback，但移除 cybersecurity policy retry/reduction fallback。本次不改变 `config` schema，改变 `workdir` schema 至 `0.24`。
 
