@@ -1356,11 +1356,25 @@ impl SessionActor {
                     "final_items": model_message.data.len(),
                 }),
             );
-            self.clear_current_plan()?;
             self.emit(SessionEvent::TurnCompleted {
                 message: model_message,
             })?;
             self.mark_turn_returned(active.turn_number);
+            self.log_info(
+                "turn_completed_emitted",
+                serde_json::json!({
+                    "turn_id": active.turn_id,
+                }),
+            );
+            if let Err(error) = self.clear_current_plan() {
+                self.log_error(
+                    "clear_current_plan_after_turn_completed_failed",
+                    serde_json::json!({
+                        "turn_id": active.turn_id,
+                        "error": error.to_string(),
+                    }),
+                );
+            }
             return Ok(());
         }
 

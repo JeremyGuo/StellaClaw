@@ -18,6 +18,9 @@ version: 1.29.0
 - 补充 SessionActor 工具结果落盘链路诊断日志：
   在工具 batch 完成到 durable `MessageAppended` 之间增加 `mark_loaded_skills`、`append_history_message`、session state persist 和 emit 的分段耗时日志；同时在 append 内部记录 system prompt 构造、would-compress 判断和 compression append 边界，便于定位工具结果已完成但前端仍停在工具执行中的卡点。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复最终 assistant 消息落盘后 live turn 未结束：
+  SessionActor 在无工具调用的最终 assistant 消息 durable append 后会先发出 `TurnCompleted`，再清理当前 plan；plan 清理或其持久化失败只记录 `clear_current_plan_after_turn_completed_failed`，不再阻断完成事件，避免 WebChannel snapshot 在重新进入 Session 时仍保留上一轮 `running_tool_results`。本次不改变 `config` schema，不改变 `workdir` schema。
+
 # 1.28.3
 
 - 修复 SessionActor 工具结果落盘被同步压缩阻塞：
