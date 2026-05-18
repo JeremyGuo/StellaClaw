@@ -1060,6 +1060,9 @@ fn send_response_create(
                                 "codex websocket completed without response".to_string(),
                             )
                         })?;
+                        for event in accumulator.missing_tool_call_stream_events(&response) {
+                            on_stream(event);
+                        }
                         merge_streamed_response_output(&mut response, accumulator);
                         if let Some(error) = provider_error_message(&response) {
                             if let Some(kind) = provider_error_kind(&response) {
@@ -2116,6 +2119,24 @@ impl StreamAccumulator {
 
     fn completed_tool_call_stream_event(&mut self, event: &Value) -> Option<ProviderStreamEvent> {
         let item = event.get("item")?;
+        self.tool_call_stream_event_from_item(item)
+    }
+
+    fn missing_tool_call_stream_events(&mut self, response: &Value) -> Vec<ProviderStreamEvent> {
+        let response_items = response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let accumulated_items = self.output_items.clone();
+        response_items
+            .iter()
+            .chain(accumulated_items.iter())
+            .filter_map(|item| self.tool_call_stream_event_from_item(item))
+            .collect()
+    }
+
+    fn tool_call_stream_event_from_item(&mut self, item: &Value) -> Option<ProviderStreamEvent> {
         if item.get("type").and_then(Value::as_str) != Some("function_call") {
             return None;
         }
@@ -2978,6 +2999,37 @@ mod tests {
         }));
 
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn completed_response_emits_unstreamed_tool_inputs() {
+        let mut accumulator = StreamAccumulator::default();
+
+        let events = accumulator.missing_tool_call_stream_events(&serde_json::json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "arguments": "{\"patch\":\"*** Begin Patch\\n*** End Patch\\n\"}"
+            }]
+        }));
+
+        assert_eq!(events.len(), 1);
+        let ProviderStreamEvent::ToolCallInputDelta {
+            item_id,
+            call_id,
+            tool_name,
+            delta,
+        } = &events[0]
+        else {
+            panic!("expected tool call input delta event");
+        };
+        assert_eq!(item_id, "fc_1");
+        assert_eq!(call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_name.as_deref(), Some("apply_patch"));
+        assert!(delta.contains("Begin Patch"));
     }
 
     #[test]
