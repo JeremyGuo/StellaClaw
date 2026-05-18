@@ -1114,7 +1114,9 @@ fn send_response_create(
                         }
                     }
                     Some("response.custom_tool_call_input.delta") => {
-                        if let Some(event) = provider_tool_call_input_delta_event(&value) {
+                        if let Some(event) =
+                            provider_tool_call_input_delta_event(&value, &accumulator)
+                        {
                             on_stream(event);
                         }
                     }
@@ -1172,7 +1174,10 @@ fn is_codex_response_progress_event(event_type: &str) -> bool {
             || event_type.contains(".done"))
 }
 
-fn provider_tool_call_input_delta_event(event: &Value) -> Option<ProviderStreamEvent> {
+fn provider_tool_call_input_delta_event(
+    event: &Value,
+    accumulator: &StreamAccumulator,
+) -> Option<ProviderStreamEvent> {
     let delta = event.get("delta").and_then(Value::as_str)?.to_string();
     let call_id = event
         .get("call_id")
@@ -1183,9 +1188,15 @@ fn provider_tool_call_input_delta_event(event: &Value) -> Option<ProviderStreamE
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| call_id.clone())?;
+    let tool_name = event
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| accumulator.tool_name_for_item(&item_id, call_id.as_deref()));
     Some(ProviderStreamEvent::ToolCallInputDelta {
         item_id,
         call_id,
+        tool_name,
         delta,
     })
 }
@@ -2058,6 +2069,26 @@ impl StreamAccumulator {
                 self.activate_reasoning_item(item_id);
             }
         }
+        self.push_unique_item(item.clone());
+    }
+
+    fn tool_name_for_item(&self, item_id: &str, call_id: Option<&str>) -> Option<String> {
+        self.output_items.iter().find_map(|item| {
+            let item_matches = item
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == item_id)
+                || call_id.is_some_and(|call_id| {
+                    item.get("call_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == call_id)
+                });
+            if item_matches {
+                item.get("name").and_then(Value::as_str).map(str::to_string)
+            } else {
+                None
+            }
+        })
     }
 
     fn push_unique_item(&mut self, item: Value) {

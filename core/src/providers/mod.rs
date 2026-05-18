@@ -465,6 +465,7 @@ pub enum ProviderStreamEvent {
     ToolCallInputDelta {
         item_id: String,
         call_id: Option<String>,
+        tool_name: Option<String>,
         delta: String,
     },
     ReasoningSummaryDelta {

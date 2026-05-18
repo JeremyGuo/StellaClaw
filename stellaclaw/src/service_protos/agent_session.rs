@@ -176,6 +176,8 @@ pub enum AgentSessionEvent {
         item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         delta: String,
     },
     StreamReasoningSummaryDelta {

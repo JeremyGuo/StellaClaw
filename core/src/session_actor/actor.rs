@@ -1278,7 +1278,7 @@ impl SessionActor {
                     "estimated provider request tokens {estimated_tokens} exceed model context {}",
                     self.model_config.token_max_context
                 );
-                if self.prune_history_after_request_too_large(
+                if self.compact_history_after_request_too_large(
                     "provider_request_preflight",
                     Some(&turn_id),
                     Some(step_index),
@@ -1485,6 +1485,7 @@ impl SessionActor {
             ProviderStreamEvent::ToolCallInputDelta {
                 item_id,
                 call_id,
+                tool_name,
                 delta,
             } => {
                 self.emit(SessionEvent::StreamToolCallDelta {
@@ -1493,6 +1494,7 @@ impl SessionActor {
                     in_message_index,
                     item_id,
                     call_id,
+                    tool_name,
                     delta,
                 })?;
             }
@@ -2627,6 +2629,113 @@ impl SessionActor {
         Ok(true)
     }
 
+    fn compact_history_after_request_too_large(
+        &mut self,
+        phase: &str,
+        turn_id: Option<&str>,
+        step_index: Option<usize>,
+        error: &str,
+    ) -> Result<bool, SessionActorError> {
+        if count_unclosed_tool_calls(&self.history) > 0 {
+            self.log_warn(
+                "request_too_large_compaction_skipped",
+                serde_json::json!({
+                    "phase": phase,
+                    "turn_id": turn_id,
+                    "step_index": step_index,
+                    "reason": "unclosed_tool_calls",
+                    "history_len": self.history.len(),
+                    "error": error,
+                }),
+            );
+            return Ok(false);
+        }
+        let Some(compressor) = self.compressor.clone() else {
+            self.log_warn(
+                "request_too_large_compaction_skipped",
+                serde_json::json!({
+                    "phase": phase,
+                    "turn_id": turn_id,
+                    "step_index": step_index,
+                    "reason": "compressor_unavailable",
+                    "history_len": self.history.len(),
+                    "error": error,
+                }),
+            );
+            return Ok(false);
+        };
+
+        self.log_warn(
+            "request_too_large_compaction_started",
+            serde_json::json!({
+                "phase": phase,
+                "turn_id": turn_id,
+                "step_index": step_index,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "error": error,
+            }),
+        );
+        let system_prompt = self.system_prompt_for_current_initial()?;
+        let compression_context = self.compression_memory_context(&self.history, None);
+        let started_at = Instant::now();
+        match compressor.compact_now_with_tools(
+            &mut self.history,
+            self.provider.as_ref(),
+            &self.model_config,
+            system_prompt.as_deref(),
+            compression_context.as_deref(),
+            self.tool_catalog
+                .iter()
+                .map(|(_, tool)| tool)
+                .collect::<Vec<_>>(),
+        ) {
+            Ok(report) => {
+                self.log_compression_report("request_too_large", &report);
+                self.log_warn(
+                    "request_too_large_compaction_completed",
+                    serde_json::json!({
+                        "phase": phase,
+                        "turn_id": turn_id,
+                        "step_index": step_index,
+                        "compressed": report.compressed,
+                        "estimated_tokens_before": report.estimated_tokens_before,
+                        "estimated_tokens_after": report.estimated_tokens_after,
+                        "threshold_tokens": report.threshold_tokens,
+                        "retained_message_count": report.retained_message_count,
+                        "compressed_message_count": report.compressed_message_count,
+                        "history_len": self.history.len(),
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                if report.compressed {
+                    self.runtime_metadata_state
+                        .promote_notified_components_to_system_snapshot();
+                    self.persist_state_if_history_closed("request_too_large_compaction")?;
+                }
+                Ok(report.compressed)
+            }
+            Err(error) => {
+                self.log_error(
+                    "request_too_large_compaction_failed",
+                    serde_json::json!({
+                        "phase": phase,
+                        "turn_id": turn_id,
+                        "step_index": step_index,
+                        "error": error.to_string(),
+                        "history_len": self.history.len(),
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                self.emit_compact_failed(
+                    "request_too_large_compaction",
+                    format!("context compression before provider retry failed: {error}"),
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
     fn provider_request_exceeds_context(
         &self,
         messages: &[ChatMessage],
@@ -3428,6 +3537,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             in_message_index,
             item_id,
             call_id,
+            tool_name,
             delta,
         } => serde_json::json!({
             "event": "stream_tool_call_delta",
@@ -3436,6 +3546,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "in_message_index": in_message_index,
             "item_id": item_id,
             "call_id": call_id,
+            "tool_name": tool_name,
             "chars": delta.chars().count(),
         }),
         SessionEvent::StreamReasoningSummaryDelta {

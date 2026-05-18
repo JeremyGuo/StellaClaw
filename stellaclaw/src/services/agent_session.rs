@@ -2902,6 +2902,7 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             in_message_index,
             item_id,
             call_id,
+            tool_name,
             delta,
         } => AgentSessionEvent::StreamToolCallDelta {
             message_id,
@@ -2909,6 +2910,7 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             in_message_index,
             item_id,
             call_id,
+            tool_name,
             delta,
         },
         CoreSessionEvent::StreamReasoningSummaryDelta {

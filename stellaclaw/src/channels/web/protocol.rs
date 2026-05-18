@@ -482,6 +482,8 @@ pub enum ChatEvent {
         item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         delta: String,
     },
     #[serde(rename = "chat.stream_reasoning_summary_part_added")]

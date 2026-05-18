@@ -944,6 +944,12 @@ impl ChatLiveState {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .unwrap_or(item_id);
+        let tool_name = event
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| item_id_if_readable(item_id))
+            .unwrap_or("tool");
         if call_id.is_empty() {
             return;
         }
@@ -978,13 +984,14 @@ impl ChatLiveState {
                         "arguments".to_string(),
                         json!(append_text_delta(existing, delta)),
                     );
+                    map.insert("tool_name".to_string(), json!(tool_name));
                 }
             } else {
                 items.push(json!({
                     "type": "tool_call",
                     "index": next_index,
                     "tool_call_id": call_id,
-                    "tool_name": item_id_if_readable(item_id).unwrap_or("tool"),
+                    "tool_name": tool_name,
                     "arguments": delta,
                 }));
             }
@@ -1276,24 +1283,6 @@ fn tool_result_call_ids(message: &Value) -> Vec<&str> {
 }
 
 fn append_text_delta(existing_text: &str, delta: &str) -> String {
-    if existing_text.is_empty() {
-        return delta.to_string();
-    }
-    if delta.is_empty() || existing_text.ends_with(delta) {
-        return existing_text.to_string();
-    }
-    if delta.starts_with(existing_text) {
-        return delta.to_string();
-    }
-    let max_overlap = existing_text.len().min(delta.len());
-    for length in (1..=max_overlap).rev() {
-        if existing_text.is_char_boundary(existing_text.len() - length)
-            && delta.is_char_boundary(length)
-            && existing_text[existing_text.len() - length..] == delta[..length]
-        {
-            return format!("{}{}", existing_text, &delta[length..]);
-        }
-    }
     format!("{existing_text}{delta}")
 }
 

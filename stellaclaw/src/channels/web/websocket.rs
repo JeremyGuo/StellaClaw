@@ -14,7 +14,7 @@ use super::protocol::HEARTBEAT_INTERVAL_SECS;
 use super::{http::HttpRequest, time_utils::now_rfc3339};
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const WEBSOCKET_MAX_FRAME_BYTES: usize = 128 * 1024;
+const WEBSOCKET_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn accept_websocket(stream: &mut TcpStream, request: &HttpRequest) -> Result<()> {
     let key = request
