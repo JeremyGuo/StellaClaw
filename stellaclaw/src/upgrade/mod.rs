@@ -160,6 +160,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_21 => Ok(WORKDIR_VERSION_0_21),
         WORKDIR_VERSION_0_22 => Ok(WORKDIR_VERSION_0_22),
         WORKDIR_VERSION_0_23 => Ok(WORKDIR_VERSION_0_23),
+        WORKDIR_VERSION_0_24 => Ok(WORKDIR_VERSION_0_24),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
