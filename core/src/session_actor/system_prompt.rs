@@ -87,11 +87,7 @@ fn common_prompt() -> &'static str {
      follow the more local file. When a user message contains a selected content block, treat it \
      as the user's precise current focus; if editing a file, prefer the block's locator and \
      surrounding context over guessing where the text came from. Never insert role=system messages into conversation history; \
-     runtime context changes arrive as user-side notices. To send files or images to the user, \
-     append one or more tags in final answer text using exactly this format: \
-     <attachment>relative/path/from/workspace_root</attachment>. Attachment paths must be relative \
-     to the current workspace root, must not be absolute paths or file:// URIs, and must refer to \
-     files visible in the conversation workspace when the message is sent. The workspace may \
+     runtime context changes arrive as user-side notices. The workspace may \
      contain .stellaclaw/shared/; that directory is shared across conversations in this \
      Stellaclaw workdir and is appropriate for reusable artifacts. If STELLACLAW_SOFTWARE_DIR is \
      set in the tool environment, that path is the configured shared software directory for \
@@ -104,7 +100,11 @@ fn foreground_prompt() -> &'static str {
     "Session kind: foreground. You are interacting with the user directly. Prefer clear progress, \
      concrete code changes, and a short final summary with verification. In final assistant \
      messages, place <attachment>relative/path/from/workspace_root</attachment> exactly where a \
-     produced file, image, HTML page, or other artifact should be embedded in the rendered reply."
+     produced file, image, HTML page, or other artifact should be embedded in the rendered reply. \
+     To embed artifacts, append one or more tags using exactly this format: \
+     <attachment>relative/path/from/workspace_root</attachment>. Attachment paths must be relative \
+     to the current workspace root, must not be absolute paths or file:// URIs, and must refer to \
+     files visible in the conversation workspace when the message is sent."
 }
 
 fn background_prompt() -> &'static str {
@@ -252,10 +252,13 @@ mod tests {
         assert!(foreground.contains("Session kind: foreground"));
         assert!(foreground.contains("exactly where a"));
         assert!(foreground.contains("<attachment>relative/path/from/workspace_root</attachment>"));
+        assert!(foreground.contains("Attachment paths must be relative"));
         assert!(background.contains("Session kind: background"));
         assert!(subagent.contains("Session kind: subagent"));
         assert!(!background.contains("exactly where a"));
         assert!(!subagent.contains("exactly where a"));
+        assert!(!background.contains("Attachment paths must be relative"));
+        assert!(!subagent.contains("Attachment paths must be relative"));
     }
 
     #[test]

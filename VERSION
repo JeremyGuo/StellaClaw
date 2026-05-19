@@ -3,6 +3,9 @@ version: 1.29.6
 
 # 1.29.6
 
+- 将 attachment 语法收敛到 foreground kind prompt：
+  `<attachment>relative/path/from/workspace_root</attachment>` 的完整格式和相对路径约束不再放在可能被 provider common prompt override 覆盖的 common prompt 中，而是放在 foreground session kind prompt 中，确保前台 final 消息始终保留附件嵌入规则。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 补充 foreground session 的 attachment 渲染提示：
   foreground system prompt 现在明确说明 final assistant 消息中可以把 `<attachment>relative/path/from/workspace_root</attachment>` 放在希望嵌入文件、图片、HTML 或其它 artifact 的具体位置，便于前端按 final 文本位置渲染附件。本次不改变 `config` schema，不改变 `workdir` schema。
 
