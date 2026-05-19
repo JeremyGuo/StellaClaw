@@ -360,14 +360,6 @@ fn control_to_channel_ingress(
                 ..Default::default()
             },
         }),
-        ConversationControl::SetIdleTimeoutCompact { enabled } => {
-            Ok(ChannelIngress::UpdateRuntimeConfig {
-                patch: KernelRuntimeConfigPatch {
-                    idle_timeout_compact_enabled: Some(*enabled),
-                    ..Default::default()
-                },
-            })
-        }
         ConversationControl::SetRemote { host, path } => Ok(ChannelIngress::UpdateRuntimeConfig {
             patch: KernelRuntimeConfigPatch {
                 tool_remote_mode: Some(ToolRemoteMode::FixedSsh {
@@ -385,7 +377,6 @@ fn control_to_channel_ingress(
         }),
         ConversationControl::ShowModel
         | ConversationControl::ShowReasoning
-        | ConversationControl::ShowIdleTimeoutCompact
         | ConversationControl::ShowRemote
         | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus {
             foreground_session_id: None,
@@ -397,7 +388,6 @@ fn control_to_channel_ingress(
                 .unwrap_or_else(|| "default".to_string())
         )),
         ConversationControl::InvalidReasoning { reason }
-        | ConversationControl::InvalidIdleTimeoutCompact { reason }
         | ConversationControl::InvalidRemote { reason }
         | ConversationControl::InvalidSandbox { reason } => Err(anyhow!(reason.clone())),
     }
@@ -693,8 +683,6 @@ fn runtime_config_home_patch(
             .reasoning_effort
             .as_deref()
             .unwrap_or("model default"),
-        "idle_timeout_compact_enabled": runtime_config_idle_timeout_compact_enabled(runtime_config, config),
-        "idle_timeout_compact_override": runtime_config.idle_timeout_compact_enabled,
         "sandbox": runtime_config
             .sandbox
             .as_ref()
@@ -708,27 +696,8 @@ fn runtime_config_home_patch(
             "tool_remote_mode": runtime_config.tool_remote_mode,
             "has_sandbox_override": runtime_config.sandbox.is_some(),
             "reasoning_effort": runtime_config.reasoning_effort,
-            "idle_timeout_compact_enabled": runtime_config_idle_timeout_compact_enabled(runtime_config, config),
-            "idle_timeout_compact_override": runtime_config.idle_timeout_compact_enabled,
         },
     })
-}
-
-fn runtime_config_idle_timeout_compact_enabled(
-    runtime_config: &conversation_new::ConversationRuntimeConfig,
-    config: &StellaclawConfig,
-) -> bool {
-    if let Some(override_value) = runtime_config.idle_timeout_compact_enabled {
-        return override_value;
-    }
-    runtime_config
-        .session_profile
-        .as_ref()
-        .or(config.default_profile.as_ref())
-        .and_then(|profile| profile.main_model.resolve(&config.models))
-        .or_else(|| config.initial_main_model())
-        .map(|model| model.idle_timeout_compact_enabled)
-        .unwrap_or(true)
 }
 
 fn service_addr_storage_component(addr: &conversation_new::ServiceAddr) -> String {

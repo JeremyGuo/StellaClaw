@@ -1,7 +1,10 @@
 const metrics = new Map();
 const events = [];
+const commitBatches = new Map();
 const MAX_EVENTS = 80;
 const MAX_META_TEXT = 220;
+let detailedMetricsEnabled = false;
+let commitBatchFrame = 0;
 
 function now() {
   return typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
@@ -23,6 +26,7 @@ export function measureChatPerf(name, fn, meta) {
 export function recordChatPerf(name, durationMs = 0, meta) {
   const key = String(name || 'unknown');
   const duration = Number(durationMs || 0);
+  const shouldStoreEvent = duration >= eventThresholdMs(key);
   const current = metrics.get(key) || {
     name: key,
     count: 0,
@@ -37,9 +41,10 @@ export function recordChatPerf(name, durationMs = 0, meta) {
   current.maxMs = Math.max(current.maxMs, duration);
   current.lastMs = duration;
   current.lastAt = Date.now();
-  current.lastMeta = compactMeta(meta);
+  const nextMeta = shouldStoreEvent || meta ? compactMeta(resolveMeta(meta)) : current.lastMeta;
+  current.lastMeta = nextMeta ?? current.lastMeta;
   metrics.set(key, current);
-  if (duration >= eventThresholdMs(key)) {
+  if (shouldStoreEvent) {
     events.push({
       time: wallTime(),
       name: key,
@@ -50,8 +55,38 @@ export function recordChatPerf(name, durationMs = 0, meta) {
   }
 }
 
+export function recordChatCommitPerf(name, durationMs = 0, meta) {
+  if (!detailedMetricsEnabled) return;
+  const key = String(name || 'unknown');
+  const duration = Number(durationMs || 0);
+  const resolvedMeta = resolveMeta(meta);
+  if (resolvedMeta === null) return;
+  const current = commitBatches.get(key) || {
+    count: 0,
+    totalMs: 0,
+    maxMs: 0,
+    maxMeta: null
+  };
+  current.count += 1;
+  current.totalMs += duration;
+  if (duration >= current.maxMs) {
+    current.maxMs = duration;
+    current.maxMeta = resolvedMeta;
+  }
+  commitBatches.set(key, current);
+  scheduleCommitBatchFlush();
+}
+
 export function countChatPerf(name, count = 1, meta) {
   recordChatPerf(name, 0, { ...compactMeta(meta), count });
+}
+
+export function setChatPerfDetailedEnabled(enabled) {
+  detailedMetricsEnabled = Boolean(enabled);
+}
+
+export function isChatPerfDetailedEnabled() {
+  return detailedMetricsEnabled;
 }
 
 export function snapshotChatPerf() {
@@ -75,6 +110,7 @@ export function snapshotChatPerf() {
 export function clearChatPerf() {
   metrics.clear();
   events.length = 0;
+  commitBatches.clear();
 }
 
 export function startChatFrameProbe(enabled) {
@@ -101,6 +137,34 @@ function eventThresholdMs(name) {
   if (name === 'chat.workspace.render_commit') return 16;
   if (name.includes('commit')) return 12;
   return 8;
+}
+
+function scheduleCommitBatchFlush() {
+  if (commitBatchFrame || typeof window === 'undefined') return;
+  commitBatchFrame = window.requestAnimationFrame(flushCommitBatches);
+}
+
+function flushCommitBatches() {
+  commitBatchFrame = 0;
+  if (commitBatches.size === 0) return;
+  const batches = Array.from(commitBatches.entries());
+  commitBatches.clear();
+  batches.forEach(([name, batch]) => {
+    recordChatPerf(name, batch.maxMs, () => ({
+      ...(compactMeta(resolveMeta(batch.maxMeta)) || {}),
+      renders: batch.count,
+      avgCommitMs: roundMs(batch.count ? batch.totalMs / batch.count : 0)
+    }));
+  });
+}
+
+function resolveMeta(meta) {
+  if (typeof meta !== 'function') return meta;
+  try {
+    return meta();
+  } catch (error) {
+    return { meta_error: error?.message || String(error) };
+  }
 }
 
 function compactMeta(meta) {

@@ -2661,6 +2661,30 @@ button {
   padding-top: 4px;
 }
 
+.tool-round-body-shell {
+  display: grid;
+  min-width: 0;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-3px);
+  transition:
+    grid-template-rows 180ms cubic-bezier(.2, .8, .2, 1),
+    opacity 150ms ease,
+    transform 180ms cubic-bezier(.2, .8, .2, 1);
+}
+
+.tool-process-group.open > .tool-round-body-shell {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.tool-round-body-clip {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .tool-process-segment {
   display: grid;
   min-width: 0;
@@ -2695,11 +2719,12 @@ button {
 
 .tool-process-toggle svg:last-child {
   margin-left: 2px;
+  transform: rotate(-90deg);
   transition: transform 140ms ease;
 }
 
 .tool-process-segment.open .tool-process-toggle svg:last-child {
-  transform: rotate(180deg);
+  transform: rotate(0deg);
 }
 
 .tool-process-toggle span {

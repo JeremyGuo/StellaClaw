@@ -318,8 +318,6 @@ pub struct ConversationRuntimeConfig {
     pub sandbox: Option<SandboxConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_timeout_compact_enabled: Option<bool>,
 }
 
 impl ConversationRuntimeConfig {
@@ -333,7 +331,6 @@ impl ConversationRuntimeConfig {
             tool_remote_mode: ToolRemoteMode::Selectable,
             sandbox: None,
             reasoning_effort: None,
-            idle_timeout_compact_enabled: None,
         }
     }
 
@@ -359,12 +356,6 @@ impl ConversationRuntimeConfig {
         }
         if self.sandbox.is_none() && defaults.sandbox.is_some() {
             self.sandbox = defaults.sandbox;
-            changed = true;
-        }
-        if self.idle_timeout_compact_enabled.is_none()
-            && defaults.idle_timeout_compact_enabled.is_some()
-        {
-            self.idle_timeout_compact_enabled = defaults.idle_timeout_compact_enabled;
             changed = true;
         }
         changed
@@ -1004,7 +995,6 @@ impl ConversationKernel {
             tool_remote_mode: self.runtime_config.tool_remote_mode.clone(),
             sandbox: self.runtime_config.sandbox.clone(),
             reasoning_effort: self.runtime_config.reasoning_effort.clone(),
-            idle_timeout_compact_enabled: self.runtime_config.idle_timeout_compact_enabled,
         }
     }
 
@@ -1186,9 +1176,6 @@ impl ConversationKernel {
         }
         if let Some(reasoning_effort) = patch.reasoning_effort {
             self.runtime_config.reasoning_effort = reasoning_effort;
-        }
-        if let Some(idle_timeout_compact_enabled) = patch.idle_timeout_compact_enabled {
-            self.runtime_config.idle_timeout_compact_enabled = idle_timeout_compact_enabled;
         }
     }
 
@@ -1708,7 +1695,6 @@ mod tests {
         runtime_config.memory_enabled = true;
         runtime_config.reasoning_effort = Some("high".to_string());
         runtime_config.session_defaults.compression_threshold_tokens = Some(64_000);
-        runtime_config.idle_timeout_compact_enabled = Some(false);
         kernel.set_runtime_config(runtime_config);
 
         kernel
@@ -1755,7 +1741,6 @@ mod tests {
             metadata["session_defaults"]["compression_threshold_tokens"],
             64_000
         );
-        assert_eq!(metadata["idle_timeout_compact_enabled"], false);
         kernel.stop_all("test finished").expect("services stop");
     }
 

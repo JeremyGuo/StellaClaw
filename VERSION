@@ -1,5 +1,10 @@
-version: 1.29.6
+version: 1.30.0
 ---
+
+# 1.30.0
+
+- 删除 idle timeout compact 功能：
+  移除 `ModelConfig` 和 Conversation runtime config 中的 idle timeout compact 开关，删除 SessionActor 空闲超时自动压缩调度、Web / Telegram `/idle_compact` 与 `/idle_timeout_compact` 控制命令、Electron Conversation 属性面板中的空闲压缩设置和示例配置字段；手动 `/compact` 与 request-too-large 触发的 context compaction 保留。新增 config `0.13 -> 0.14` 升级，旧配置中的 `idle_timeout_compact_enabled` 会被忽略并在重写后消失；新增 workdir `0.25 -> 0.26` 升级，从 Conversation runtime config 文件移除旧字段。本次改变 `config` schema 至 `0.14`，改变 `workdir` schema 至 `0.26`。
 
 # 1.29.6
 
@@ -14,6 +19,15 @@ version: 1.29.6
 
 - 降低 StellaCodeX Electron streaming tool 数据面开销：
   `stream_tool_call_delta` 不再每个 websocket delta 立即更新 React 消息状态，而是进入 RAF 队列并按帧合并当前积压的工具参数；工具参数流也不再额外维护一份不断增长的 stream buffer，只用本次合并 delta 更新 UI 和 activity 摘要，避免大工具参数流造成主线程字符串拷贝和 state update 风暴。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 StellaCodeX Electron 窗口焦点恢复路径：
+  窗口 focus / visibility 恢复不再写入 App 顶层 React state，避免切回窗口立即触发 ConversationBar、ChatWorkspace 和右侧面板整树重渲染；前台已读标记改为 ref 驱动并延迟到焦点恢复后的空档执行，同时在 Chat 性能面板记录 `app.foreground_event` / `app.foreground_first_frame` 便于定位切回窗口首帧卡顿。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 StellaCodeX Electron Chat 性能诊断和消息流渲染边界：
+  Chat commit 类性能指标改为性能面板打开时才采样，并按 RAF 聚合同一帧内多个 message / Markdown / tool 实例的 commit 记录，避免诊断面板本身放大卡顿；消息流主体抽出 memo 边界，输入框、命令弹窗和性能面板状态变化不再重新遍历可见消息列表；性能面板、虚拟窗口计算、composer 附件读取、live activity 计划面板以及工具卡合并/摘要逻辑拆到 chat 子模块，工具分类结果增加缓存，删除已经无调用点的旧 ActivityStatus 组件；消息时间格式化复用按系统时区缓存的 `Intl.DateTimeFormat`；第一层工具折叠增加展开/收起过渡动画，并统一工具展开指示箭头为折叠向右、展开向下。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 继续拆分 StellaCodeX Electron App 顶层职责：
+  Conversation websocket snapshot/update reducer、foreground session 本地状态合并、聊天协议诊断摘要、composer 控制命令解析/模式文案、本地文件/附件 target 解析、workspace tab snapshot、窗口 chrome metrics 和 App error boundary 分别迁入独立 lib / component 模块，`App.jsx` 不再混放这些纯数据函数和外围 UI 辅助；这为后续把 home/chat/workspace 流程拆成更细 hooks 留出边界。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 改进 StellaCodeX Electron HTML 预览：
   右侧文件预览和 chat 内联 HTML artifact 默认以内嵌 iframe 渲染页面，并提供“预览 / 源码”两个 tab；有源码时用 `srcDoc` 渲染并保留源码查看，没有源码但有可访问 URL 时仍可渲染页面。本次不改变 `config` schema，不改变 `workdir` schema。

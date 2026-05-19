@@ -107,7 +107,7 @@ Stellaclaw 现在已经可以作为 Telegram-backed 和 StellaCodeX/Web-backed A
 - StellaCodeX Electron 桌面端：server profiles、conversation list、chat、粘贴/拖拽附件、workspace browser、文件预览、HTML sandbox rendering、terminal dock、plan/overview panels、usage breakdown、可配置主题、Git diff tool detail rendering。
 - Per-conversation model switching、sandbox switching、reasoning effort、remote workspace switching、status query、cancel、continue、foreground/background/subagent bindings 和 managed-agent status。
 - `agent_server` 子进程边界：stdin/stdout line-delimited JSON-RPC。
-- `SessionActor` control/data mailbox、turn loop、tool batch executor、provider worker isolation、idle compaction、崩溃恢复、未完成 turn 继续执行和未闭合 tool-call history repair。
+- `SessionActor` control/data mailbox、turn loop、tool batch executor、provider worker isolation、崩溃恢复、未完成 turn 继续执行和未闭合 tool-call history repair。
 - Codex subscription provider：使用官方 websocket shape，支持 access token refresh、priority service tier、encrypted reasoning continuation 和 streamed reasoning summary persistence。
 - OpenRouter chat-completions / responses providers、Claude provider、Brave Search provider、OpenAI-compatible image generation/editing 和 provider-backed media helpers。
 - Model-aware multimodal input normalization：模型不支持某种文件模态时降级成文本/file context。

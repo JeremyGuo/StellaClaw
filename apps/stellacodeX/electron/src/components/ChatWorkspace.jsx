@@ -1,18 +1,24 @@
-import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import 'katex/dist/katex.min.css';
-import { ChevronDown, Code2, Copy, Download, Eye, FileText, Info, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
+import { ChevronDown, Code2, Copy, Download, Eye, FileText, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, fileNameFromPath, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
 import { firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
-import { clearChatPerf, measureChatPerf, recordChatPerf, snapshotChatPerf, startChatFrameProbe } from '../lib/chatPerfMetrics';
-import { buildChatRenderModel, chatRenderEntryKey } from './chat/renderModel';
+import { measureChatPerf, recordChatPerf } from '../lib/chatPerfMetrics';
+import { ChatPerfPopover } from './chat/ChatPerfPopover';
+import { composerAttachmentFromFile, isImageFileObject, outgoingAttachmentPayload, selectionSummary } from './chat/composerAttachments';
+import { InlineActivityStatus, LiveActivityStack, shouldShowInlineActivity } from './chat/LiveActivity';
+import { renderCommitStart, useRenderCommitPerf } from './chat/perfHooks';
+import { buildChatRenderModel } from './chat/renderModel';
+import { mergedToolCards, sameToolBlock, sameUsage, toolCardsAreComplete, toolGroupSummary } from './chat/toolCards';
+import { VIRTUALIZE_ENTRY_THRESHOLD, virtualWindowForEntries } from './chat/virtualWindow';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -33,83 +39,11 @@ const REASONING_EFFORTS = [
   { value: 'default', label: 'Default', description: '恢复模型默认 reasoning effort' }
 ];
 
-const VIRTUALIZE_ENTRY_THRESHOLD = 80;
-const VIRTUAL_ENTRY_ESTIMATE = 150;
-const VIRTUAL_OVERSCAN_PX = 1100;
-
-function readFileAsBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
-    reader.onload = () => {
-      const value = String(reader.result || '');
-      resolve(value.includes(',') ? value.split(',').pop() : value);
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-function imageSizeFromUrl(url) {
-  return new Promise((resolve) => {
-    if (!url) {
-      resolve({});
-      return;
-    }
-    const image = new Image();
-    image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
-    image.onerror = () => resolve({});
-    image.src = url;
-  });
-}
-
-function fileMediaType(file) {
-  return file?.type || 'application/octet-stream';
-}
-
-function isImageFileObject(file) {
-  return String(fileMediaType(file)).toLowerCase().startsWith('image/');
-}
-
-async function composerAttachmentFromFile(file, fallbackName = '') {
-  const name = file?.name || fallbackName || 'attachment';
-  const mediaType = fileMediaType(file);
-  const previewUrl = isImageFileObject(file) ? URL.createObjectURL(file) : '';
-  const imageSize = previewUrl ? await imageSizeFromUrl(previewUrl) : {};
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    name,
-    media_type: mediaType,
-    size_bytes: file?.size || 0,
-    data_base64: await readFileAsBase64(file),
-    previewUrl,
-    width: imageSize.width,
-    height: imageSize.height
-  };
-}
-
-function outgoingAttachmentPayload(attachment) {
-  return {
-    name: attachment.name,
-    media_type: attachment.media_type,
-    uri: `data:${attachment.media_type || 'application/octet-stream'};base64,${attachment.data_base64}`,
-    size_bytes: attachment.size_bytes,
-    width: attachment.width,
-    height: attachment.height
-  };
-}
-
-function selectionSummary(selection) {
-  const locator = selection?.locator || {};
-  if (locator.start_line && locator.end_line) {
-    return `L${locator.start_line}-${locator.end_line}`;
-  }
-  if (locator.page) return `P${locator.page}`;
-  const text = String(selection?.selected_text || '').replace(/\s+/g, ' ').trim();
-  return text.length > 28 ? `${text.slice(0, 28)}...` : text || '选区';
-}
+const datePartFormatters = new Map();
+const clockFormatters = new Map();
 
 export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
-  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+  const renderStartedAt = renderCommitStart();
   const currentActivity = (runningActivities || []).at(-1) || null;
   const renderModel = useMemo(() => measureChatPerf('chat.render_model.total', () => buildChatRenderModel({
     messages,
@@ -186,14 +120,12 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   }, [messages, messagesReady, sending, processing, currentActivity]);
   const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
 
-  useLayoutEffect(() => {
-    recordChatPerf('chat.workspace.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+  useRenderCommitPerf('chat.workspace.render_commit', renderStartedAt, () => ({
       messages: messages?.length || 0,
       entries: renderEntries.length,
       visible: virtualWindow.items.length,
       activity: currentActivity?.id || currentActivity?.kind || ''
-    });
-  });
+  }));
 
   useEffect(() => {
     if (!sessionRunning) return undefined;
@@ -553,68 +485,36 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     onSend?.(`/reasoning ${effort}`);
   };
 
+  const continueTurn = useCallback(() => {
+    onSend?.('/continue');
+  }, [onSend]);
+
   return (
     <section className="chat-workspace">
       <div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
-        {modelSelectionPending ? (
-          <ModelSelectionGate
-            models={models}
-            loading={modelsLoading}
-            error={modelsError}
-            onReload={openModelOptions}
-            onChoose={chooseModel}
-          />
-        ) : renderedMessages.length === 0 ? (
-          <div className="empty-chat">
-            <strong>欢迎使用 Stellacode</strong>
-            <span>选择一个 Conversation，或者新建对话，让 Stellacode 帮你检查项目、修改代码、运行命令和整理上下文。</span>
-          </div>
-        ) : (
-          <div className="message-stream-content" ref={contentRef}>
-            {virtualWindow.virtualized && virtualWindow.topPadding > 0 && (
-              <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.topPadding}px` }} aria-hidden="true" />
-            )}
-            {virtualWindow.items.map(({ entry, index, key }) => (
-              <div className="virtual-entry" key={key} data-virtual-key={key}>
-                {entry.type === 'assistantTurn'
-                  ? (
-                    <MemoAssistantTurn
-                      entry={entry}
-                      active={sessionRunning && index === latestAssistantTurnIndex}
-                      elapsedNowMs={sessionRunning && index === latestAssistantTurnIndex ? elapsedTickMs : undefined}
-                      onOpenAttachment={onOpenAttachment}
-                      onDownloadAttachment={onDownloadAttachment}
-                      onResolveAttachmentUrl={onResolveAttachmentUrl}
-                      onOpenLocalLink={onOpenLocalLink}
-                    />
-                  )
-                  : (
-                    <MemoMessageArticle
-                      message={entry.message}
-                      onOpenAttachment={onOpenAttachment}
-                      onDownloadAttachment={onDownloadAttachment}
-                      onResolveAttachmentUrl={onResolveAttachmentUrl}
-                      onOpenLocalLink={onOpenLocalLink}
-                    />
-                  )}
-              </div>
-            ))}
-            {virtualWindow.virtualized && virtualWindow.bottomPadding > 0 && (
-              <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.bottomPadding}px` }} aria-hidden="true" />
-            )}
-            {pendingAssistantVisible && <PendingAssistantPlaceholder />}
-            {inlineActivity && <InlineActivityStatus activity={inlineActivity} />}
-            {turnStoppedAfterTool && (
-              <div className="turn-continuation-notice">
-                <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
-                <button type="button" onClick={() => onSend?.('/continue')} disabled={sending}>
-                  继续
-                </button>
-              </div>
-            )}
-            <div className="response-spacer" aria-hidden="true" />
-          </div>
-        )}
+        <MemoMessageStreamView
+          modelSelectionPending={modelSelectionPending}
+          models={models}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          onReloadModels={openModelOptions}
+          onChooseModel={chooseModel}
+          renderedMessages={renderedMessages}
+          virtualWindow={virtualWindow}
+          contentRef={contentRef}
+          sessionRunning={sessionRunning}
+          latestAssistantTurnIndex={latestAssistantTurnIndex}
+          elapsedTickMs={elapsedTickMs}
+          pendingAssistantVisible={pendingAssistantVisible}
+          inlineActivity={inlineActivity}
+          turnStoppedAfterTool={turnStoppedAfterTool}
+          onContinue={continueTurn}
+          sending={sending}
+          onOpenAttachment={onOpenAttachment}
+          onDownloadAttachment={onDownloadAttachment}
+          onResolveAttachmentUrl={onResolveAttachmentUrl}
+          onOpenLocalLink={onOpenLocalLink}
+        />
       </div>
       <ChatPerfPopover />
       <LiveActivityStack activities={runningActivities} progressRef={progressRef} />
@@ -817,150 +717,123 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   );
 }
 
-function ChatPerfPopover() {
-  const [open, setOpen] = useState(false);
-  const [snapshot, setSnapshot] = useState(() => snapshotChatPerf());
-  const [copied, setCopied] = useState(false);
-  useEffect(() => {
-    if (!open) return undefined;
-    setSnapshot(snapshotChatPerf());
-    const stopProbe = startChatFrameProbe(true);
-    const timer = window.setInterval(() => {
-      setSnapshot(snapshotChatPerf());
-    }, 600);
-    return () => {
-      stopProbe?.();
-      window.clearInterval(timer);
-    };
-  }, [open]);
-  const rows = snapshot.rows || [];
-  const total = rows.reduce((sum, row) => sum + Number(row.totalMs || 0), 0);
-  const copySnapshot = async () => {
-    try {
-      await navigator.clipboard?.writeText(JSON.stringify(snapshotChatPerf(), null, 2));
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1200);
-    } catch {
-      setCopied(false);
-    }
-  };
-  const reset = () => {
-    clearChatPerf();
-    setSnapshot(snapshotChatPerf());
-  };
+function MessageStreamView({
+  modelSelectionPending,
+  models,
+  modelsLoading,
+  modelsError,
+  onReloadModels,
+  onChooseModel,
+  renderedMessages,
+  virtualWindow,
+  contentRef,
+  sessionRunning,
+  latestAssistantTurnIndex,
+  elapsedTickMs,
+  pendingAssistantVisible,
+  inlineActivity,
+  turnStoppedAfterTool,
+  onContinue,
+  sending,
+  onOpenAttachment,
+  onDownloadAttachment,
+  onResolveAttachmentUrl,
+  onOpenLocalLink
+}) {
+  if (modelSelectionPending) {
+    return (
+      <ModelSelectionGate
+        models={models}
+        loading={modelsLoading}
+        error={modelsError}
+        onReload={onReloadModels}
+        onChoose={onChooseModel}
+      />
+    );
+  }
+
+  if (renderedMessages.length === 0) {
+    return (
+      <div className="empty-chat">
+        <strong>欢迎使用 Stellacode</strong>
+        <span>选择一个 Conversation，或者新建对话，让 Stellacode 帮你检查项目、修改代码、运行命令和整理上下文。</span>
+      </div>
+    );
+  }
+
   return (
-    <Popover.Root open={open} onOpenChange={setOpen}>
-      <Popover.Trigger asChild>
-        <button className="chat-perf-trigger" type="button" title="查看 Chat 性能统计" aria-label="查看 Chat 性能统计">
-          <Info size={15} strokeWidth={2} aria-hidden="true" />
-        </button>
-      </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content className="chat-perf-popover" side="top" align="start" sideOffset={10}>
-          <div className="chat-perf-header">
-            <div>
-              <strong>Chat 性能</strong>
-              <span>{snapshot.capturedAt}</span>
-            </div>
-            <em>{rows.length} 项 · {formatPerfMs(total)}</em>
-          </div>
-          <div className="chat-perf-actions">
-            <button type="button" onClick={copySnapshot}>{copied ? '已复制' : '复制'}</button>
-            <button type="button" onClick={reset}>清空</button>
-          </div>
-          <div className="chat-perf-table" role="table" aria-label="Chat performance metrics">
-            <div className="chat-perf-row head" role="row">
-              <span>Metric</span>
-              <span>Last</span>
-              <span>Avg</span>
-              <span>Max</span>
-              <span>Count</span>
-            </div>
-            {rows.slice(0, 20).map((row) => (
-              <div className="chat-perf-row" role="row" key={row.name} title={perfMetaTitle(row.lastMeta)}>
-                <span>{row.name}</span>
-                <span>{formatPerfMs(row.lastMs)}</span>
-                <span>{formatPerfMs(row.avgMsRounded)}</span>
-                <span>{formatPerfMs(row.maxMs)}</span>
-                <span>{row.count}</span>
-              </div>
-            ))}
-            {rows.length === 0 && <div className="chat-perf-empty">暂无采样；保持面板打开并复现卡顿。</div>}
-          </div>
-          <div className="chat-perf-events">
-            <strong>慢事件</strong>
-            {(snapshot.events || []).slice(0, 10).map((event, index) => (
-              <div className="chat-perf-event" key={`${event.time}-${event.name}-${index}`} title={perfMetaTitle(event.meta)}>
-                <span>{event.time}</span>
-                <em>{event.name}</em>
-                <b>{formatPerfMs(event.durationMs)}</b>
-              </div>
-            ))}
-            {(snapshot.events || []).length === 0 && <div className="chat-perf-empty">暂无慢事件</div>}
-          </div>
-          <Popover.Arrow className="floating-popover-arrow" />
-        </Popover.Content>
-      </Popover.Portal>
-    </Popover.Root>
+    <div className="message-stream-content" ref={contentRef}>
+      {virtualWindow.virtualized && virtualWindow.topPadding > 0 && (
+        <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.topPadding}px` }} aria-hidden="true" />
+      )}
+      {virtualWindow.items.map(({ entry, index, key }) => (
+        <div className="virtual-entry" key={key} data-virtual-key={key}>
+          {entry.type === 'assistantTurn'
+            ? (
+              <MemoAssistantTurn
+                entry={entry}
+                active={sessionRunning && index === latestAssistantTurnIndex}
+                elapsedNowMs={sessionRunning && index === latestAssistantTurnIndex ? elapsedTickMs : undefined}
+                onOpenAttachment={onOpenAttachment}
+                onDownloadAttachment={onDownloadAttachment}
+                onResolveAttachmentUrl={onResolveAttachmentUrl}
+                onOpenLocalLink={onOpenLocalLink}
+              />
+            )
+            : (
+              <MemoMessageArticle
+                message={entry.message}
+                onOpenAttachment={onOpenAttachment}
+                onDownloadAttachment={onDownloadAttachment}
+                onResolveAttachmentUrl={onResolveAttachmentUrl}
+                onOpenLocalLink={onOpenLocalLink}
+              />
+            )}
+        </div>
+      ))}
+      {virtualWindow.virtualized && virtualWindow.bottomPadding > 0 && (
+        <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.bottomPadding}px` }} aria-hidden="true" />
+      )}
+      {pendingAssistantVisible && <PendingAssistantPlaceholder />}
+      {inlineActivity && <InlineActivityStatus activity={inlineActivity} />}
+      {turnStoppedAfterTool && (
+        <div className="turn-continuation-notice">
+          <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
+          <button type="button" onClick={onContinue} disabled={sending}>
+            继续
+          </button>
+        </div>
+      )}
+      <div className="response-spacer" aria-hidden="true" />
+    </div>
   );
 }
 
-function formatPerfMs(value) {
-  const number = Number(value || 0);
-  if (number >= 1000) return `${(number / 1000).toFixed(1)}s`;
-  if (number >= 100) return `${Math.round(number)}ms`;
-  return `${number.toFixed(number >= 10 ? 1 : 2)}ms`;
-}
-
-function perfMetaTitle(meta) {
-  if (!meta) return '';
-  try {
-    return JSON.stringify(meta, null, 2);
-  } catch {
-    return String(meta);
+const MemoMessageStreamView = memo(MessageStreamView, (previous, next) => {
+  if (previous.modelSelectionPending !== next.modelSelectionPending) return false;
+  if (next.modelSelectionPending) {
+    return previous.models === next.models
+      && previous.modelsLoading === next.modelsLoading
+      && previous.modelsError === next.modelsError
+      && previous.onReloadModels === next.onReloadModels
+      && previous.onChooseModel === next.onChooseModel;
   }
-}
-
-function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeIndex }) {
-  const count = entries.length;
-  if (count <= VIRTUALIZE_ENTRY_THRESHOLD) {
-    return {
-      virtualized: false,
-      start: 0,
-      end: Math.max(0, count - 1),
-      topPadding: 0,
-      bottomPadding: 0,
-      items: entries.map((entry, index) => ({ entry, index, key: keys[index] || chatRenderEntryKey(entry, index) }))
-    };
-  }
-  const heights = keys.map((key) => heightCache.get(key) || VIRTUAL_ENTRY_ESTIMATE);
-  const offsets = new Array(count + 1);
-  offsets[0] = 0;
-  for (let index = 0; index < count; index += 1) {
-    offsets[index + 1] = offsets[index] + heights[index];
-  }
-  const top = Math.max(0, Number(viewport.scrollTop || 0) - VIRTUAL_OVERSCAN_PX);
-  const bottom = Math.max(top, Number(viewport.scrollTop || 0) + Number(viewport.clientHeight || 0) + VIRTUAL_OVERSCAN_PX);
-  let start = 0;
-  while (start < count - 1 && offsets[start + 1] < top) start += 1;
-  let end = start;
-  while (end < count - 1 && offsets[end] < bottom) end += 1;
-  if (Number.isFinite(activeIndex) && activeIndex >= 0) {
-    start = Math.min(start, Math.max(0, activeIndex - 2));
-    end = Math.max(end, Math.min(count - 1, activeIndex + 2));
-  }
-  return {
-    virtualized: true,
-    start,
-    end,
-    topPadding: offsets[start],
-    bottomPadding: Math.max(0, offsets[count] - offsets[end + 1]),
-    items: entries.slice(start, end + 1).map((entry, offset) => {
-      const index = start + offset;
-      return { entry, index, key: keys[index] || chatRenderEntryKey(entry, index) };
-    })
-  };
-}
+  return previous.renderedMessages === next.renderedMessages
+    && previous.virtualWindow === next.virtualWindow
+    && previous.contentRef === next.contentRef
+    && previous.sessionRunning === next.sessionRunning
+    && previous.latestAssistantTurnIndex === next.latestAssistantTurnIndex
+    && previous.elapsedTickMs === next.elapsedTickMs
+    && previous.pendingAssistantVisible === next.pendingAssistantVisible
+    && previous.inlineActivity === next.inlineActivity
+    && previous.turnStoppedAfterTool === next.turnStoppedAfterTool
+    && previous.onContinue === next.onContinue
+    && previous.sending === next.sending
+    && previous.onOpenAttachment === next.onOpenAttachment
+    && previous.onDownloadAttachment === next.onDownloadAttachment
+    && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
+    && previous.onOpenLocalLink === next.onOpenLocalLink;
+});
 
 function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }) {
   return (
@@ -998,150 +871,19 @@ function ModelSelectionGate({ models, loading, error, onReload, onChoose }) {
   );
 }
 
-export function LiveActivityStack({ activities, progressRef }) {
-  if (!activities?.length) return null;
-  const current = activities.at(-1) || {};
-  const plan = normalizeActivityPlan(current.plan);
-  if (!plan) return null;
-  return (
-    <section className="session-progress-card with-plan" aria-live="polite" ref={progressRef}>
-      <ActivityPlanPanel plan={plan} />
-    </section>
-  );
-}
-
-function InlineActivityStatus({ activity }) {
-  const state = String(activity?.state || 'running').toLowerCase();
-  const title = String(activity?.title || '').trim();
-  const detail = String(activity?.detail || activity?.activity || activity?.model || '').trim();
-  const label = title || (state === 'failed' ? '执行失败' : state === 'done' ? '已完成' : '正在思考');
-  return (
-    <div className={`chat-activity-status ${state}`}>
-      <i className="chat-activity-icon" aria-hidden="true" />
-      <span>{label}</span>
-      {detail && <code>{detail}</code>}
-    </div>
-  );
-}
-
-function shouldShowInlineActivity(activity) {
-  if (!activity) return false;
-  const state = String(activity?.state || 'running').toLowerCase();
-  if (state === 'failed') return true;
-  return false;
-}
-
-function ActivityStatus({ activity }) {
-  const state = String(activity?.state || 'running').toLowerCase();
-  const title = String(activity?.title || (state === 'failed' ? '执行失败' : state === 'done' ? '已完成' : '处理中')).trim();
-  const detail = String(activity?.detail || activity?.activity || activity?.model || '').trim();
-  return (
-    <div className={`session-progress-head ${state}`}>
-      <i className="session-progress-dot" aria-hidden="true" />
-      <span>{title}</span>
-      {detail && <code>{detail}</code>}
-    </div>
-  );
-}
-
-function normalizeActivityPlan(rawPlan) {
-  const items = Array.isArray(rawPlan)
-    ? rawPlan
-    : Array.isArray(rawPlan?.items)
-      ? rawPlan.items
-      : Array.isArray(rawPlan?.plan)
-        ? rawPlan.plan
-        : [];
-  if (!items.length && !rawPlan?.explanation) return null;
-  const normalized = items
-    .map(normalizePlanItem)
-    .filter((item) => item.step);
-  const completed = normalized.filter((item) => item.status === 'completed' || item.status === 'done').length;
-  return {
-    explanation: String(rawPlan?.explanation || '').trim(),
-    items: normalized,
-    completed,
-    total: normalized.length
-  };
-}
-
-function normalizePlanItem(item) {
-  const rawStep = String(item?.step || item?.text || item?.title || '').trim();
-  const marker = rawStep.match(/^\[(x|~|\s*)]\s*/i)?.[1]?.toLowerCase();
-  const markerStatus = marker === 'x'
-    ? 'completed'
-    : marker === '~'
-      ? 'in_progress'
-      : marker !== undefined
-        ? 'pending'
-        : '';
-  const rawStatus = String(item?.status || item?.state || '').toLowerCase();
-  const normalizedStatus = normalizePlanStatus(rawStatus);
-  const status = markerStatus && (!normalizedStatus || normalizedStatus === 'pending')
-    ? markerStatus
-    : normalizedStatus || markerStatus || 'pending';
-  return {
-    step: rawStep.replace(/^\[(?:x|~|\s*)]\s*/i, '').trim(),
-    status
-  };
-}
-
-function normalizePlanStatus(status) {
-  if (status === 'completed' || status === 'done' || status === 'success') return 'completed';
-  if (status === 'in_progress' || status === 'running' || status === 'active') return 'in_progress';
-  if (status === 'pending' || status === 'todo') return 'pending';
-  return '';
-}
-
-function ActivityPlanPanel({ plan }) {
-  return (
-    <section className="activity-plan-panel">
-      <div className="activity-plan-head">
-        <span>进度</span>
-        <code>共 {plan.total} 项，已完成 {plan.completed} 项</code>
-        <Pin className="activity-plan-pin" size={15} aria-hidden="true" />
-      </div>
-      <div className="activity-plan-body">
-        {plan.explanation && <p>{plan.explanation}</p>}
-        {plan.items.map((item, index) => (
-          <div className={`activity-plan-row ${planStatusClass(item.status)}`} key={`${item.step}-${index}`}>
-            <span>{planStatusMark(item.status)}</span>
-            <strong>{index + 1}.</strong>
-            <em>{item.step}</em>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function planStatusClass(status) {
-  if (status === 'completed' || status === 'done') return 'completed';
-  if (status === 'in_progress' || status === 'running') return 'running';
-  return 'pending';
-}
-
-function planStatusMark(status) {
-  if (status === 'completed' || status === 'done') return '✓';
-  if (status === 'in_progress' || status === 'running') return '◌';
-  return '○';
-}
-
 export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
-  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+  const renderStartedAt = renderCommitStart();
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
   const className = messageArticleClassName(message);
   const roleName = String(message.role || '').toLowerCase();
   const auxiliaryMessages = Array.isArray(message._auxiliary) ? message._auxiliary : [];
-  useLayoutEffect(() => {
-    recordChatPerf('chat.message.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+  useRenderCommitPerf('chat.message.render_commit', renderStartedAt, () => ({
       role: roleName,
       streaming: Boolean(message?._streaming),
       textLen: messageText(message).length,
       items: messageItems(message).length
-    });
-  });
+  }));
   return (
     <article className={className}>
       {auxiliaryMessages.length > 0 && (
@@ -1212,12 +954,7 @@ function parseMessageDate(value) {
 }
 
 function systemDateParts(date) {
-  const parts = new Intl.DateTimeFormat(undefined, {
-    timeZone: systemTimeZone(),
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric'
-  }).formatToParts(date);
+  const parts = datePartFormatter(systemTimeZone()).formatToParts(date);
   return {
     year: Number(parts.find((part) => part.type === 'year')?.value || 0),
     month: Number(parts.find((part) => part.type === 'month')?.value || 0),
@@ -1226,16 +963,41 @@ function systemDateParts(date) {
 }
 
 function systemClock(date) {
-  return new Intl.DateTimeFormat(undefined, {
-    timeZone: systemTimeZone(),
-    hour: 'numeric',
-    minute: '2-digit',
-    hourCycle: 'h23'
-  }).format(date);
+  return clockFormatter(systemTimeZone()).format(date);
 }
 
 function systemTimeZone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
+function datePartFormatter(timeZone) {
+  const key = timeZone || 'system';
+  let formatter = datePartFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(undefined, {
+      timeZone,
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric'
+    });
+    datePartFormatters.set(key, formatter);
+  }
+  return formatter;
+}
+
+function clockFormatter(timeZone) {
+  const key = timeZone || 'system';
+  let formatter = clockFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(undefined, {
+      timeZone,
+      hour: 'numeric',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    });
+    clockFormatters.set(key, formatter);
+  }
+  return formatter;
 }
 
 function messageArticleClassName(message) {
@@ -1420,7 +1182,7 @@ function sameToolGroup(left, right) {
 }
 
 export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
-  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+  const renderStartedAt = renderCommitStart();
   const messages = group.messages || [];
   const expandedRows = useMemo(() => measureChatPerf('chat.tool_group.expand_rows', () => messages.map((message, index) => {
     const { textMessage, toolCards, segments } = splitMessageForDisplay(message);
@@ -1448,6 +1210,7 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
   const waitingForNextItem = activeTail && toolsComplete && !hasFinalMessage;
   const complete = !activeTail && (hasFinalMessage || toolsComplete);
   const [open, setOpen] = useState(() => !hasFinalMessage);
+  const bodyPresent = useDeferredPresence(open, 180);
   const wasActiveTailRef = useRef(activeTail);
   const hadFinalMessageRef = useRef(hasFinalMessage);
   useEffect(() => {
@@ -1465,14 +1228,12 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
   const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete, active ? elapsedNowMs : undefined);
   const summary = useMemo(() => measureChatPerf('chat.tool_group.summary', () => toolRoundSummary(blocks), { blocks: blocks.length }), [blocks]);
   const title = toolRoundTitle(elapsed, complete, summary);
-  useLayoutEffect(() => {
-    recordChatPerf('chat.tool_group.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
-      messages: messages.length,
-      blocks: blocks.length,
-      active,
-      open
-    });
-  });
+  useRenderCommitPerf('chat.tool_group.render_commit', renderStartedAt, () => ({
+    messages: messages.length,
+    blocks: blocks.length,
+    active,
+    open
+  }));
   return (
     <section className={`tool-process-group${open ? ' open' : ''}${complete ? ' complete' : ''}${activeTail ? ' active' : ''}`}>
       <button className="tool-round-toggle" type="button" onClick={() => setOpen((value) => !value)}>
@@ -1489,27 +1250,31 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
         </div>
       )}
       <div className="tool-round-separator" aria-hidden="true" />
-      {open && (
-        <div className="tool-process-round-body">
-          {blocks.map((block, index) => {
-            if (block.type === 'tools') {
-              const cardsComplete = toolCardsAreComplete(block.cards);
-              return (
-                <MemoToolProcessSegment
-                  key={block.id}
-                  block={block}
-                  complete={complete || cardsComplete}
-                  running={!cardsComplete && index === lastToolBlockIndex && activeTail}
-                />
-              );
-            }
-            return block.kind === 'reasoning'
-              ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
-              : <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />;
-          })}
-          {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在思考" />}
+      <div className="tool-round-body-shell" aria-hidden={!open}>
+        <div className="tool-round-body-clip">
+          {bodyPresent && (
+            <div className="tool-process-round-body">
+              {blocks.map((block, index) => {
+                if (block.type === 'tools') {
+                  const cardsComplete = toolCardsAreComplete(block.cards);
+                  return (
+                    <MemoToolProcessSegment
+                      key={block.id}
+                      block={block}
+                      complete={complete || cardsComplete}
+                      running={!cardsComplete && index === lastToolBlockIndex && activeTail}
+                    />
+                  );
+                }
+                return block.kind === 'reasoning'
+                  ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
+                  : <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />;
+              })}
+              {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在思考" />}
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </section>
   );
 }
@@ -1519,6 +1284,19 @@ const MemoToolProcessGroup = memo(ToolProcessGroup, (previous, next) => (
   && previous.elapsedNowMs === next.elapsedNowMs
   && sameToolGroup(previous.group, next.group)
 ));
+
+function useDeferredPresence(present, delayMs) {
+  const [mounted, setMounted] = useState(present);
+  useEffect(() => {
+    if (present) {
+      setMounted(true);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setMounted(false), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [delayMs, present]);
+  return mounted;
+}
 
 function useToolRoundElapsed(messages, nextMessage, complete, nowMs) {
   const startMsRef = useRef(toolRoundStartMs(messages));
@@ -1722,148 +1500,6 @@ const MemoToolProcessSegment = memo(ToolProcessSegment, (previous, next) => (
   && previous.running === next.running
   && sameToolBlock(previous.block, next.block)
 ));
-
-function sameToolBlock(left, right) {
-  if (left === right) return true;
-  if (!left || !right) return false;
-  if (
-    left.id !== right.id
-    || left.type !== right.type
-    || left.kind !== right.kind
-    || left.text !== right.text
-  ) {
-    return false;
-  }
-  return sameToolCards(left.cards, right.cards);
-}
-
-function sameToolCards(leftCards = [], rightCards = []) {
-  const left = Array.isArray(leftCards) ? leftCards : [];
-  const right = Array.isArray(rightCards) ? rightCards : [];
-  if (left.length !== right.length) return false;
-  for (let index = 0; index < left.length; index += 1) {
-    if (!sameToolCard(left[index], right[index])) return false;
-  }
-  return true;
-}
-
-function sameToolCard(left, right) {
-  if (left === right) return true;
-  if (!left || !right) return false;
-  return left.renderId === right.renderId
-    && left.id === right.id
-    && left.kind === right.kind
-    && left.name === right.name
-    && left.payload === right.payload
-    && left.sourceRowId === right.sourceRowId
-    && sameUsage(left.sourceRowUsage, right.sourceRowUsage)
-    && sameUsage(left.usage, right.usage);
-}
-
-function mergedToolCards(cards) {
-  const rows = [];
-  const byId = new Map();
-  cards.forEach((card, index) => {
-    const id = String(card.id || '').trim();
-    if (!id) {
-      rows.push({ order: index, call: card.kind === 'call' ? card : null, result: card.kind === 'result' ? card : null, sourceRowIds: new Set([card.sourceRowId].filter(Boolean)) });
-      return;
-    }
-    let row = byId.get(id);
-    if (!row) {
-      row = { order: index, call: null, result: null, sourceRowIds: new Set() };
-      byId.set(id, row);
-      rows.push(row);
-    }
-    if (card.sourceRowId) row.sourceRowIds.add(card.sourceRowId);
-    if (card.kind === 'result') {
-      row.result = card;
-    } else {
-      row.call = card;
-    }
-  });
-  const orderedRows = rows.sort((left, right) => left.order - right.order);
-  const usageBySourceRow = new Map();
-  cards.forEach((card) => {
-    if (card.sourceRowId && Number(card.sourceRowUsage?.total || 0)) {
-      usageBySourceRow.set(card.sourceRowId, card.sourceRowUsage);
-    }
-  });
-  const lastMergedRowBySource = new Map();
-  orderedRows.forEach((row) => {
-    row.sourceRowIds.forEach((sourceRowId) => {
-      lastMergedRowBySource.set(sourceRowId, row);
-    });
-  });
-  const usageByMergedRow = new Map();
-  usageBySourceRow.forEach((usage, sourceRowId) => {
-    const row = lastMergedRowBySource.get(sourceRowId);
-    if (row) usageByMergedRow.set(row, addToolUsage(usageByMergedRow.get(row), usage));
-  });
-  return orderedRows.map((row, index) => {
-    const call = row.call;
-    const result = row.result;
-    const displayCard = call || result;
-    const detailCard = result || call;
-    return {
-      renderId: call?.renderId || result?.renderId || `tool-row-${index}`,
-      id: displayCard?.id || detailCard?.id || '',
-      kind: result ? 'result' : 'call',
-      name: displayCard?.name || detailCard?.name || 'tool',
-      payload: displayCard?.payload ?? detailCard?.payload ?? '',
-      callPayload: call?.payload,
-      resultPayload: result?.payload,
-      usage: usageByMergedRow.get(row) || null,
-      running: Boolean(call && !result)
-    };
-  });
-}
-
-function addToolUsage(left, right) {
-  if (!Number(right?.total || 0)) return left || null;
-  if (!left) {
-    return {
-      input: Number(right.input || 0),
-      output: Number(right.output || 0),
-      cacheRead: Number(right.cacheRead || 0),
-      cacheWrite: Number(right.cacheWrite || 0),
-      total: Number(right.total || 0)
-    };
-  }
-  return {
-    input: Number(left.input || 0) + Number(right.input || 0),
-    output: Number(left.output || 0) + Number(right.output || 0),
-    cacheRead: Number(left.cacheRead || 0) + Number(right.cacheRead || 0),
-    cacheWrite: Number(left.cacheWrite || 0) + Number(right.cacheWrite || 0),
-    total: Number(left.total || 0) + Number(right.total || 0)
-  };
-}
-
-function sameUsage(left, right) {
-  if (left === right) return true;
-  if (!left || !right) return !Number(left?.total || right?.total || 0);
-  return Number(left.input || 0) === Number(right.input || 0)
-    && Number(left.output || 0) === Number(right.output || 0)
-    && Number(left.cacheRead || 0) === Number(right.cacheRead || 0)
-    && Number(left.cacheWrite || 0) === Number(right.cacheWrite || 0)
-    && Number(left.total || 0) === Number(right.total || 0);
-}
-
-function toolCardsAreComplete(cards) {
-  if (!cards.length) return false;
-  const open = new Set();
-  let hasResult = false;
-  cards.forEach((card, index) => {
-    const id = String(card.id || `${card.name || 'tool'}-${index}`);
-    if (card.kind === 'call') {
-      open.add(id);
-    } else if (card.kind === 'result') {
-      hasResult = true;
-      open.delete(id);
-    }
-  });
-  return hasResult && (open.size === 0 || cards.at(-1)?.kind === 'result');
-}
 
 function artifactAttachmentForPath(path, attachments = []) {
   const cleanPath = String(path || '').trim();
@@ -2127,15 +1763,15 @@ function shortReasoningSummary(value) {
 }
 
 export function MarkdownContent({ text, attachments = [], className = 'markdown-content', plain = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
-  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+  const renderStartedAt = renderCommitStart();
   const value = String(text || '');
-  useLayoutEffect(() => {
-    if (!value.trim()) return;
-    recordChatPerf(plain ? 'chat.markdown.plain_commit' : 'chat.markdown.rich_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+  useRenderCommitPerf(plain ? 'chat.markdown.plain_commit' : 'chat.markdown.rich_commit', renderStartedAt, () => {
+    if (!value.trim()) return null;
+    return {
       className,
       chars: value.length,
       attachments: attachments.length
-    });
+    };
   });
   if (!value.trim()) return null;
   if (plain) {
@@ -2781,78 +2417,6 @@ function lightToolPayload(payload) {
   return result;
 }
 
-function toolGroupSummary(cards, fallbackName) {
-  const records = toolOperationRecords(cards);
-  const counts = new Map();
-  records.forEach((card) => {
-    const category = toolCategory(card.name);
-    counts.set(category, (counts.get(category) || 0) + 1);
-  });
-  const parts = [
-    toolCountLabel(counts, 'search'),
-    toolCountLabel(counts, 'command'),
-    toolCountLabel(counts, 'edit'),
-    toolCountLabel(counts, 'fetch'),
-    toolCountLabel(counts, 'read'),
-    toolCountLabel(counts, 'image'),
-    toolCountLabel(counts, 'plan'),
-    toolCountLabel(counts, 'memory'),
-    toolCountLabel(counts, 'skill'),
-    toolCountLabel(counts, 'cron'),
-    toolCountLabel(counts, 'agent'),
-    toolCountLabel(counts, 'tool')
-  ].filter(Boolean);
-  const doneTitle = parts.join(' ') || `已处理 ${fallbackName || '工具'}`;
-  const runningTitle = `正在处理 ${fallbackName || '工具'}`;
-  return { doneTitle, runningTitle };
-}
-
-function toolOperationRecords(cards) {
-  const hasCalls = cards.some((card) => card.kind === 'call');
-  const seen = new Set();
-  return cards.filter((card, index) => {
-    if (hasCalls && card.kind !== 'call') return false;
-    const id = String(card.id || '').trim();
-    const key = id || `${card.kind}:${card.name || 'tool'}:${index}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function toolCategory(name) {
-  const lowerName = String(name || '').toLowerCase();
-  if (lowerName.includes('search') || lowerName.includes('grep') || lowerName === 'rg') return 'search';
-  if (lowerName.includes('shell') || lowerName.includes('command') || lowerName.includes('terminal') || lowerName.includes('stdin')) return 'command';
-  if (lowerName.includes('edit') || lowerName.includes('write') || lowerName.includes('patch')) return 'edit';
-  if (lowerName.includes('fetch') || lowerName.includes('browser') || lowerName.includes('open_url')) return 'fetch';
-  if (lowerName.includes('file_read') || lowerName.includes('read')) return 'read';
-  if (lowerName.includes('image') || lowerName.includes('screenshot')) return 'image';
-  if (lowerName.includes('plan')) return 'plan';
-  if (lowerName.includes('memory')) return 'memory';
-  if (lowerName.includes('skill')) return 'skill';
-  if (lowerName.includes('cron') || lowerName.includes('automation')) return 'cron';
-  if (lowerName.includes('agent') || lowerName.includes('subagent')) return 'agent';
-  return 'tool';
-}
-
-function toolCountLabel(counts, category) {
-  const count = counts.get(category) || 0;
-  if (!count) return '';
-  if (category === 'search') return `已探索 ${count} 次搜索`;
-  if (category === 'command') return `已运行 ${count} 条命令`;
-  if (category === 'edit') return `已编辑 ${count} 次`;
-  if (category === 'fetch') return `已抓取 ${count} 个网页`;
-  if (category === 'read') return `已读取 ${count} 个文件`;
-  if (category === 'image') return `已查看 ${count} 张图片`;
-  if (category === 'plan') return count === 1 ? '已更新计划' : `已更新 ${count} 次计划`;
-  if (category === 'memory') return `已访问 ${count} 次记忆`;
-  if (category === 'skill') return `已运行 ${count} 个技能`;
-  if (category === 'cron') return `已处理 ${count} 个定时任务`;
-  if (category === 'agent') return `已运行 ${count} 个代理`;
-  return `已调用 ${count} 个工具`;
-}
-
 function ToolDetail({ title, name, payload }) {
   const data = parseToolPayload(payload);
   const patchText = editPatchText(name, data);
@@ -3209,7 +2773,7 @@ function diffMarker(type) {
 }
 
 export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, usage, running = false }) {
-  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+  const renderStartedAt = renderCommitStart();
   const [open, setOpen] = useState(false);
   const display = useMemo(() => measureChatPerf('chat.tool_card.display', () => toolDisplay(kind, name, payload), {
     kind,
@@ -3217,15 +2781,13 @@ export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload
     payloadChars: typeof payload === 'string' ? payload.length : 0
   }), [kind, name, payload]);
   const hasMergedPayload = callPayload !== undefined || resultPayload !== undefined;
-  useLayoutEffect(() => {
-    recordChatPerf('chat.tool_card.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+  useRenderCommitPerf('chat.tool_card.render_commit', renderStartedAt, () => ({
       kind,
       name,
       open,
       running,
       payloadChars: typeof payload === 'string' ? payload.length : 0
-    });
-  });
+  }));
   return (
     <details
       className={`tool-inline-card ${kind}${running ? ' running' : ''}`}

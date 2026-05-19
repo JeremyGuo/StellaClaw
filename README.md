@@ -107,7 +107,7 @@ Implemented today:
 - StellaCodeX Electron desktop client with server profiles, conversation list, chat, paste/drop attachments, workspace browser, previews, HTML sandbox rendering, terminal dock, plan/overview panels, usage breakdown, configurable themes, and Git diff tool detail rendering.
 - Per-conversation model switching, sandbox switching, reasoning effort, remote workspace switching, status query, cancel, continue, foreground/background/subagent bindings, and managed-agent status.
 - `agent_server` subprocess boundary using stdin/stdout line-delimited JSON-RPC.
-- `SessionActor` control/data mailboxes, turn loop, tool batch executor, provider worker isolation, idle compaction, crash recovery, unfinished-turn continuation, and closed tool-call history repair.
+- `SessionActor` control/data mailboxes, turn loop, tool batch executor, provider worker isolation, crash recovery, unfinished-turn continuation, and closed tool-call history repair.
 - Codex subscription provider using the official websocket shape, including access token refresh, priority service tier, encrypted reasoning continuation, and streamed reasoning summary persistence.
 - OpenRouter chat-completions / responses providers, Claude provider, Brave Search provider, OpenAI-compatible image generation/editing, and provider-backed media helpers.
 - Model-aware multimodal input normalization with graceful downgrade to text/file context when a model cannot accept a file modality.

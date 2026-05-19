@@ -682,7 +682,6 @@ fn migrate_foreground_session(
         tool_remote_mode: tool_remote_mode.clone(),
         compression_threshold_tokens: config.session_defaults.compression_threshold_tokens,
         compression_retain_recent_tokens: config.session_defaults.compression_retain_recent_tokens,
-        idle_timeout_compact_enabled: session_model.idle_timeout_compact_enabled,
         image_tool_model: resolve_tool_model_target(
             "image_tool_model",
             config.session_defaults.image_tool_model.as_ref(),

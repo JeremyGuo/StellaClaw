@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import 'highlight.js/styles/github-dark.css';
 import './styles.css';
@@ -16,14 +16,13 @@ import {
   loadConversations,
   loadMessages,
   loadModels,
-  normalizeConversationSummary,
-  normalizeForegroundSessionSummary,
   postConversationMessage,
   renameConversation,
   renameForegroundSession,
   selectedForegroundSessionId
 } from './lib/api';
 import { ConversationBar } from './components/ConversationBar';
+import { AppErrorBoundary } from './components/AppErrorBoundary';
 import { WindowChrome } from './components/WindowChrome';
 import { ChatSessionPane } from './components/ChatSessionPane';
 import { OverviewPanel } from './components/OverviewPanel';
@@ -35,7 +34,7 @@ import { RenameConversationDialog, RenameSessionDialog } from './components/Rena
 import { ConversationPropertiesDialog } from './components/ConversationPropertiesDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatModel, statusUsageTotals } from './lib/format';
-import { attachmentName, fileExtension, fileNameFromPath, messageText } from './lib/fileUtils';
+import { attachmentName, fileExtension, fileNameFromPath } from './lib/fileUtils';
 import { addUsageTotals, firstMessageId, hasOlderMessages, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText } from './lib/messageUtils';
 import {
   applyStreamErrorToMessages,
@@ -46,7 +45,6 @@ import {
   streamAssistantDeltaPatch,
   streamErrorPatch,
   streamEventIndex,
-  streamEventType,
   streamMessageId,
   streamReasoningDeltaPatch,
   streamReasoningPartPatch,
@@ -65,156 +63,44 @@ import {
   summarizeMessagesTail,
   summarizePayload
 } from './lib/chatProtocolDiagnostics';
+import { recordChatPerf } from './lib/chatPerfMetrics';
 import { chatSessionStateIsActive, chatSnapshotState, isActiveSessionState, mergeProgressActivity, normalizeProgressFeedback, recentMessagePageParams } from './lib/chatSessionState';
 import { getChatRuntimeSnapshot, setChatRuntimeMessages, setChatRuntimeMessagesReady, setChatRuntimeSending } from './lib/chatRuntimeStore';
+import {
+  compactMessagesSummary,
+  patchActionSummary,
+  streamDeltaSummary,
+  streamUiCategory,
+  streamUiKind
+} from './lib/chatDebugSummaries';
+import { composerModeInfo, controlCommandActivity, slashCommandState } from './lib/composerCommands';
+import {
+  applyConversationStreamEvent,
+  createLocalForegroundSessionId,
+  hasUnreadConversation,
+  nextForegroundSessionName,
+  patchConversationForegroundSession
+} from './lib/conversationState';
+import {
+  attachmentCacheKey,
+  attachmentConversationFileTarget,
+  normalizeAbsolutePath,
+  workspaceTargetFromLocalLink
+} from './lib/localTargets';
+import { applyChromeMetrics } from './lib/chromeMetrics';
+import { fileTabSnapshot } from './lib/workspaceFileTabs';
 import { layoutSnapshotFromValues, useAppLayout } from './hooks/useAppLayout';
 import { revokeFilePreviewUrls, useWorkspaceState } from './hooks/useWorkspaceState';
 import { useWorkspaceWorkflow, workspaceFileImageDataUrl } from './hooks/useWorkspaceWorkflow';
 import { useWorkspaceTransfers } from './hooks/useWorkspaceTransfers';
 import { effectiveThemeMode, themeCssVariables } from './lib/theme';
-import { normalizeWorkspacePath, workspaceDisplayRoot, workspaceFileKind } from './lib/workspaceUtils';
+import { workspaceDisplayRoot, workspaceFileKind } from './lib/workspaceUtils';
 
 const MESSAGE_IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
 const MIN_DISPLAY_FONT_SIZE = 11;
 const MAX_DISPLAY_FONT_SIZE = 18;
 const MIN_UI_SCALE = 0.8;
 const MAX_UI_SCALE = 1.4;
-function setPxVariable(element, name, value) {
-  if (!Number.isFinite(value)) return;
-  element.style.setProperty(name, `${value}px`);
-}
-
-function safeDecodeUriComponent(value) {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function filePathFromFileUri(value) {
-  const raw = String(value || '').trim();
-  if (!/^file:/i.test(raw)) return '';
-  try {
-    return decodeURIComponent(new URL(raw).pathname);
-  } catch {
-    return '';
-  }
-}
-
-function normalizeAbsolutePath(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  return raw.replace(/\\/g, '/').replace(/\/+$/, '');
-}
-
-function isAbsolutePath(value) {
-  const raw = String(value || '').trim();
-  return raw.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw);
-}
-
-function pathRelativeToRoot(path, root) {
-  const absolutePath = normalizeAbsolutePath(path);
-  const absoluteRoot = normalizeAbsolutePath(root);
-  if (!absolutePath || !absoluteRoot) return '';
-  if (absolutePath === absoluteRoot) return '';
-  const prefix = `${absoluteRoot}/`;
-  if (!absolutePath.startsWith(prefix)) return '';
-  return normalizeWorkspacePath(absolutePath.slice(prefix.length));
-}
-
-function localAttachmentPath(attachment, rawUrl = '') {
-  const uriPath = filePathFromFileUri(rawUrl)
-    || filePathFromFileUri(attachment?.uri)
-    || filePathFromFileUri(attachment?.file_uri)
-    || filePathFromFileUri(attachment?.url);
-  if (uriPath) return uriPath;
-  return String(attachment?.path || attachment?.file_path || attachment?.src || '').trim();
-}
-
-function attachmentWorkspacePath(attachment, rawUrl, workspaceRoots = []) {
-  const explicit = String(
-    attachment?.workspace_path
-    || attachment?.relative_path
-    || attachment?.workspace_relative_path
-    || ''
-  ).trim();
-  if (explicit) return normalizeWorkspacePath(explicit);
-  const path = localAttachmentPath(attachment, rawUrl);
-  if (!path) return '';
-  if (!isAbsolutePath(path) && !/^file:/i.test(path) && !/^[a-z][a-z0-9+.-]*:/i.test(path)) {
-    return normalizeWorkspacePath(path);
-  }
-  for (const root of workspaceRoots) {
-    const relative = pathRelativeToRoot(path, root);
-    if (relative) return relative;
-  }
-  return '';
-}
-
-function conversationFileTargetFromPath(value) {
-  const path = normalizeAbsolutePath(value);
-  const match = path.match(/(?:^|\/)conversations\/([^/]+)\/(.+)$/);
-  if (!match) return null;
-  const conversationId = match[1];
-  const relativePath = normalizeWorkspacePath(match[2]);
-  if (!conversationId || !relativePath) return null;
-  return { conversationId, path: relativePath };
-}
-
-function workspaceTargetFromLocalLink(rawHref, fallbackConversationId, workspaceRoots = []) {
-  const raw = String(rawHref || '').trim();
-  if (!raw || raw.startsWith('#') || /^(?:https?:|mailto:|data:|blob:|javascript:)/i.test(raw)) {
-    return null;
-  }
-  const withoutHash = raw.split('#', 1)[0];
-  const withoutQuery = withoutHash.split('?', 1)[0];
-  const decoded = safeDecodeUriComponent(withoutQuery);
-  const localPath = filePathFromFileUri(decoded) || decoded;
-  if (!localPath) return null;
-  const explicitDirectory = /\/$/.test(localPath);
-  const absoluteTarget = conversationFileTargetFromPath(localPath);
-  if (absoluteTarget) {
-    return { ...absoluteTarget, explicitDirectory };
-  }
-  if (isAbsolutePath(localPath)) {
-    for (const root of workspaceRoots) {
-      if (normalizeAbsolutePath(localPath) === normalizeAbsolutePath(root)) {
-        return { conversationId: fallbackConversationId, path: '', explicitDirectory: true };
-      }
-      const relative = pathRelativeToRoot(localPath, root);
-      if (relative) {
-        return { conversationId: fallbackConversationId, path: relative, explicitDirectory };
-      }
-    }
-    return null;
-  }
-  if (/^[a-z][a-z0-9+.-]*:/i.test(localPath)) return null;
-  const path = normalizeWorkspacePath(localPath);
-  if (!path || !fallbackConversationId) return null;
-  return { conversationId: fallbackConversationId, path, explicitDirectory };
-}
-
-function attachmentConversationFileTarget(attachment, rawUrl, fallbackConversationId, workspaceRoots = []) {
-  const absoluteTarget = conversationFileTargetFromPath(localAttachmentPath(attachment, rawUrl));
-  if (absoluteTarget) return absoluteTarget;
-  const path = attachmentWorkspacePath(attachment, rawUrl, workspaceRoots);
-  if (!path || !fallbackConversationId) return null;
-  return { conversationId: fallbackConversationId, path };
-}
-
-function attachmentCacheKey(serverId, conversationId, path, attachment, rawUrl = '') {
-  return [
-    serverId,
-    conversationId,
-    path,
-    rawUrl,
-    attachment?.uri,
-    attachment?.file_uri,
-    attachment?.path,
-    attachment?.name
-  ].map((value) => String(value || '')).join('|');
-}
 
 function workspaceFileAttachmentDataUrl(path, file) {
   const imageUrl = workspaceFileImageDataUrl(path, file);
@@ -230,423 +116,6 @@ function workspaceFileAttachmentDataUrl(path, file) {
     return `data:text/html;charset=utf-8,${encodeURIComponent(String(data))}`;
   }
   return '';
-}
-
-function applyChromeMetrics(metrics) {
-  if (!metrics || typeof document === 'undefined') return;
-  const root = document.documentElement;
-  root.dataset.platform = metrics.platform || 'unknown';
-  setPxVariable(root, '--window-controls-left-safe-area', metrics.leftSafeArea);
-  setPxVariable(root, '--chrome-left-toolbar-offset', metrics.leftToolbarOffset);
-  setPxVariable(root, '--chrome-title-left-offset', metrics.titleLeftOffset);
-  setPxVariable(root, '--chrome-right-toolbar-offset', metrics.rightToolbarOffset);
-  setPxVariable(root, '--chrome-title-right-offset', metrics.titleRightOffset);
-  setPxVariable(root, '--chrome-title-right-offset-with-update', metrics.titleRightOffsetWithUpdate);
-}
-
-function composerModeInfo(status) {
-  const remote = String(status?.remote || status?.tool_remote_mode || '').trim();
-  const fixedRemote = remote.match(/^fixed ssh `([^`]*)` `([^`]*)`/);
-  if (fixedRemote) {
-    const host = fixedRemote[1];
-    const cwd = fixedRemote[2];
-    return {
-      label: '远程',
-      tone: 'remote',
-      title: cwd ? `工具运行在 ${host}:${cwd}` : `工具运行在 ${host}`
-    };
-  }
-  if (remote && remote !== 'selectable') {
-    return { label: '远程', tone: 'remote', title: remote };
-  }
-  return {
-    label: '本地',
-    tone: 'local',
-    title: '工具在当前 Stellaclaw 工作区执行'
-  };
-}
-
-function fileTabSnapshot(file) {
-  const path = normalizeWorkspacePath(file?.path);
-  if (!path) return null;
-  return {
-    path,
-    name: file?.name || fileNameFromPath(path),
-    kind: file?.kind || workspaceFileKind(path)
-  };
-}
-
-class AppErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { error: null };
-  }
-
-  static getDerivedStateFromError(error) {
-    return { error };
-  }
-
-  componentDidCatch(error, info) {
-    console.error('[StellaCodeX fatal render error]', error, info);
-  }
-
-  render() {
-    if (this.state.error) {
-      return (
-        <div className="app-fatal-error">
-          <strong>界面渲染失败</strong>
-          <span>{this.state.error?.message || '未知错误'}</span>
-          <button type="button" onClick={() => window.location.reload()}>
-            重新加载
-          </button>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
-function maxMessageId(...values) {
-  let best;
-  let bestOrder = -1;
-  for (const value of values) {
-    const order = messageOrderFromId(value);
-    if (order !== undefined && order >= bestOrder) {
-      best = String(value);
-      bestOrder = order;
-    }
-  }
-  return best;
-}
-
-function compareMessageIds(left, right) {
-  const leftOrder = messageOrderFromId(left);
-  const rightOrder = messageOrderFromId(right);
-  if (leftOrder === undefined && rightOrder === undefined) return 0;
-  if (leftOrder === undefined) return -1;
-  if (rightOrder === undefined) return 1;
-  return leftOrder === rightOrder ? 0 : leftOrder > rightOrder ? 1 : -1;
-}
-
-function mergeConversationSummary(existing, incoming) {
-  incoming = normalizeConversationSummary(incoming);
-  if (!existing) return incoming;
-  if (!incoming) return existing;
-  existing = normalizeConversationSummary(existing);
-  const incomingHasNewerMessage = compareMessageIds(incoming.last_message_id, existing.last_message_id) >= 0;
-  const seen = maxMessageId(existing.last_seen_message_id, incoming.last_seen_message_id);
-  const incomingSeenIsNewer = compareMessageIds(incoming?.last_seen_message_id, existing?.last_seen_message_id) >= 0;
-  const merged = {
-    ...existing,
-    ...incoming,
-    last_message_id: incomingHasNewerMessage
-      ? incoming.last_message_id ?? existing.last_message_id
-      : existing.last_message_id,
-    last_message_time: incomingHasNewerMessage
-      ? incoming.last_message_time ?? existing.last_message_time
-      : existing.last_message_time,
-    message_count: incomingHasNewerMessage
-      ? incoming.message_count ?? existing.message_count
-      : existing.message_count
-  };
-  if (!seen) return merged;
-  return {
-    ...merged,
-    last_seen_message_id: seen,
-    last_seen_at: incomingSeenIsNewer
-      ? incoming?.last_seen_at
-      : existing?.last_seen_at
-  };
-}
-
-function patchConversationForegroundSession(conversation, sessionId, patch) {
-  const targetSessionId = String(sessionId || 'main');
-  const sessions = foregroundSessions(conversation);
-  let found = false;
-  const nextSessions = sessions.map((session) => {
-    const currentId = String(session?.id || 'main');
-    if (currentId !== targetSessionId) return session;
-    found = true;
-    return normalizeForegroundSessionSummary({ ...session, ...patch, id: currentId }, conversation);
-  });
-  if (!found) {
-    nextSessions.push(normalizeForegroundSessionSummary({
-      id: targetSessionId,
-      session_id: targetSessionId,
-      is_main: targetSessionId === 'main',
-      ...patch
-    }, conversation));
-  }
-  return {
-    ...conversation,
-    ...(targetSessionId === 'main' ? patch : {}),
-    foreground_sessions: nextSessions
-  };
-}
-
-function nextForegroundSessionName(conversation) {
-  const existingNames = new Set(
-    foregroundSessions(conversation)
-      .map((session) => displayForegroundSessionName(session, conversation).trim())
-      .filter(Boolean)
-  );
-  let index = Math.max(2, existingNames.size + 1);
-  while (existingNames.has(`Session ${index}`)) index += 1;
-  return `Session ${index}`;
-}
-
-function createLocalForegroundSessionId(conversation) {
-  const existingIds = new Set(foregroundSessions(conversation).map((session) => String(session?.id || 'main')));
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const suffix = Math.random().toString(36).slice(2, 8);
-    const id = `session_${Date.now().toString(36)}_${suffix}`;
-    if (!existingIds.has(id)) return id;
-  }
-  return `session_${Date.now().toString(36)}`;
-}
-
-function applyConversationStreamEvent(current, payload) {
-  const type = String(payload?.type || '');
-  const eventType = type.startsWith('home.') ? type.slice('home.'.length) : type;
-  const sort = (list) => [...list].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
-  const upsert = (list, incoming) => {
-    if (!incoming?.conversation_id) return list;
-    const exists = list.some((conversation) => conversation.conversation_id === incoming.conversation_id);
-    if (!exists) return sort([...list, incoming]);
-    return list.map((conversation) => (
-      conversation.conversation_id === incoming.conversation_id
-        ? mergeConversationSummary(conversation, incoming)
-        : conversation
-    ));
-  };
-
-  if (eventType === 'snapshot' || eventType === 'conversation_snapshot') {
-    const existingById = new Map(current.map((conversation) => [conversation.conversation_id, conversation]));
-    return (payload.conversations || [])
-      .map((conversation) => mergeConversationSummary(existingById.get(conversation.conversation_id), conversation));
-  }
-
-  if (eventType === 'conversation_upserted') {
-    return upsert(current, payload.conversation);
-  }
-
-  if (eventType === 'conversation_updated' && payload.conversation_id) {
-    return current.map((conversation) => (
-      conversation.conversation_id === payload.conversation_id
-        ? normalizeConversationSummary({
-          ...conversation,
-          ...(payload.patch || {}),
-          conversation_id: payload.conversation_id
-        })
-        : conversation
-    ));
-  }
-
-  if (eventType === 'foreground_session_upserted' && payload.conversation_id && payload.foreground_session) {
-    const session = payload.foreground_session;
-    const sessionId = session.id || session.foreground_session_id || 'main';
-    return current.map((conversation) => (
-      conversation.conversation_id === payload.conversation_id
-        ? patchConversationForegroundSession(conversation, sessionId, session)
-        : conversation
-    ));
-  }
-
-  if (eventType === 'foreground_session_updated' && payload.conversation_id) {
-    const foregroundSessionId = payload.foreground_session_id || payload.session_id || 'main';
-    const patch = payload.patch?.foreground_session || payload.patch || {};
-    return current.map((conversation) => (
-      conversation.conversation_id === payload.conversation_id
-        ? patchConversationForegroundSession(conversation, foregroundSessionId, patch)
-        : conversation
-    ));
-  }
-
-  if (eventType === 'foreground_session_deleted' && payload.conversation_id) {
-    const foregroundSessionId = String(payload.foreground_session_id || 'main');
-    return current.map((conversation) => {
-      if (conversation.conversation_id !== payload.conversation_id) return conversation;
-      return {
-        ...conversation,
-        foreground_sessions: foregroundSessions(conversation)
-          .filter((session) => String(session?.id || 'main') !== foregroundSessionId)
-      };
-    });
-  }
-
-  if (eventType === 'conversation_deleted' && payload.conversation_id) {
-    return current.filter((conversation) => conversation.conversation_id !== payload.conversation_id);
-  }
-
-  if (eventType === 'conversation_processing' && payload.conversation_id) {
-    return current.map((conversation) => (
-      conversation.conversation_id === payload.conversation_id
-        ? {
-          ...conversation,
-          processing_state: payload.processing_state || conversation.processing_state,
-          running: Boolean(payload.running)
-        }
-        : conversation
-    ));
-  }
-
-  if (eventType === 'conversation_turn_completed' && payload.conversation_id) {
-    const incoming = {
-      ...(payload.conversation || {}),
-      conversation_id: payload.conversation_id,
-      platform_chat_id: payload.platform_chat_id || payload.conversation?.platform_chat_id,
-      processing_state: 'idle',
-      running: false,
-      message_count: payload.message_count ?? payload.conversation?.message_count,
-      last_message_id: payload.last_message_id ?? payload.conversation?.last_message_id,
-      last_message_time: payload.last_message_time ?? payload.conversation?.last_message_time,
-      last_seen_message_id: payload.last_seen_message_id ?? payload.conversation?.last_seen_message_id,
-      last_seen_at: payload.last_seen_at ?? payload.conversation?.last_seen_at
-    };
-    return upsert(current, incoming);
-  }
-
-  if (eventType === 'foreground_session_state_updated' && payload.conversation_id) {
-    const foregroundSessionId = payload.foreground_session_id || 'main';
-    const state = String(payload.state || 'idle').toLowerCase();
-    const running = state === 'running' || state === 'queued';
-    return current.map((conversation) => (
-      conversation.conversation_id === payload.conversation_id
-        ? patchConversationForegroundSession(conversation, foregroundSessionId, {
-          state,
-          active_turn_id: payload.active_turn_id || payload.activeTurnId || null,
-          last_error: payload.last_error || payload.lastError || null,
-          processing_state: state,
-          running
-        })
-        : conversation
-    ));
-  }
-
-  if (
-    (eventType === 'conversation_seen' || eventType === 'foreground_session_seen_state_updated')
-    && payload.conversation_id
-    && payload.seen
-  ) {
-    const foregroundSessionId = payload.foreground_session_id || 'main';
-    return current.map((conversation) => (
-      conversation.conversation_id === payload.conversation_id
-        ? patchConversationForegroundSession(conversation, foregroundSessionId, {
-          last_seen_message_id: payload.seen.last_seen_message_id,
-          last_seen_at: payload.seen.updated_at
-        })
-        : conversation
-    ));
-  }
-
-  return current;
-}
-
-function hasUnreadConversation(conversation) {
-  return foregroundSessions(conversation).some((session) => (
-    compareMessageIds(session?.last_message_id, session?.last_seen_message_id) > 0
-  ));
-}
-
-function slashCommandState(value) {
-  const command = String(value || '').trim();
-  const name = command.split(/\s+/, 1)[0]?.toLowerCase() || '';
-  if (name === '/model') {
-    return { control: true, name, title: '切换模型', detail: '模型切换命令已发送' };
-  }
-  if (name === '/remote') {
-    return { control: true, name, title: '切换远程模式', detail: '远程模式命令已发送' };
-  }
-  if (name === '/reasoning') {
-    return { control: true, name, title: '切换推理强度', detail: 'reasoning effort 命令已发送' };
-  }
-  if (name === '/idle_compact' || name === '/idle_timeout_compact') {
-    return { control: true, name, title: '切换空闲压缩', detail: 'idle compact 命令已发送' };
-  }
-  if (name === '/cancel') {
-    return { control: true, name, title: '取消执行', detail: '取消命令已发送' };
-  }
-  if (name === '/compact') {
-    return { control: true, name, title: '压缩上下文', detail: '压缩命令已发送' };
-  }
-  if (name === '/status') {
-    return { control: true, name, title: '读取状态', detail: '状态命令已发送' };
-  }
-  return { control: false, name, title: '等待响应', detail: '消息已送达，等待模型开始处理' };
-}
-
-function controlCommandActivity(command) {
-  const name = String(command || '').trim().split(/\s+/, 1)[0]?.toLowerCase() || '';
-  if (name === '/model') return '模型切换命令已发送';
-  if (name === '/reasoning') return 'Reasoning 命令已发送';
-  if (name === '/idle_compact' || name === '/idle_timeout_compact') return '空闲压缩设置命令已发送';
-  return 'Conversation 设置命令已发送';
-}
-
-function streamDeltaSummary(event) {
-  const delta = String(event?.delta ?? event?.text_delta ?? event?.textDelta ?? '');
-  return {
-    eventType: streamEventType(event),
-    message_id: event?.message_id || event?.messageId || event?.stream_id || event?.streamId,
-    item_id: event?.item_id || event?.itemId,
-    call_id: event?.call_id || event?.callId,
-    tool_name: event?.tool_name || event?.toolName,
-    in_message_index: event?.in_message_index ?? event?.inMessageIndex,
-    delta_len: delta.length,
-    delta: shortLogText(delta)
-  };
-}
-
-function patchActionSummary(type, patch) {
-  if (type === 'stream_assistant_message_delta') return 'append assistant delta';
-  if (type === 'stream_reasoning_summary_delta') return 'append reasoning delta';
-  if (type === 'stream_reasoning_summary_part_added') return 'start reasoning summary';
-  if (type === 'stream_tool_call_delta') return 'append tool call delta';
-  if (type === 'stream_tool_result_done') return 'append tool result / refresh message';
-  if (type === 'stream_turn_start' || type === 'turn_started') return 'turn started';
-  if (type === 'stream_turn_done' || type === 'turn_completed') return 'turn done / remove provisional stream';
-  if (type === 'stream_error') return 'drop current provisional stream';
-  return patch?.messages ? 'refresh messages' : 'update state';
-}
-
-function streamUiCategory(type, patch) {
-  if (!patch?.messages) return 'stream';
-  if (type === 'stream_turn_done' || type === 'turn_completed' || type === 'stream_error') {
-    return 'replace_ui_element';
-  }
-  return 'append_stream_to_ui';
-}
-
-function streamUiKind(category) {
-  if (category === 'append_stream_to_ui') return 'chat.append_stream_to_ui';
-  if (category === 'replace_ui_element') return 'chat.replace_ui_element';
-  return 'chat.stream';
-}
-
-function compactMessageSummary(message) {
-  if (!message) return null;
-  const text = messageText(message);
-  return {
-    id: message.id || message.message_id,
-    index: messageIndex(message),
-    role: message.role,
-    streaming: Boolean(message._streaming),
-    text_len: text.length,
-    text: shortLogText(text),
-    item_types: (Array.isArray(message.items) ? message.items : [])
-      .map((item) => item?.type)
-      .filter(Boolean)
-      .slice(0, 8)
-  };
-}
-
-function compactMessagesSummary(messages, count = 3) {
-  return (Array.isArray(messages) ? messages : []).slice(-count).map(compactMessageSummary);
-}
-
-function shortLogText(value, max = 120) {
-  const text = String(value || '').replace(/\s+/g, ' ').trim();
-  return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
 function App() {
@@ -679,16 +148,15 @@ function App() {
   const [propertiesModelsError, setPropertiesModelsError] = useState('');
   const [propertiesApplying, setPropertiesApplying] = useState(false);
   const [selectionReferences, setSelectionReferences] = useState([]);
-  const [appForeground, setAppForeground] = useState(() => (
-    typeof document === 'undefined'
-      ? true
-      : document.visibilityState === 'visible' && document.hasFocus()
-  ));
   const messagesRef = useRef(getChatRuntimeSnapshot().messages);
   const sendingRef = useRef(getChatRuntimeSnapshot().sending);
   const chatSessionStateRef = useRef({ state: 'idle' });
   const conversationsRef = useRef([]);
-  const appForegroundRef = useRef(appForeground);
+  const appForegroundRef = useRef(
+    typeof document === 'undefined'
+      ? true
+      : document.visibilityState === 'visible' && document.hasFocus()
+  );
   const settingsRef = useRef(null);
   const settingsSaveSeqRef = useRef(0);
   const selectedRef = useRef(null);
@@ -699,6 +167,7 @@ function App() {
   const restoringUiRef = useRef(false);
   const uiSaveTimerRef = useRef(null);
   const readSaveTimersRef = useRef(new Map());
+  const foregroundReadTimerRef = useRef(0);
   const selectedSessionId = selectedForegroundSessionId(selected);
   const selectedServerId = selected?.serverId || '';
   const selectedConversationId = selected?.conversationId || '';
@@ -726,10 +195,6 @@ function App() {
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
-
-  useEffect(() => {
-    appForegroundRef.current = appForeground;
-  }, [appForeground]);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -774,21 +239,6 @@ function App() {
     const scale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
     window.stellacode2?.setZoomFactor?.(scale).catch(() => {});
   }, [settings?.uiScale]);
-
-  useEffect(() => {
-    const updateForeground = () => {
-      setAppForeground(document.visibilityState === 'visible' && document.hasFocus());
-    };
-    updateForeground();
-    window.addEventListener('focus', updateForeground);
-    window.addEventListener('blur', updateForeground);
-    document.addEventListener('visibilitychange', updateForeground);
-    return () => {
-      window.removeEventListener('focus', updateForeground);
-      window.removeEventListener('blur', updateForeground);
-      document.removeEventListener('visibilitychange', updateForeground);
-    };
-  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings?.themeMode || 'system';
@@ -1069,7 +519,66 @@ function App() {
     readSaveTimersRef.current.set(key, timer);
   }, []);
 
+  const scheduleForegroundReadMark = useCallback(() => {
+    if (foregroundReadTimerRef.current) {
+      window.clearTimeout(foregroundReadTimerRef.current);
+      foregroundReadTimerRef.current = 0;
+    }
+    foregroundReadTimerRef.current = window.setTimeout(() => {
+      foregroundReadTimerRef.current = 0;
+      const currentSelected = selectedRef.current;
+      const sessionId = selectedForegroundSessionId(currentSelected);
+      const conversation = conversationsRef.current.find((item) => (
+        item.conversation_id === currentSelected?.conversationId
+      ));
+      const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
+      if (!currentSelected || !session?.last_message_id) return;
+      markConversationRead(
+        currentSelected.serverId,
+        currentSelected.conversationId,
+        sessionId,
+        session.last_message_id
+      );
+    }, 240);
+  }, [markConversationRead]);
+
+  useEffect(() => {
+    const updateForeground = () => {
+      const startedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+      const next = document.visibilityState === 'visible' && document.hasFocus();
+      const previous = appForegroundRef.current;
+      appForegroundRef.current = next;
+      recordChatPerf('app.foreground_event', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - startedAt, {
+        foreground: next,
+        previous
+      });
+      if (next && !previous) {
+        window.requestAnimationFrame(() => {
+          recordChatPerf('app.foreground_first_frame', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - startedAt);
+        });
+        scheduleForegroundReadMark();
+      }
+    };
+    updateForeground();
+    window.addEventListener('focus', updateForeground);
+    window.addEventListener('blur', updateForeground);
+    document.addEventListener('visibilitychange', updateForeground);
+    return () => {
+      window.removeEventListener('focus', updateForeground);
+      window.removeEventListener('blur', updateForeground);
+      document.removeEventListener('visibilitychange', updateForeground);
+      if (foregroundReadTimerRef.current) {
+        window.clearTimeout(foregroundReadTimerRef.current);
+        foregroundReadTimerRef.current = 0;
+      }
+    };
+  }, [scheduleForegroundReadMark]);
+
   useEffect(() => () => {
+    if (foregroundReadTimerRef.current) {
+      window.clearTimeout(foregroundReadTimerRef.current);
+      foregroundReadTimerRef.current = 0;
+    }
     window.clearTimeout(uiSaveTimerRef.current);
     for (const timer of readSaveTimersRef.current.values()) {
       window.clearTimeout(timer);
@@ -1165,12 +674,6 @@ function App() {
       if (streamSocket && streamSocket.readyState <= WebSocket.OPEN) streamSocket.close();
     };
   }, [activeServerId, settingsReady]);
-
-  useEffect(() => {
-    if (!appForeground) return;
-    if (!selectedKey || !activeForegroundSession?.last_message_id) return;
-    markConversationRead(selected.serverId, selected.conversationId, selectedSessionId, activeForegroundSession.last_message_id);
-  }, [appForeground, selected, selectedKey, selectedSessionId, activeForegroundSession?.last_message_id, markConversationRead]);
 
   const saveSettingsFromDialog = useCallback(async (next) => {
     setSettingsSaving(true);
@@ -2218,12 +1721,6 @@ function App() {
     postConversationControlCommand(conversation, `/reasoning ${value}`);
   }, [postConversationControlCommand]);
 
-  const switchConversationIdleCompact = useCallback((conversation, value) => {
-    const normalized = String(value || '').trim();
-    if (!normalized) return;
-    postConversationControlCommand(conversation, `/idle_compact ${normalized}`);
-  }, [postConversationControlCommand]);
-
   const sendMessage = useCallback(async (text, files = [], selections = []) => {
     const value = String(text || '').trim();
     const outgoingFiles = Array.isArray(files) ? files : [];
@@ -2552,7 +2049,6 @@ function App() {
         onLoadModels={loadPropertiesModels}
         onSwitchModel={switchConversationModel}
         onSwitchReasoning={switchConversationReasoning}
-        onSwitchIdleCompact={switchConversationIdleCompact}
       />
       <SettingsDialog
         open={settingsOpen}

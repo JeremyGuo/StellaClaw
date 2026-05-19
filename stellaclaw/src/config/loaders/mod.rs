@@ -7,9 +7,9 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::config::{
     StellaclawConfig, CONFIG_VERSION_0_10, CONFIG_VERSION_0_11, CONFIG_VERSION_0_12,
-    CONFIG_VERSION_0_2, CONFIG_VERSION_0_3, CONFIG_VERSION_0_4, CONFIG_VERSION_0_5,
-    CONFIG_VERSION_0_6, CONFIG_VERSION_0_7, CONFIG_VERSION_0_8, CONFIG_VERSION_0_9,
-    LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION,
+    CONFIG_VERSION_0_13, CONFIG_VERSION_0_2, CONFIG_VERSION_0_3, CONFIG_VERSION_0_4,
+    CONFIG_VERSION_0_5, CONFIG_VERSION_0_6, CONFIG_VERSION_0_7, CONFIG_VERSION_0_8,
+    CONFIG_VERSION_0_9, LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION,
 };
 
 mod partyclaw;
@@ -18,6 +18,7 @@ mod v0_10;
 mod v0_11;
 mod v0_12;
 mod v0_13;
+mod v0_14;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -46,7 +47,8 @@ pub fn load_config_file_and_upgrade(path: &Path) -> Result<(StellaclawConfig, bo
         CONFIG_VERSION_0_10 => v0_10::load(&raw, path)?,
         CONFIG_VERSION_0_11 => v0_11::load(&raw, path)?,
         CONFIG_VERSION_0_12 => v0_12::load(&raw, path)?,
-        LATEST_CONFIG_VERSION => v0_13::load(&raw, path)?,
+        CONFIG_VERSION_0_13 => v0_13::load(&raw, path)?,
+        LATEST_CONFIG_VERSION => v0_14::load(&raw, path)?,
         PARTYCLAW_LATEST_CONFIG_VERSION => partyclaw::load_and_upgrade(&raw, path)?,
         other => return Err(anyhow!("unsupported config version '{}'", other)),
     };

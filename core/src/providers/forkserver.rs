@@ -579,7 +579,10 @@ mod unix_impl {
             }
 
             fail_all_pending(&pending, "provider request runtime closed".to_string());
-            fail_all_worker_pending(&pending_workers, "provider request runtime closed".to_string());
+            fail_all_worker_pending(
+                &pending_workers,
+                "provider request runtime closed".to_string(),
+            );
             fail_all_compact_pending(
                 &pending_compact,
                 "provider request runtime closed".to_string(),
@@ -789,7 +792,9 @@ mod unix_impl {
                 libc::close(command_pipe[0]);
                 libc::close(command_pipe[1]);
             }
-            return Err(format!("failed to create provider worker result pipe: {error}"));
+            return Err(format!(
+                "failed to create provider worker result pipe: {error}"
+            ));
         }
 
         let pid = unsafe { libc::fork() };

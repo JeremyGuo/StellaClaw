@@ -38,7 +38,6 @@ use super::{
 };
 
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
-const IDLE_COMPACTION_MIN_RATIO: f64 = 0.3;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
 const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 10;
 const SESSION_PLAN_CONTEXT_MARKER: &str = "[StellaClaw Current Task Plan]";
@@ -83,7 +82,6 @@ pub struct SessionActor {
     last_provider_request_started_at: Option<Instant>,
     last_agent_returned_at: Option<Instant>,
     last_completed_turn_number: u64,
-    last_idle_compaction_turn_number: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +264,6 @@ impl SessionActor {
             last_provider_request_started_at: None,
             last_agent_returned_at: None,
             last_completed_turn_number: 0,
-            last_idle_compaction_turn_number: 0,
         }
     }
 
@@ -369,63 +366,26 @@ impl SessionActor {
             return self.process_ready_step();
         }
 
-        if let Some(delay) = self.idle_compaction_delay() {
-            if delay.is_zero() {
-                if self.try_run_idle_compaction()? {
-                    return Ok(SessionActorStep::ProcessedIdleCompaction);
-                }
-            } else {
-                let idle_timer = crossbeam_channel::after(delay);
-                select! {
-                recv(self.request_rx) -> request => {
-                    let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
-                    self.enqueue_request(request);
-                }
-                recv(self.tool_completion_rx) -> completion => {
-                    let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
-                    self.pending_tool_completions.push_back(completion);
-                }
-                recv(self.tool_progress_rx) -> progress => {
-                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
-                    self.pending_tool_progress.push_back(progress);
-                }
-                recv(self.provider_event_rx) -> event => {
-                    let event = event.map_err(|_| {
-                        SessionActorError::from_provider_error(ProviderError::Subprocess(
-                            "provider event channel disconnected".to_string(),
-                        ))
-                    })?;
-                    self.pending_provider_events.push_back(event);
-                }
-                recv(idle_timer) -> _ => {
-                    if self.try_run_idle_compaction()? {
-                        return Ok(SessionActorStep::ProcessedIdleCompaction);
-                    }
-                }
-                }
+        select! {
+            recv(self.request_rx) -> request => {
+                let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
+                self.enqueue_request(request);
             }
-        } else {
-            select! {
-                recv(self.request_rx) -> request => {
-                    let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
-                    self.enqueue_request(request);
-                }
-                recv(self.tool_completion_rx) -> completion => {
-                    let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
-                    self.pending_tool_completions.push_back(completion);
-                }
-                recv(self.tool_progress_rx) -> progress => {
-                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
-                    self.pending_tool_progress.push_back(progress);
-                }
-                recv(self.provider_event_rx) -> event => {
-                    let event = event.map_err(|_| {
-                        SessionActorError::from_provider_error(ProviderError::Subprocess(
-                            "provider event channel disconnected".to_string(),
-                        ))
-                    })?;
-                    self.pending_provider_events.push_back(event);
-                }
+            recv(self.tool_completion_rx) -> completion => {
+                let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
+                self.pending_tool_completions.push_back(completion);
+            }
+            recv(self.tool_progress_rx) -> progress => {
+                let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
+                self.pending_tool_progress.push_back(progress);
+            }
+            recv(self.provider_event_rx) -> event => {
+                let event = event.map_err(|_| {
+                    SessionActorError::from_provider_error(ProviderError::Subprocess(
+                        "provider event channel disconnected".to_string(),
+                    ))
+                })?;
+                self.pending_provider_events.push_back(event);
             }
         }
         self.process_ready_step()
@@ -2520,133 +2480,6 @@ impl SessionActor {
         self.last_completed_turn_number = self.last_completed_turn_number.max(turn_number);
     }
 
-    fn idle_compaction_delay(&self) -> Option<Duration> {
-        let initial = self.initial.as_ref()?;
-        if !initial.idle_timeout_compact_enabled {
-            return None;
-        }
-        self.compressor.as_ref()?;
-        if self.shutdown
-            || self.active_provider_request.is_some()
-            || self.active_tool_batch.is_some()
-            || !self.pending_control.is_empty()
-            || !self.pending_data.is_empty()
-            || !self.pending_provider_events.is_empty()
-            || !self.pending_tool_completions.is_empty()
-            || !self.pending_tool_progress.is_empty()
-            || self.last_completed_turn_number <= self.last_idle_compaction_turn_number
-            || count_unclosed_tool_calls(&self.history) > 0
-        {
-            return None;
-        }
-
-        let cache_touched_at = self
-            .last_provider_request_started_at
-            .or(self.last_agent_returned_at)?;
-        let threshold = idle_compaction_threshold(&self.model_config)?;
-        let elapsed = cache_touched_at.elapsed();
-        Some(threshold.saturating_sub(elapsed))
-    }
-
-    fn try_run_idle_compaction(&mut self) -> Result<bool, SessionActorError> {
-        if !matches!(self.idle_compaction_delay(), Some(delay) if delay.is_zero()) {
-            return Ok(false);
-        }
-
-        let Some(compressor) = self.compressor.clone() else {
-            return Ok(false);
-        };
-
-        self.log_info(
-            "idle_compaction_started",
-            serde_json::json!({
-                "history_len": self.history.len(),
-                "all_messages_len": self.all_messages.len(),
-                "last_completed_turn_number": self.last_completed_turn_number,
-            }),
-        );
-
-        let threshold_tokens =
-            idle_compaction_token_threshold(&self.model_config, self.initial.as_ref());
-        let system_prompt = self.system_prompt_for_current_initial()?;
-        let mut request_too_large_attempts = 0usize;
-        let report = loop {
-            let compression_context = if compressor
-                .would_compact_with_threshold(&self.history, threshold_tokens)
-                .unwrap_or(false)
-            {
-                self.compression_memory_context(&self.history, None)
-            } else {
-                None
-            };
-            match compressor.compact_if_needed_with_threshold_and_tools(
-                &mut self.history,
-                self.provider.as_ref(),
-                &self.model_config,
-                system_prompt.as_deref(),
-                threshold_tokens,
-                compression_context.as_deref(),
-                self.tool_catalog
-                    .iter()
-                    .map(|(_, tool)| tool)
-                    .collect::<Vec<_>>(),
-            ) {
-                Ok(report) => break Ok(report),
-                Err(error)
-                    if compression_error_is_request_too_large(&error)
-                        && request_too_large_attempts < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
-                {
-                    request_too_large_attempts += 1;
-                    if self.prune_history_after_request_too_large(
-                        "idle_compaction",
-                        None,
-                        None,
-                        &error.to_string(),
-                    )? {
-                        continue;
-                    }
-                    break Err(error);
-                }
-                Err(error) => break Err(error),
-            }
-        };
-
-        match report {
-            Ok(report) => {
-                self.log_compression_report("idle", &report);
-                if report.compressed {
-                    self.runtime_metadata_state
-                        .promote_notified_components_to_system_snapshot();
-                    self.persist_state_if_history_closed("idle_compaction")?;
-                }
-                self.last_idle_compaction_turn_number = self.last_completed_turn_number;
-                self.log_info(
-                    "idle_compaction_finished",
-                    serde_json::json!({
-                        "compressed": report.compressed,
-                        "estimated_tokens_before": report.estimated_tokens_before,
-                        "estimated_tokens_after": report.estimated_tokens_after,
-                        "threshold_tokens": report.threshold_tokens,
-                        "history_len": self.history.len(),
-                    }),
-                );
-                Ok(report.compressed)
-            }
-            Err(error) => {
-                self.last_idle_compaction_turn_number = self.last_completed_turn_number;
-                self.log_error(
-                    "idle_compaction_failed",
-                    serde_json::json!({"error": error.to_string()}),
-                );
-                self.emit_compact_failed(
-                    "idle_compaction",
-                    format!("idle context compression failed: {error}"),
-                )?;
-                Ok(false)
-            }
-        }
-    }
-
     fn prune_history_after_request_too_large(
         &mut self,
         phase: &str,
@@ -2881,7 +2714,6 @@ pub enum SessionActorStep {
     Idle,
     ProcessedControl,
     ProcessedData,
-    ProcessedIdleCompaction,
     WaitingProviderRequest,
     WaitingToolBatch,
     Shutdown,
@@ -3213,27 +3045,6 @@ fn default_retain_recent_tokens(threshold_tokens: u64) -> u64 {
     ((threshold_tokens.saturating_mul(DEFAULT_RETAIN_RECENT_PERCENT)) / 100)
         .max(512)
         .min(threshold_tokens - 1)
-}
-
-fn idle_compaction_threshold(model_config: &ModelConfig) -> Option<Duration> {
-    const CACHE_EXPIRY_LEAD_TIME_SECS: u64 = 30;
-    if model_config.cache_timeout <= CACHE_EXPIRY_LEAD_TIME_SECS {
-        return None;
-    }
-    Some(Duration::from_secs(
-        model_config.cache_timeout - CACHE_EXPIRY_LEAD_TIME_SECS,
-    ))
-}
-
-fn idle_compaction_token_threshold(
-    model_config: &ModelConfig,
-    initial: Option<&SessionInitial>,
-) -> u64 {
-    let idle_threshold = model_context_ratio_threshold(model_config, IDLE_COMPACTION_MIN_RATIO);
-    initial
-        .and_then(|initial| initial.compression_threshold_tokens)
-        .map(|active_threshold| active_threshold.min(idle_threshold).max(1))
-        .unwrap_or(idle_threshold)
 }
 
 fn collect_tool_calls(message: &ChatMessage) -> Vec<super::ToolCallItem> {
@@ -4351,7 +4162,6 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
-            idle_timeout_compact_enabled: true,
             conn_timeout: 10,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -4451,33 +4261,6 @@ mod tests {
         assert_eq!(default_retain_recent_tokens(200_000), 20_000);
         assert_eq!(default_retain_recent_tokens(1_000), 512);
         assert_eq!(default_retain_recent_tokens(2), 1);
-    }
-
-    #[test]
-    fn idle_compaction_threshold_uses_lower_context_ratio() {
-        let mut model_config = test_model_config();
-        model_config.token_max_context = 200_000;
-        let mut initial = SessionInitial::new(
-            test_session_id("session_idle_compression_threshold"),
-            super::super::SessionType::Foreground,
-        );
-
-        assert_eq!(
-            idle_compaction_token_threshold(&model_config, Some(&initial)),
-            60_000
-        );
-
-        initial.compression_threshold_tokens = Some(235_929);
-        assert_eq!(
-            idle_compaction_token_threshold(&model_config, Some(&initial)),
-            60_000
-        );
-
-        initial.compression_threshold_tokens = Some(40_000);
-        assert_eq!(
-            idle_compaction_token_threshold(&model_config, Some(&initial)),
-            40_000
-        );
     }
 
     #[test]
@@ -6515,139 +6298,6 @@ mod tests {
             )
         });
         assert!(failed);
-        assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
-
-        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
-    }
-
-    #[test]
-    fn idle_compaction_runs_after_cache_lead_time() {
-        let _cwd = temp_cwd("actor-idle-compression");
-        let (inbox, mailbox) = test_inbox();
-        let mut initial = SessionInitial::new(
-            test_session_id("session_idle_compression"),
-            super::super::SessionType::Foreground,
-        );
-        initial.compression_threshold_tokens = Some(1_000);
-        initial.compression_retain_recent_tokens = Some(12);
-        mailbox.append(
-            SessionMailboxKind::Control,
-            SessionRequest::Initial { initial },
-        );
-        mailbox.append(
-            SessionMailboxKind::Data,
-            SessionRequest::EnqueueUserMessage {
-                message: ChatMessage::new(
-                    ChatRole::User,
-                    vec![ChatMessageItem::Context(ContextItem {
-                        text: "old ".repeat(50),
-                    })],
-                ),
-            },
-        );
-        let events = Arc::new(MemoryEventSink::default());
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            ChatMessage::new(
-                ChatRole::Assistant,
-                vec![ChatMessageItem::Context(ContextItem {
-                    text: "first final".to_string(),
-                })],
-            ),
-            ChatMessage::new(
-                ChatRole::Assistant,
-                vec![ChatMessageItem::Context(ContextItem {
-                    text: compression_response("summary"),
-                })],
-            ),
-        ]));
-        let tools = Arc::new(EchoToolExecutor::new());
-        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
-        let (mut model_config, tokenizer_dir) = test_model_config_with_tokenizer();
-        model_config.token_max_context = 64;
-        model_config.cache_timeout = 300;
-        let mut actor = SessionActor::new(
-            model_config,
-            provider.clone(),
-            tools,
-            inbox,
-            events,
-            catalog,
-        );
-
-        actor.run_until_idle(4).expect("actor should run");
-        assert_eq!(actor.history().len(), 2);
-        assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
-
-        actor.last_provider_request_started_at = Some(Instant::now() - Duration::from_secs(271));
-        actor.last_agent_returned_at = Some(Instant::now());
-        let compacted = actor
-            .try_run_idle_compaction()
-            .expect("idle compaction should not fail");
-
-        assert!(compacted);
-        assert!(message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
-        assert!(message_text_for_test(&actor.history()[0]).contains("summary"));
-        assert_eq!(provider.seen_requests.lock().unwrap().len(), 2);
-
-        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
-    }
-
-    #[test]
-    fn idle_compaction_respects_session_initial_switch() {
-        let _cwd = temp_cwd("actor-idle-compression-disabled");
-        let (inbox, mailbox) = test_inbox();
-        let mut initial = SessionInitial::new(
-            test_session_id("session_idle_compression_disabled"),
-            super::super::SessionType::Foreground,
-        );
-        initial.compression_threshold_tokens = Some(1_000);
-        initial.compression_retain_recent_tokens = Some(12);
-        initial.idle_timeout_compact_enabled = false;
-        mailbox.append(
-            SessionMailboxKind::Control,
-            SessionRequest::Initial { initial },
-        );
-        mailbox.append(
-            SessionMailboxKind::Data,
-            SessionRequest::EnqueueUserMessage {
-                message: ChatMessage::new(
-                    ChatRole::User,
-                    vec![ChatMessageItem::Context(ContextItem {
-                        text: "old ".repeat(50),
-                    })],
-                ),
-            },
-        );
-        let events = Arc::new(MemoryEventSink::default());
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            ChatMessage::new(
-                ChatRole::Assistant,
-                vec![ChatMessageItem::Context(ContextItem {
-                    text: "first final".to_string(),
-                })],
-            ),
-            ChatMessage::new(
-                ChatRole::Assistant,
-                vec![ChatMessageItem::Context(ContextItem {
-                    text: compression_response("summary"),
-                })],
-            ),
-        ]));
-        let tools = Arc::new(EchoToolExecutor::new());
-        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
-        let (mut model_config, tokenizer_dir) = test_model_config_with_tokenizer();
-        model_config.token_max_context = 64;
-        model_config.cache_timeout = 300;
-        let mut actor = SessionActor::new(model_config, provider, tools, inbox, events, catalog);
-
-        actor.run_until_idle(4).expect("actor should run");
-        actor.last_provider_request_started_at = Some(Instant::now() - Duration::from_secs(271));
-        actor.last_agent_returned_at = Some(Instant::now());
-        let compacted = actor
-            .try_run_idle_compaction()
-            .expect("idle compaction should not fail");
-
-        assert!(!compacted);
         assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
 
         fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");

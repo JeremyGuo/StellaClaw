@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_23};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_23, WORKDIR_VERSION_0_24};
 use crate::config::StellaclawConfig;
 
 pub struct ChatMessageCompactionItemUpgrade;
@@ -13,7 +13,7 @@ impl WorkdirUpgrader for ChatMessageCompactionItemUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_24
     }
 
     fn upgrade(&self, _workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

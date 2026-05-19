@@ -11,12 +11,6 @@ const REASONING_EFFORTS = [
   { value: 'default', label: 'Default' }
 ];
 
-const IDLE_COMPACT_OPTIONS = [
-  { value: 'default', label: '继承模型默认' },
-  { value: 'on', label: '开启' },
-  { value: 'off', label: '关闭' }
-];
-
 export function ConversationPropertiesDialog({
   open,
   conversation,
@@ -28,16 +22,13 @@ export function ConversationPropertiesDialog({
   onOpenChange,
   onLoadModels,
   onSwitchModel,
-  onSwitchReasoning,
-  onSwitchIdleCompact
+  onSwitchReasoning
 }) {
   const [selectedModel, setSelectedModel] = useState('');
   const [selectedReasoning, setSelectedReasoning] = useState('default');
-  const [selectedIdleCompact, setSelectedIdleCompact] = useState('default');
   const sessions = useMemo(() => foregroundSessions(conversation || {}), [conversation]);
   const currentModel = formatModel(conversation || {}, status || {}) || 'pending';
   const currentReasoning = String(conversation?.reasoning || status?.reasoning || 'default');
-  const currentIdleCompact = idleCompactState(conversation, status);
   const title = displayConversationName(conversation || {});
   const stats = useMemo(() => conversationStats(conversation, sessions), [conversation, sessions]);
 
@@ -45,9 +36,8 @@ export function ConversationPropertiesDialog({
     if (!open) return;
     setSelectedModel('');
     setSelectedReasoning(currentReasoning || 'default');
-    setSelectedIdleCompact(currentIdleCompact.override);
     onLoadModels?.();
-  }, [currentIdleCompact.override, currentReasoning, onLoadModels, open]);
+  }, [currentReasoning, onLoadModels, open]);
 
   const applyModel = (event) => {
     event.preventDefault();
@@ -59,12 +49,6 @@ export function ConversationPropertiesDialog({
     event.preventDefault();
     if (!selectedReasoning) return;
     onSwitchReasoning?.(conversation, selectedReasoning);
-  };
-
-  const applyIdleCompact = (event) => {
-    event.preventDefault();
-    if (!selectedIdleCompact) return;
-    onSwitchIdleCompact?.(conversation, selectedIdleCompact);
   };
 
   return (
@@ -96,7 +80,6 @@ export function ConversationPropertiesDialog({
               <dl className="properties-grid">
                 <dt>Model</dt><dd>{currentModel}</dd>
                 <dt>Reasoning</dt><dd>{currentReasoning || 'default'}</dd>
-                <dt>Idle compact</dt><dd>{currentIdleCompact.summary}</dd>
                 <dt>Remote</dt><dd>{conversation?.remote || status?.remote || 'local'}</dd>
                 <dt>Sandbox</dt><dd>{conversation?.sandbox || status?.sandbox || '-'}</dd>
                 <dt>Workspace</dt><dd title={conversation?.workspace || status?.workspace}>{conversation?.workspace || status?.workspace || '-'}</dd>
@@ -143,52 +126,11 @@ export function ConversationPropertiesDialog({
                 <button className="primary-button" type="submit" disabled={!selectedReasoning || applying}>应用</button>
               </form>
             </section>
-
-            <section className="properties-section">
-              <h3>Idle timeout compact</h3>
-              <form className="properties-action-row" onSubmit={applyIdleCompact}>
-                <select value={selectedIdleCompact} onChange={(event) => setSelectedIdleCompact(event.target.value)} disabled={applying}>
-                  {IDLE_COMPACT_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </select>
-                <button className="primary-button" type="submit" disabled={!selectedIdleCompact || applying}>应用</button>
-              </form>
-              <p className="properties-help">
-                当前{currentIdleCompact.enabled ? '开启' : '关闭'}，{currentIdleCompact.sourceLabel}。
-              </p>
-            </section>
           </div>
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
   );
-}
-
-function idleCompactState(conversation, status) {
-  const overrideRaw = conversation?.idle_timeout_compact_override
-    ?? conversation?.runtime_config?.idle_timeout_compact_override
-    ?? conversation?.runtime_config?.idle_timeout_compact_enabled
-    ?? status?.idle_timeout_compact_override
-    ?? status?.runtime_config?.idle_timeout_compact_override
-    ?? status?.runtime_config?.idle_timeout_compact_enabled
-    ?? null;
-  const effectiveRaw = conversation?.idle_timeout_compact_enabled
-    ?? conversation?.runtime_config?.idle_timeout_compact_effective
-    ?? conversation?.runtime_config?.idle_timeout_compact_enabled
-    ?? status?.idle_timeout_compact_enabled
-    ?? status?.runtime_config?.idle_timeout_compact_effective
-    ?? status?.runtime_config?.idle_timeout_compact_enabled
-    ?? true;
-  const override = overrideRaw === true ? 'on' : overrideRaw === false ? 'off' : 'default';
-  const enabled = effectiveRaw !== false;
-  const sourceLabel = override === 'default' ? '继承模型默认值' : 'Conversation 覆盖';
-  return {
-    override,
-    enabled,
-    sourceLabel,
-    summary: `${enabled ? '开启' : '关闭'} · ${sourceLabel}`
-  };
 }
 
 function conversationStats(conversation, sessions) {
