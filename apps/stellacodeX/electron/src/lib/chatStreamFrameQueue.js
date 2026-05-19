@@ -113,7 +113,8 @@ export function createChatStreamFrameQueue({
     if (pending.size === 0) return;
     const entries = [];
     for (const [key, entry] of pending.entries()) {
-      const chunk = takeEntryText(entry, targetCharsPerFrame);
+      const budget = entry.kind === 'tool' ? Number.MAX_SAFE_INTEGER : targetCharsPerFrame;
+      const chunk = takeEntryText(entry, budget);
       if (chunk.text) {
         entries.push({
           kind: entry.kind,

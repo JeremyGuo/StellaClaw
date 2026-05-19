@@ -1880,7 +1880,7 @@ function App() {
             );
           } else if (kind === 'tool') {
             applyStreamPatch(
-              streamToolCallDeltaPatch(messagesRef.current, event, key, streamBuffers),
+              streamToolCallDeltaPatch(messagesRef.current, event),
               event,
               'stream_tool_call_delta'
             );
@@ -1950,11 +1950,7 @@ function App() {
 
       if (type === 'stream_tool_call_delta') {
         if (!acceptStreamEvent(event)) return;
-        applyStreamPatch(
-          streamToolCallDeltaPatch(messagesRef.current, event, key, streamBuffers),
-          event,
-          type
-        );
+        streamFrameQueue?.enqueue('tool', event);
         return;
       }
 

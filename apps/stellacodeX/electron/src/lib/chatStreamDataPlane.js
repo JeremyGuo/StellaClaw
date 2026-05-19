@@ -752,10 +752,9 @@ export function streamReasoningDeltaPatch(currentMessages, event, scopeKey, stre
   };
 }
 
-export function streamToolCallDeltaPatch(currentMessages, event, scopeKey, streamBuffers) {
+export function streamToolCallDeltaPatch(currentMessages, event) {
   const itemId = streamItemId(event);
-  const bufferKey = `${scopeKey}:tool:${itemId}`;
-  const text = streamBuffers.append(bufferKey, streamDeltaText(event));
+  const text = streamDeltaText(event);
   return {
     chatState: { state: 'running', currentTurnState: event },
     messages: appendStreamToolCallDelta(currentMessages, event),

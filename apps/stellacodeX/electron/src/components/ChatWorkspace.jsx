@@ -1369,7 +1369,55 @@ export function AssistantTurn({ entry, active = false, elapsedNowMs, onOpenAttac
   );
 }
 
-const MemoAssistantTurn = memo(AssistantTurn);
+const MemoAssistantTurn = memo(AssistantTurn, (previous, next) => (
+  previous.active === next.active
+  && previous.elapsedNowMs === next.elapsedNowMs
+  && previous.onOpenAttachment === next.onOpenAttachment
+  && previous.onDownloadAttachment === next.onDownloadAttachment
+  && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
+  && previous.onOpenLocalLink === next.onOpenLocalLink
+  && sameAssistantTurnEntry(previous.entry, next.entry)
+));
+
+function sameAssistantTurnEntry(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.type === right.type
+    && left.id === right.id
+    && sameMessageProjection(left.finalMessage, right.finalMessage)
+    && sameToolGroup(left.processGroup, right.processGroup);
+}
+
+function sameMessageProjection(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return String(left.id ?? left.message_id ?? '') === String(right.id ?? right.message_id ?? '')
+    && left.index === right.index
+    && left.role === right.role
+    && left.message_time === right.message_time
+    && left.text === right.text
+    && left.preview === right.preview
+    && left.content === right.content
+    && left.text_with_attachment_markers === right.text_with_attachment_markers
+    && left.items === right.items
+    && left.attachments === right.attachments
+    && left.files === right.files
+    && Boolean(left._forceSeparate) === Boolean(right._forceSeparate)
+    && Boolean(left._streaming) === Boolean(right._streaming);
+}
+
+function sameToolGroup(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  if (left.id !== right.id || left.nextMessage !== right.nextMessage) return false;
+  const leftMessages = Array.isArray(left.messages) ? left.messages : [];
+  const rightMessages = Array.isArray(right.messages) ? right.messages : [];
+  if (leftMessages.length !== rightMessages.length) return false;
+  for (let index = 0; index < leftMessages.length; index += 1) {
+    if (leftMessages[index] !== rightMessages[index]) return false;
+  }
+  return true;
+}
 
 export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
   const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
@@ -1447,7 +1495,7 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
             if (block.type === 'tools') {
               const cardsComplete = toolCardsAreComplete(block.cards);
               return (
-                <ToolProcessSegment
+                <MemoToolProcessSegment
                   key={block.id}
                   block={block}
                   complete={complete || cardsComplete}
@@ -1457,7 +1505,7 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
             }
             return block.kind === 'reasoning'
               ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
-              : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />;
+              : <MemoMarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />;
           })}
           {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在思考" />}
         </div>
@@ -1466,7 +1514,11 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
   );
 }
 
-const MemoToolProcessGroup = memo(ToolProcessGroup);
+const MemoToolProcessGroup = memo(ToolProcessGroup, (previous, next) => (
+  previous.active === next.active
+  && previous.elapsedNowMs === next.elapsedNowMs
+  && sameToolGroup(previous.group, next.group)
+));
 
 function useToolRoundElapsed(messages, nextMessage, complete, nowMs) {
   const startMsRef = useRef(toolRoundStartMs(messages));
@@ -1648,7 +1700,7 @@ function ToolProcessSegment({ block, complete, running = false }) {
       {open && (
         <div className="tool-process-body">
           {toolRows.map((card) => (
-            <ToolInlineCard
+            <MemoToolInlineCard
               key={card.renderId}
               kind={card.kind}
               name={card.name}
@@ -1663,6 +1715,49 @@ function ToolProcessSegment({ block, complete, running = false }) {
       )}
     </section>
   );
+}
+
+const MemoToolProcessSegment = memo(ToolProcessSegment, (previous, next) => (
+  previous.complete === next.complete
+  && previous.running === next.running
+  && sameToolBlock(previous.block, next.block)
+));
+
+function sameToolBlock(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  if (
+    left.id !== right.id
+    || left.type !== right.type
+    || left.kind !== right.kind
+    || left.text !== right.text
+  ) {
+    return false;
+  }
+  return sameToolCards(left.cards, right.cards);
+}
+
+function sameToolCards(leftCards = [], rightCards = []) {
+  const left = Array.isArray(leftCards) ? leftCards : [];
+  const right = Array.isArray(rightCards) ? rightCards : [];
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (!sameToolCard(left[index], right[index])) return false;
+  }
+  return true;
+}
+
+function sameToolCard(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.renderId === right.renderId
+    && left.id === right.id
+    && left.kind === right.kind
+    && left.name === right.name
+    && left.payload === right.payload
+    && left.sourceRowId === right.sourceRowId
+    && sameUsage(left.sourceRowUsage, right.sourceRowUsage)
+    && sameUsage(left.usage, right.usage);
 }
 
 function mergedToolCards(cards) {
@@ -1742,6 +1837,16 @@ function addToolUsage(left, right) {
     cacheWrite: Number(left.cacheWrite || 0) + Number(right.cacheWrite || 0),
     total: Number(left.total || 0) + Number(right.total || 0)
   };
+}
+
+function sameUsage(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return !Number(left?.total || right?.total || 0);
+  return Number(left.input || 0) === Number(right.input || 0)
+    && Number(left.output || 0) === Number(right.output || 0)
+    && Number(left.cacheRead || 0) === Number(right.cacheRead || 0)
+    && Number(left.cacheWrite || 0) === Number(right.cacheWrite || 0)
+    && Number(left.total || 0) === Number(right.total || 0);
 }
 
 function toolCardsAreComplete(cards) {
@@ -1870,7 +1975,7 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
       {structuredItems.length > 0 ? (
         <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       ) : text ? (
-        <MarkdownContent className="message-text" text={text} attachments={allAttachments} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
+        <MemoMarkdownContent className="message-text" text={text} attachments={allAttachments} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       ) : null}
       {displayTrailingAttachments.length > 0 && <AttachmentList attachments={displayTrailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
@@ -1909,10 +2014,10 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
   const rendered = orderedItems
     .map(({ item, index }) => {
       if (typeof item === 'string') {
-        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
+        return <MemoMarkdownContent key={index} className="message-text" text={item} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
       }
       if (item?.type === 'text') {
-        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
+        return <MemoMarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
       }
       if (item?.type === 'file') {
         return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />;
@@ -1925,7 +2030,7 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
       }
       if (item?.type === 'tool_call' || item?.type === 'tool_result') {
         return (
-          <ToolInlineCard
+          <MemoToolInlineCard
             key={index}
             kind={item.type === 'tool_result' ? 'result' : 'call'}
             name={item.tool_name || 'tool'}
@@ -1938,7 +2043,7 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
     .filter(Boolean);
   if (String(role || '').toLowerCase() === 'user' && hasSelectionReference && fallback && !hasTextItem) {
     rendered.push(
-      <MarkdownContent
+      <MemoMarkdownContent
         key="fallback-text"
         className="message-text"
         text={fallbackText}
@@ -1952,7 +2057,7 @@ export function StructuredItems({ role, items, attachments, fallbackText, plain 
     );
   }
   if (rendered.length) return <>{rendered}</>;
-  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
+  return <MemoMarkdownContent className="message-text" text={fallbackText} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
 }
 
 function orderedStructuredItems(items, role) {
@@ -2003,14 +2108,14 @@ function ReasoningNote({ text, collapsible = false, defaultOpen = true, live = f
           <em>{open ? '收起' : shortReasoningSummary(value)}</em>
           <ChevronDown size={14} strokeWidth={1.9} aria-hidden="true" />
         </button>
-        {open && <MarkdownContent className="reasoning-note-text" text={value} plain={live} />}
+        {open && <MemoMarkdownContent className="reasoning-note-text" text={value} plain={live} />}
       </div>
     );
   }
   return (
     <div className="reasoning-note">
       <span>思考</span>
-      <MarkdownContent className="reasoning-note-text" text={value} plain={live} />
+      <MemoMarkdownContent className="reasoning-note-text" text={value} plain={live} />
     </div>
   );
 }
@@ -2056,7 +2161,7 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
       }
     } else if (match[3]) {
       parts.push(
-        <ToolInlineCard
+        <MemoToolInlineCard
           key={`tool-${match.index}`}
           kind={match[3].toLowerCase() === 'result' ? 'result' : 'call'}
           name={match[4].trim()}
@@ -2072,6 +2177,17 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   }
   return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />}</div>;
 }
+
+const MemoMarkdownContent = memo(MarkdownContent, (previous, next) => (
+  previous.text === next.text
+  && previous.attachments === next.attachments
+  && previous.className === next.className
+  && previous.plain === next.plain
+  && previous.onOpenAttachment === next.onOpenAttachment
+  && previous.onDownloadAttachment === next.onDownloadAttachment
+  && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
+  && previous.onOpenLocalLink === next.onOpenLocalLink
+));
 
 function PlainTextBlock({ text }) {
   const value = String(text || '');
@@ -3132,6 +3248,16 @@ export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload
     </details>
   );
 }
+
+const MemoToolInlineCard = memo(ToolInlineCard, (previous, next) => (
+  previous.kind === next.kind
+  && previous.name === next.name
+  && previous.payload === next.payload
+  && previous.callPayload === next.callPayload
+  && previous.resultPayload === next.resultPayload
+  && previous.running === next.running
+  && sameUsage(previous.usage, next.usage)
+));
 
 function MergedToolDetail({ name, callPayload, resultPayload, running = false }) {
   return (
