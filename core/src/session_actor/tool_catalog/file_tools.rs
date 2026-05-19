@@ -55,7 +55,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             .with_concurrency(ToolConcurrency::Serial),
             ToolDefinition::new(
                 "attachment_make_visible",
-                "Make a workspace-relative file or directory visible for attachment sending. Before referencing a file with <attachment>, call this when that file is not yet visible to the conversation workspace; reference it only after this tool succeeds. Requires path and optional timeout_seconds.",
+                "Make a workspace-relative file or directory visible for foreground Markdown artifact links or image rendering. Before referencing a remote-only file with [name](path) or ![alt](path), call this when that file is not yet visible to the conversation workspace; reference it only after this tool succeeds. Requires path and optional timeout_seconds.",
                 object_schema(
                     properties([
                         ("path", json!({"type": "string"})),

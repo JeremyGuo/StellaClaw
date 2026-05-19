@@ -1,13 +1,17 @@
 import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
+import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
-import { ChevronDown, Copy, Download, FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
+import remarkMath from 'remark-math';
+import 'katex/dist/katex.min.css';
+import { ChevronDown, Code2, Copy, Download, Eye, FileText, Info, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
-import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
+import { attachmentName, attachmentUrl, fileExtension, fileNameFromPath, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
 import { firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { clearChatPerf, measureChatPerf, recordChatPerf, snapshotChatPerf, startChatFrameProbe } from '../lib/chatPerfMetrics';
 import { buildChatRenderModel, chatRenderEntryKey } from './chat/renderModel';
 
 const COMMANDS = [
@@ -105,14 +109,15 @@ function selectionSummary(selection) {
 }
 
 export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
   const currentActivity = (runningActivities || []).at(-1) || null;
-  const renderModel = useMemo(() => buildChatRenderModel({
+  const renderModel = useMemo(() => measureChatPerf('chat.render_model.total', () => buildChatRenderModel({
     messages,
     currentActivity,
     sending,
     processing,
     modelSelectionPending
-  }), [messages, currentActivity, sending, processing, modelSelectionPending]);
+  }), { messages: messages?.length || 0, activity: currentActivity?.id || currentActivity?.kind || '' }), [messages, currentActivity, sending, processing, modelSelectionPending]);
   const {
     renderedMessages,
     renderEntries,
@@ -162,23 +167,42 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
+  const [elapsedTickMs, setElapsedTickMs] = useState(() => Date.now());
   const inlineActivity = shouldShowInlineActivity(currentActivity) ? currentActivity : null;
   const progressVisible = Boolean(currentActivity);
   const sessionRunning = Boolean(processing || currentActivity);
-  const virtualWindow = useMemo(() => virtualWindowForEntries({
+  const virtualWindow = useMemo(() => measureChatPerf('chat.virtual_window', () => virtualWindowForEntries({
     entries: renderEntries,
     keys: entryKeys,
     heightCache: virtualHeightsRef.current,
     heightVersion: virtualHeightVersion,
     viewport,
     activeIndex: latestAssistantTurnIndex
-  }), [renderEntries, entryKeys, virtualHeightVersion, viewport, latestAssistantTurnIndex]);
+  }), { entries: renderEntries.length, virtualized: renderEntries.length > VIRTUALIZE_ENTRY_THRESHOLD }), [renderEntries, entryKeys, virtualHeightVersion, viewport, latestAssistantTurnIndex]);
   const toolStopNoticeCandidate = useMemo(() => {
     if (!messagesReady || sending || processing || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
     return isExecutionMessage(lastMessage);
   }, [messages, messagesReady, sending, processing, currentActivity]);
   const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
+
+  useLayoutEffect(() => {
+    recordChatPerf('chat.workspace.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+      messages: messages?.length || 0,
+      entries: renderEntries.length,
+      visible: virtualWindow.items.length,
+      activity: currentActivity?.id || currentActivity?.kind || ''
+    });
+  });
+
+  useEffect(() => {
+    if (!sessionRunning) return undefined;
+    setElapsedTickMs(Date.now());
+    const timer = window.setInterval(() => {
+      setElapsedTickMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [sessionRunning, activeMessageScope]);
 
   useEffect(() => {
     if (!toolStopNoticeCandidate) {
@@ -244,9 +268,11 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const composer = composerRef.current;
     if (!list) return undefined;
     const observer = new ResizeObserver(() => {
-      updateResponseSpacerMetrics();
-      syncViewport();
-      if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
+      measureChatPerf('chat.resize_observer.message_scroll', () => {
+        updateResponseSpacerMetrics();
+        syncViewport();
+        if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
+      });
     });
     observer.observe(list);
     if (content) observer.observe(content);
@@ -260,17 +286,20 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     let frame = 0;
     const measure = () => {
       frame = 0;
-      let changed = false;
-      content.querySelectorAll('[data-virtual-key]').forEach((node) => {
-        const key = node.getAttribute('data-virtual-key');
-        if (!key) return;
-        const height = Math.ceil(node.getBoundingClientRect().height);
-        if (!Number.isFinite(height) || height <= 0) return;
-        if (Math.abs((virtualHeightsRef.current.get(key) || 0) - height) > 1) {
-          virtualHeightsRef.current.set(key, height);
-          changed = true;
-        }
-      });
+      const changed = measureChatPerf('chat.virtual_measure.visible_entries', () => {
+        let didChange = false;
+        content.querySelectorAll('[data-virtual-key]').forEach((node) => {
+          const key = node.getAttribute('data-virtual-key');
+          if (!key) return;
+          const height = Math.ceil(node.getBoundingClientRect().height);
+          if (!Number.isFinite(height) || height <= 0) return;
+          if (Math.abs((virtualHeightsRef.current.get(key) || 0) - height) > 1) {
+            virtualHeightsRef.current.set(key, height);
+            didChange = true;
+          }
+        });
+        return didChange;
+      }, { visible: virtualWindow.items.length });
       if (changed) {
         setVirtualHeightVersion((value) => value + 1);
         if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
@@ -552,6 +581,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                     <MemoAssistantTurn
                       entry={entry}
                       active={sessionRunning && index === latestAssistantTurnIndex}
+                      elapsedNowMs={sessionRunning && index === latestAssistantTurnIndex ? elapsedTickMs : undefined}
                       onOpenAttachment={onOpenAttachment}
                       onDownloadAttachment={onDownloadAttachment}
                       onResolveAttachmentUrl={onResolveAttachmentUrl}
@@ -586,6 +616,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           </div>
         )}
       </div>
+      <ChatPerfPopover />
       <LiveActivityStack activities={runningActivities} progressRef={progressRef} />
       <footer className="composer-wrap" ref={composerRef}>
         <div className="composer">
@@ -784,6 +815,110 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       </footer>
     </section>
   );
+}
+
+function ChatPerfPopover() {
+  const [open, setOpen] = useState(false);
+  const [snapshot, setSnapshot] = useState(() => snapshotChatPerf());
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!open) return undefined;
+    setSnapshot(snapshotChatPerf());
+    const stopProbe = startChatFrameProbe(true);
+    const timer = window.setInterval(() => {
+      setSnapshot(snapshotChatPerf());
+    }, 600);
+    return () => {
+      stopProbe?.();
+      window.clearInterval(timer);
+    };
+  }, [open]);
+  const rows = snapshot.rows || [];
+  const total = rows.reduce((sum, row) => sum + Number(row.totalMs || 0), 0);
+  const copySnapshot = async () => {
+    try {
+      await navigator.clipboard?.writeText(JSON.stringify(snapshotChatPerf(), null, 2));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+  const reset = () => {
+    clearChatPerf();
+    setSnapshot(snapshotChatPerf());
+  };
+  return (
+    <Popover.Root open={open} onOpenChange={setOpen}>
+      <Popover.Trigger asChild>
+        <button className="chat-perf-trigger" type="button" title="查看 Chat 性能统计" aria-label="查看 Chat 性能统计">
+          <Info size={15} strokeWidth={2} aria-hidden="true" />
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content className="chat-perf-popover" side="top" align="start" sideOffset={10}>
+          <div className="chat-perf-header">
+            <div>
+              <strong>Chat 性能</strong>
+              <span>{snapshot.capturedAt}</span>
+            </div>
+            <em>{rows.length} 项 · {formatPerfMs(total)}</em>
+          </div>
+          <div className="chat-perf-actions">
+            <button type="button" onClick={copySnapshot}>{copied ? '已复制' : '复制'}</button>
+            <button type="button" onClick={reset}>清空</button>
+          </div>
+          <div className="chat-perf-table" role="table" aria-label="Chat performance metrics">
+            <div className="chat-perf-row head" role="row">
+              <span>Metric</span>
+              <span>Last</span>
+              <span>Avg</span>
+              <span>Max</span>
+              <span>Count</span>
+            </div>
+            {rows.slice(0, 20).map((row) => (
+              <div className="chat-perf-row" role="row" key={row.name} title={perfMetaTitle(row.lastMeta)}>
+                <span>{row.name}</span>
+                <span>{formatPerfMs(row.lastMs)}</span>
+                <span>{formatPerfMs(row.avgMsRounded)}</span>
+                <span>{formatPerfMs(row.maxMs)}</span>
+                <span>{row.count}</span>
+              </div>
+            ))}
+            {rows.length === 0 && <div className="chat-perf-empty">暂无采样；保持面板打开并复现卡顿。</div>}
+          </div>
+          <div className="chat-perf-events">
+            <strong>慢事件</strong>
+            {(snapshot.events || []).slice(0, 10).map((event, index) => (
+              <div className="chat-perf-event" key={`${event.time}-${event.name}-${index}`} title={perfMetaTitle(event.meta)}>
+                <span>{event.time}</span>
+                <em>{event.name}</em>
+                <b>{formatPerfMs(event.durationMs)}</b>
+              </div>
+            ))}
+            {(snapshot.events || []).length === 0 && <div className="chat-perf-empty">暂无慢事件</div>}
+          </div>
+          <Popover.Arrow className="floating-popover-arrow" />
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
+function formatPerfMs(value) {
+  const number = Number(value || 0);
+  if (number >= 1000) return `${(number / 1000).toFixed(1)}s`;
+  if (number >= 100) return `${Math.round(number)}ms`;
+  return `${number.toFixed(number >= 10 ? 1 : 2)}ms`;
+}
+
+function perfMetaTitle(meta) {
+  if (!meta) return '';
+  try {
+    return JSON.stringify(meta, null, 2);
+  } catch {
+    return String(meta);
+  }
 }
 
 function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeIndex }) {
@@ -993,11 +1128,20 @@ function planStatusMark(status) {
 }
 
 export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
   const className = messageArticleClassName(message);
   const roleName = String(message.role || '').toLowerCase();
   const auxiliaryMessages = Array.isArray(message._auxiliary) ? message._auxiliary : [];
+  useLayoutEffect(() => {
+    recordChatPerf('chat.message.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+      role: roleName,
+      streaming: Boolean(message?._streaming),
+      textLen: messageText(message).length,
+      items: messageItems(message).length
+    });
+  });
   return (
     <article className={className}>
       {auxiliaryMessages.length > 0 && (
@@ -1206,12 +1350,12 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-export function AssistantTurn({ entry, active = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+export function AssistantTurn({ entry, active = false, elapsedNowMs, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const finalMessage = entry.finalMessage;
   const complete = isFinalAssistantMessage(finalMessage);
   return (
     <section className={`assistant-turn${active ? ' active' : ''}${complete ? ' complete' : ''}`}>
-      <MemoToolProcessGroup group={entry.processGroup} active={active} />
+      <MemoToolProcessGroup group={entry.processGroup} active={active} elapsedNowMs={elapsedNowMs} />
       {finalMessage && (
         <MemoMessageArticle
           message={finalMessage}
@@ -1227,9 +1371,10 @@ export function AssistantTurn({ entry, active = false, onOpenAttachment, onDownl
 
 const MemoAssistantTurn = memo(AssistantTurn);
 
-export function ToolProcessGroup({ group, active = false }) {
+export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
+  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
   const messages = group.messages || [];
-  const expandedRows = useMemo(() => messages.map((message, index) => {
+  const expandedRows = useMemo(() => measureChatPerf('chat.tool_group.expand_rows', () => messages.map((message, index) => {
     const { textMessage, toolCards, segments } = splitMessageForDisplay(message);
     return {
       id: messageKey(message, index),
@@ -1238,8 +1383,8 @@ export function ToolProcessGroup({ group, active = false }) {
       toolCards,
       usage: tokenUsage(message)
     };
-  }), [messages]);
-  const blocks = useMemo(() => toolProcessBlocks(expandedRows), [expandedRows]);
+  }), { messages: messages.length }), [messages]);
+  const blocks = useMemo(() => measureChatPerf('chat.tool_group.blocks', () => toolProcessBlocks(expandedRows), { rows: expandedRows.length }), [expandedRows]);
   const activeTail = active && !group.nextMessage;
   const lastToolBlockIndex = useMemo(() => {
     for (let index = blocks.length - 1; index >= 0; index -= 1) {
@@ -1248,10 +1393,10 @@ export function ToolProcessGroup({ group, active = false }) {
     return -1;
   }, [blocks]);
   const hasFinalMessage = isFinalAssistantMessage(group.nextMessage);
-  const toolsComplete = useMemo(() => {
+  const toolsComplete = useMemo(() => measureChatPerf('chat.tool_group.complete_check', () => {
     const toolBlocks = blocks.filter((block) => block.type === 'tools');
     return toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards));
-  }, [blocks]);
+  }, { blocks: blocks.length }), [blocks]);
   const waitingForNextItem = activeTail && toolsComplete && !hasFinalMessage;
   const complete = !activeTail && (hasFinalMessage || toolsComplete);
   const [open, setOpen] = useState(() => !hasFinalMessage);
@@ -1269,9 +1414,17 @@ export function ToolProcessGroup({ group, active = false }) {
     }
     hadFinalMessageRef.current = hasFinalMessage;
   }, [hasFinalMessage]);
-  const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete);
-  const summary = useMemo(() => toolRoundSummary(blocks), [blocks]);
+  const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete, active ? elapsedNowMs : undefined);
+  const summary = useMemo(() => measureChatPerf('chat.tool_group.summary', () => toolRoundSummary(blocks), { blocks: blocks.length }), [blocks]);
   const title = toolRoundTitle(elapsed, complete, summary);
+  useLayoutEffect(() => {
+    recordChatPerf('chat.tool_group.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+      messages: messages.length,
+      blocks: blocks.length,
+      active,
+      open
+    });
+  });
   return (
     <section className={`tool-process-group${open ? ' open' : ''}${complete ? ' complete' : ''}${activeTail ? ' active' : ''}`}>
       <button className="tool-round-toggle" type="button" onClick={() => setOpen((value) => !value)}>
@@ -1315,11 +1468,10 @@ export function ToolProcessGroup({ group, active = false }) {
 
 const MemoToolProcessGroup = memo(ToolProcessGroup);
 
-function useToolRoundElapsed(messages, nextMessage, complete) {
+function useToolRoundElapsed(messages, nextMessage, complete, nowMs) {
   const startMsRef = useRef(toolRoundStartMs(messages));
   const finalElapsedMsRef = useRef(null);
   const wasLiveRef = useRef(!complete);
-  const [tickMs, setTickMs] = useState(() => Date.now());
 
   if (!complete) {
     wasLiveRef.current = true;
@@ -1327,19 +1479,12 @@ function useToolRoundElapsed(messages, nextMessage, complete) {
     finalElapsedMsRef.current = Math.max(0, Date.now() - startMsRef.current);
   }
 
-  useEffect(() => {
-    if (complete) return undefined;
-    const timer = window.setInterval(() => {
-      setTickMs(Date.now());
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [complete]);
-
   if (complete) {
     const elapsedMs = finalElapsedMsRef.current ?? toolRoundElapsedMs(messages, nextMessage);
     return elapsedMs !== null ? formatElapsedMs(elapsedMs) : '';
   }
-  return formatElapsedMs(Math.max(0, tickMs - startMsRef.current));
+  const liveNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return formatElapsedMs(Math.max(0, liveNowMs - startMsRef.current));
 }
 
 function toolRoundStartMs(messages) {
@@ -1615,6 +1760,75 @@ function toolCardsAreComplete(cards) {
   return hasResult && (open.size === 0 || cards.at(-1)?.kind === 'result');
 }
 
+function artifactAttachmentForPath(path, attachments = []) {
+  const cleanPath = String(path || '').trim();
+  const existing = attachments.find((attachment) => attachmentMatchesPath(attachment, cleanPath));
+  if (existing) return existing;
+  const name = fileNameFromPath(cleanPath) || cleanPath;
+  return {
+    path: cleanPath,
+    workspace_path: cleanPath,
+    relative_path: cleanPath,
+    name,
+    media_type: mediaTypeForArtifactPath(cleanPath)
+  };
+}
+
+function attachmentMatchesPath(attachment, path) {
+  const target = normalizeArtifactPath(path);
+  if (!target) return false;
+  const candidates = [
+    attachment?.path,
+    attachment?.file_path,
+    attachment?.workspace_path,
+    attachment?.relative_path,
+    attachment?.workspace_relative_path,
+    attachment?.uri,
+    attachment?.file_uri,
+    attachment?.url,
+    attachment?.file?.path,
+    attachment?.file?.uri
+  ];
+  return candidates.some((candidate) => normalizeArtifactPath(candidate) === target);
+}
+
+function normalizeArtifactPath(value) {
+  let path = String(value || '').trim();
+  if (!path) return '';
+  if (/^file:/i.test(path)) {
+    try {
+      path = decodeURIComponent(new URL(path).pathname);
+    } catch {
+      path = path.replace(/^file:\/\//i, '');
+    }
+  }
+  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/');
+}
+
+function mediaTypeForArtifactPath(path) {
+  const ext = fileExtension(path);
+  if (['png'].includes(ext)) return 'image/png';
+  if (['jpg', 'jpeg'].includes(ext)) return 'image/jpeg';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'svg') return 'image/svg+xml';
+  if (['html', 'htm'].includes(ext)) return 'text/html';
+  if (ext === 'pdf') return 'application/pdf';
+  return '';
+}
+
+function uniqueAttachments(attachments) {
+  const seen = new Set();
+  const result = [];
+  attachments.forEach((attachment) => {
+    const key = attachmentIdentity(attachment);
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
+    result.push(attachment);
+  });
+  return result;
+}
+
 export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const text = messageText(message);
   const structuredItems = messageItems(message);
@@ -1623,6 +1837,11 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
   const files = Array.isArray(message?.files) ? message.files : [];
   const allAttachments = [...attachments, ...files];
   const inlineIndexes = markerIndexes(text);
+  const inlineAttachmentKeys = new Set(
+    Array.from(inlineIndexes)
+      .map((index) => attachmentIdentity(allAttachments[index]))
+      .filter(Boolean)
+  );
   const structuredAttachmentIndexes = new Set(
     structuredItems
       .filter((item) => item?.type === 'file' && item.attachment_index !== undefined)
@@ -1640,10 +1859,12 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
     const key = attachmentIdentity(attachment);
     return !inlineIndexes.has(index)
       && !inlineIndexes.has(attachmentIndex)
+      && !(key && inlineAttachmentKeys.has(key))
       && !structuredAttachmentIndexes.has(index)
       && !structuredAttachmentIndexes.has(attachmentIndex)
       && !(key && structuredAttachmentKeys.has(key));
   });
+  const displayTrailingAttachments = uniqueAttachments(trailingAttachments);
   return (
     <div className="message-body">
       {structuredItems.length > 0 ? (
@@ -1651,7 +1872,7 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
       ) : text ? (
         <MarkdownContent className="message-text" text={text} attachments={allAttachments} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       ) : null}
-      {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />}
+      {displayTrailingAttachments.length > 0 && <AttachmentList attachments={displayTrailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
         <div className="message-attachments muted">正在加载附件...</div>
       )}
@@ -1801,7 +2022,16 @@ function shortReasoningSummary(value) {
 }
 
 export function MarkdownContent({ text, attachments = [], className = 'markdown-content', plain = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
   const value = String(text || '');
+  useLayoutEffect(() => {
+    if (!value.trim()) return;
+    recordChatPerf(plain ? 'chat.markdown.plain_commit' : 'chat.markdown.rich_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+      className,
+      chars: value.length,
+      attachments: attachments.length
+    });
+  });
   if (!value.trim()) return null;
   if (plain) {
     return (
@@ -1811,13 +2041,13 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
     );
   }
   const parts = [];
-  const pattern = /(\[\[attachment:(\d+)]]|\[tool_(call|result)\s+([^\]\n]+)\]\s*([\s\S]*?)(?=\n\[tool_(?:call|result)\s+|$))/g;
+  const pattern = /(\[\[attachment:(\d+)]]|\[tool_(call|result)\s+([^\]\n]+)\]\s*([\s\S]*?)(?=\n\[tool_(?:call|result)\s+|$))/gi;
   let cursor = 0;
   let match;
   while ((match = pattern.exec(value)) !== null) {
     const before = value.slice(cursor, match.index);
     if (before.trim()) {
-      parts.push(<MarkdownBlock key={`text-${cursor}`} text={before} onOpenLocalLink={onOpenLocalLink} />);
+      parts.push(<MarkdownBlock key={`text-${cursor}`} text={before} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />);
     }
     if (match[2] !== undefined) {
       const attachment = attachments[Number(match[2])];
@@ -1828,7 +2058,7 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
       parts.push(
         <ToolInlineCard
           key={`tool-${match.index}`}
-          kind={match[3] === 'result' ? 'result' : 'call'}
+          kind={match[3].toLowerCase() === 'result' ? 'result' : 'call'}
           name={match[4].trim()}
           payload={match[5].trim()}
         />
@@ -1838,9 +2068,9 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   }
   const rest = value.slice(cursor);
   if (rest.trim()) {
-    parts.push(<MarkdownBlock key={`text-${cursor}`} text={rest} onOpenLocalLink={onOpenLocalLink} />);
+    parts.push(<MarkdownBlock key={`text-${cursor}`} text={rest} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />);
   }
-  return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} onOpenLocalLink={onOpenLocalLink} />}</div>;
+  return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />}</div>;
 }
 
 function PlainTextBlock({ text }) {
@@ -1864,11 +2094,69 @@ function PlainTextBlock({ text }) {
   );
 }
 
-export function MarkdownBlock({ text, onOpenLocalLink }) {
+function normalizeTexMathDelimiters(text) {
+  const value = String(text || '');
+  if (!value.includes('\\(') && !value.includes('\\)') && !value.includes('\\[') && !value.includes('\\]')) return value;
+  const lines = value.split(/(\n)/);
+  let inFence = null;
+  const processInline = (line) => {
+    let output = '';
+    let inlineTicks = '';
+    for (let index = 0; index < line.length;) {
+      const tickMatch = line.slice(index).match(/^`+/);
+      if (tickMatch) {
+        const ticks = tickMatch[0];
+        output += ticks;
+        if (!inlineTicks) {
+          inlineTicks = ticks;
+        } else if (ticks.length === inlineTicks.length) {
+          inlineTicks = '';
+        }
+        index += ticks.length;
+        continue;
+      }
+      if (!inlineTicks) {
+        const pair = line.slice(index, index + 2);
+        if (pair === '\\(' || pair === '\\)') {
+          output += '$';
+          index += 2;
+          continue;
+        }
+        if (pair === '\\[' || pair === '\\]') {
+          output += '$$';
+          index += 2;
+          continue;
+        }
+      }
+      output += line[index];
+      index += 1;
+    }
+    return output;
+  };
+
+  return lines.map((part) => {
+    if (part === '\n') return part;
+    const fenceMatch = part.match(/^(\s*)(`{3,}|~{3,})/);
+    if (inFence) {
+      if (fenceMatch && fenceMatch[2][0] === inFence.marker && fenceMatch[2].length >= inFence.length) {
+        inFence = null;
+      }
+      return part;
+    }
+    if (fenceMatch) {
+      inFence = { marker: fenceMatch[2][0], length: fenceMatch[2].length };
+      return part;
+    }
+    return processInline(part);
+  }).join('');
+}
+
+export function MarkdownBlock({ text, attachments = [], onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  const markdownText = useMemo(() => normalizeTexMathDelimiters(text), [text]);
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeHighlight]}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeHighlight, rehypeKatex]}
       components={{
         a: ({ node, ...props }) => {
           const href = String(props.href || '');
@@ -1891,10 +2179,24 @@ export function MarkdownBlock({ text, onOpenLocalLink }) {
             />
           );
         },
-        img: ({ node, ...props }) => <img {...props} className="message-inline-image" loading="lazy" alt={props.alt || ''} />
+        img: ({ node, ...props }) => {
+          const src = String(props.src || '').trim();
+          if (src && !isExternalUrl(src) && !/^(?:data:|blob:)/i.test(src)) {
+            return (
+              <AttachmentCard
+                attachment={artifactAttachmentForPath(src, attachments)}
+                inline
+                onOpenAttachment={onOpenAttachment}
+                onDownloadAttachment={onDownloadAttachment}
+                onResolveAttachmentUrl={onResolveAttachmentUrl}
+              />
+            );
+          }
+          return <img {...props} className="message-inline-image" loading="lazy" alt={props.alt || ''} />;
+        }
       }}
     >
-      {text}
+      {markdownText}
     </ReactMarkdown>
   );
 }
@@ -1968,6 +2270,9 @@ export function AttachmentCard({ attachment, inline = false, onOpenAttachment, o
     setImageFailed(false);
     setLoadedImageSize(null);
   }, [url]);
+  if (inline && isHtmlAttachment(attachment)) {
+    return <HtmlAttachmentCard attachment={attachment} name={name} url={url} canOpen={canOpen} canDownload={canDownload} openAttachment={openAttachment} downloadAttachment={downloadAttachment} />;
+  }
   if (isImageAttachment(attachment)) {
     const imageWidth = attachmentImageDisplayWidth(attachment, loadedImageSize);
     const imageStyle = imageWidth ? { '--attachment-image-width': `${imageWidth}px` } : undefined;
@@ -2009,7 +2314,7 @@ export function AttachmentCard({ attachment, inline = false, onOpenAttachment, o
   }
   return (
     <div
-      className={`message-attachment file${canOpen ? ' clickable' : ''}`}
+      className={`message-attachment file${inline ? ' inline' : ''}${canOpen ? ' clickable' : ''}`}
       title={canOpen ? `预览 ${name}` : name}
     >
       <button className="attachment-file-main" type="button" onClick={openAttachment} disabled={!canOpen}>
@@ -2064,6 +2369,115 @@ function AttachmentOpenMenu({ name, canOpen, canDownload, onOpen, onDownload }) 
   );
 }
 
+function HtmlAttachmentCard({ attachment, name, url, canOpen, canDownload, openAttachment, downloadAttachment }) {
+  const [mode, setMode] = useState('render');
+  const source = htmlAttachmentSource(attachment, url);
+  const renderUrl = htmlRenderableAttachmentUrl(attachment, url);
+  const hasSource = source.trim().length > 0;
+  useEffect(() => {
+    setMode('render');
+  }, [name, url, source]);
+  return (
+    <div
+      className={`message-attachment html inline${renderUrl || hasSource ? '' : ' loading'}${canOpen ? ' clickable' : ''}`}
+      title={canOpen ? `预览 ${name}` : name}
+    >
+      <div className="attachment-html-toolbar">
+        <span>{name}</span>
+        <div className="attachment-html-tabs" role="tablist" aria-label="HTML attachment preview mode">
+          <button
+            className={mode === 'render' ? 'active' : ''}
+            type="button"
+            role="tab"
+            aria-selected={mode === 'render'}
+            onClick={(event) => {
+              event.stopPropagation();
+              setMode('render');
+            }}
+          >
+            <Eye size={12} />
+            预览
+          </button>
+          <button
+            className={mode === 'source' ? 'active' : ''}
+            type="button"
+            role="tab"
+            aria-selected={mode === 'source'}
+            onClick={(event) => {
+              event.stopPropagation();
+              setMode('source');
+            }}
+          >
+            <Code2 size={12} />
+            源码
+          </button>
+        </div>
+        <AttachmentOpenMenu
+          name={name}
+          canOpen={canOpen}
+          canDownload={canDownload}
+          onOpen={openAttachment}
+          onDownload={downloadAttachment}
+        />
+      </div>
+      <div className="attachment-html-body">
+        {mode === 'render' ? (
+          hasSource || renderUrl ? (
+            <iframe
+              title={name}
+              src={hasSource ? undefined : renderUrl}
+              srcDoc={hasSource ? source : undefined}
+              sandbox="allow-scripts allow-forms"
+              loading="lazy"
+              referrerPolicy="no-referrer"
+            />
+          ) : (
+            <div className="attachment-html-placeholder">正在加载 HTML 预览</div>
+          )
+        ) : hasSource ? (
+          <pre><code>{source}</code></pre>
+        ) : (
+          <div className="attachment-html-placeholder">没有可显示的 HTML 源码</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function htmlAttachmentSource(attachment, url) {
+  const direct = String(
+    attachment?.text
+    || attachment?.content
+    || (attachment?.encoding === 'utf8' ? attachment?.data : '')
+    || attachment?.html
+    || ''
+  );
+  if (direct.trim()) return direct;
+  const preview = attachment?.preview;
+  if (preview && typeof preview === 'object') {
+    const previewText = String(preview.text || preview.content || (preview.encoding === 'utf8' ? preview.data : '') || '');
+    if (previewText.trim()) return previewText;
+  }
+  return dataHtmlFromUrl(url);
+}
+
+function htmlRenderableAttachmentUrl(attachment, url) {
+  const raw = String(url || attachment?.url || attachment?.uri || attachment?.file_uri || '').trim();
+  return /^(https?:|data:text\/html|blob:)/i.test(raw) ? raw : '';
+}
+
+function dataHtmlFromUrl(url) {
+  const value = String(url || '');
+  const match = value.match(/^data:text\/html(?:;charset=[^;,]+)?(;base64)?,(.*)$/i);
+  if (!match) return '';
+  const body = match[2] || '';
+  try {
+    return match[1] ? atob(body) : decodeURIComponent(body);
+  } catch {
+    return '';
+  }
+}
+
 function attachmentMeta(attachment, name) {
   const mediaType = String(attachment?.media_type || attachment?.mime_type || attachment?.mime || '').toLowerCase();
   const ext = fileExtension(name).toUpperCase();
@@ -2074,6 +2488,12 @@ function attachmentMeta(attachment, name) {
   if (ext === 'PDF') return '文档 · PDF';
   if (ext) return `文件 · ${ext}`;
   return attachment?.kind ? String(attachment.kind) : '文件';
+}
+
+function isHtmlAttachment(attachment) {
+  const mediaType = String(attachment?.media_type || attachment?.mime_type || attachment?.mime || '').toLowerCase();
+  const name = attachmentName(attachment);
+  return mediaType === 'text/html' || ['html', 'htm'].includes(fileExtension(name || attachment?.path || attachment?.uri || ''));
 }
 
 function attachmentNumber(value) {
@@ -2093,11 +2513,15 @@ function attachmentImageDisplayWidth(attachment, loadedImageSize) {
   return Math.max(minWidth, Math.min(maxWidth, Math.round(width * scale)));
 }
 
-function parseToolPayload(payload) {
+function parseToolPayload(payload, options = {}) {
   if (!payload) return {};
   if (typeof payload === 'object') return payload;
   const value = String(payload || '').trim();
   if (!value) return {};
+  const maxJsonChars = Number(options.maxJsonChars ?? Number.POSITIVE_INFINITY);
+  if (Number.isFinite(maxJsonChars) && value.length > maxJsonChars) {
+    return { text: value };
+  }
   try {
     return JSON.parse(value);
   } catch {
@@ -2137,9 +2561,25 @@ function shellResultSummary(data) {
 }
 
 function toolDisplay(kind, name, payload) {
-  const data = parseToolPayload(payload);
   const lowerName = String(name || '').toLowerCase();
   const isResult = kind === 'result';
+  const payloadText = typeof payload === 'string' ? payload : '';
+  if (lowerName.includes('edit') || lowerName.includes('write') || lowerName.includes('patch')) {
+    const data = isResult ? parseToolPayload(payload, { maxJsonChars: 8000 }) : lightToolPayload(payload);
+    const file = data.path || data.file_path || data.file || '';
+    const added = data.added ?? data.additions ?? data.lines_added;
+    const removed = data.removed ?? data.deletions ?? data.lines_removed;
+    const diff = added !== undefined || removed !== undefined ? ` +${Number(added || 0)} -${Number(removed || 0)}` : '';
+    return {
+      title: isResult ? '已编辑' : '编辑',
+      chip: name,
+      summary: file ? `${file}${diff}` : 'Edited files',
+      detailTitle: 'Edit'
+    };
+  }
+  const data = payloadText.length > 12000
+    ? lightToolPayload(payload)
+    : parseToolPayload(payload);
   if (lowerName.includes('shell') || lowerName.includes('command') || lowerName.includes('terminal') || lowerName.includes('stdin')) {
     const command = data.command || data.cmd || data.text || '';
     const outputSummary = isResult ? shellResultSummary(data) : '';
@@ -2178,18 +2618,6 @@ function toolDisplay(kind, name, payload) {
       detailTitle: 'Search'
     };
   }
-  if (lowerName.includes('edit') || lowerName.includes('write') || lowerName.includes('patch')) {
-    const file = data.path || data.file_path || data.file || '';
-    const added = data.added ?? data.additions ?? data.lines_added;
-    const removed = data.removed ?? data.deletions ?? data.lines_removed;
-    const diff = added !== undefined || removed !== undefined ? ` +${Number(added || 0)} -${Number(removed || 0)}` : '';
-    return {
-      title: isResult ? '已编辑' : '编辑',
-      chip: name,
-      summary: file ? `${file}${diff}` : 'Edited files',
-      detailTitle: 'Edit'
-    };
-  }
   if (lowerName.includes('file_read') || lowerName.includes('read')) {
     const file = data.path || data.file_path || data.file || '';
     return {
@@ -2206,6 +2634,35 @@ function toolDisplay(kind, name, payload) {
     summary: text || name || 'tool',
     detailTitle: name || 'Tool'
   };
+}
+
+function lightToolPayload(payload) {
+  if (!payload || typeof payload === 'object') return payload || {};
+  const text = String(payload || '');
+  const result = {};
+  const sample = text.slice(0, 8192);
+  [
+    ['path', /"path"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/],
+    ['file_path', /"file_path"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/],
+    ['file', /"file"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/],
+    ['command', /"command"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/],
+    ['cmd', /"cmd"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/],
+    ['url', /"url"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/],
+    ['query', /"query"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/],
+    ['pattern', /"pattern"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/]
+  ].forEach(([key, pattern]) => {
+    const match = sample.match(pattern);
+    if (!match) return;
+    try {
+      result[key] = JSON.parse(`"${match[1]}"`);
+    } catch {
+      result[key] = match[1];
+    }
+  });
+  if (!Object.keys(result).length) {
+    result.text = compactToolSummary(text, 180);
+  }
+  return result;
 }
 
 function toolGroupSummary(cards, fallbackName) {
@@ -2636,30 +3093,65 @@ function diffMarker(type) {
 }
 
 export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, usage, running = false }) {
-  const display = toolDisplay(kind, name, payload);
+  const renderStartedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+  const [open, setOpen] = useState(false);
+  const display = useMemo(() => measureChatPerf('chat.tool_card.display', () => toolDisplay(kind, name, payload), {
+    kind,
+    name,
+    payloadChars: typeof payload === 'string' ? payload.length : 0
+  }), [kind, name, payload]);
   const hasMergedPayload = callPayload !== undefined || resultPayload !== undefined;
+  useLayoutEffect(() => {
+    recordChatPerf('chat.tool_card.render_commit', (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - renderStartedAt, {
+      kind,
+      name,
+      open,
+      running,
+      payloadChars: typeof payload === 'string' ? payload.length : 0
+    });
+  });
   return (
-    <details className={`tool-inline-card ${kind}${running ? ' running' : ''}`}>
+    <details
+      className={`tool-inline-card ${kind}${running ? ' running' : ''}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
       <summary>
         <span>{display.title}</span>
         <code>{display.chip}</code>
         <em>{display.summary}</em>
         <InlineTokenUsage usage={usage} />
       </summary>
-      {hasMergedPayload ? (
-        <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} />
+      {open && (hasMergedPayload ? (
+        <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} running={running} />
       ) : (
-        <ToolDetail title={display.detailTitle} name={name} payload={payload} />
-      )}
+        running
+          ? <StreamingToolPayloadDetail title={display.detailTitle} payload={payload} />
+          : <ToolDetail title={display.detailTitle} name={name} payload={payload} />
+      ))}
     </details>
   );
 }
 
-function MergedToolDetail({ name, callPayload, resultPayload }) {
+function MergedToolDetail({ name, callPayload, resultPayload, running = false }) {
   return (
     <div className="merged-tool-detail">
-      {callPayload !== undefined ? <ToolDetail title="调用参数" name={name} payload={callPayload} /> : null}
+      {callPayload !== undefined ? (
+        running && resultPayload === undefined
+          ? <StreamingToolPayloadDetail title="调用参数" payload={callPayload} />
+          : <ToolDetail title="调用参数" name={name} payload={callPayload} />
+      ) : null}
       {resultPayload !== undefined ? <ToolDetail title="工具结果" name={name} payload={resultPayload} /> : null}
+    </div>
+  );
+}
+
+function StreamingToolPayloadDetail({ title, payload }) {
+  const value = typeof payload === 'string' ? payload : JSON.stringify(payload ?? '', null, 2);
+  return (
+    <div className="tool-detail">
+      <strong>{title}</strong>
+      <pre><code>{value}</code></pre>
     </div>
   );
 }

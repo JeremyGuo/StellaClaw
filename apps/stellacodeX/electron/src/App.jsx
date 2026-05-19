@@ -16,8 +16,6 @@ import {
   loadConversations,
   loadMessages,
   loadModels,
-  loadWorkspace,
-  loadWorkspaceFile,
   normalizeConversationSummary,
   normalizeForegroundSessionSummary,
   postConversationMessage,
@@ -27,7 +25,7 @@ import {
 } from './lib/api';
 import { ConversationBar } from './components/ConversationBar';
 import { WindowChrome } from './components/WindowChrome';
-import { ChatWorkspace } from './components/ChatWorkspace';
+import { ChatSessionPane } from './components/ChatSessionPane';
 import { OverviewPanel } from './components/OverviewPanel';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { FilePreviewPanel } from './components/FilePreviewPanel';
@@ -36,8 +34,8 @@ import { NewConversationDialog } from './components/NewConversationDialog';
 import { RenameConversationDialog, RenameSessionDialog } from './components/RenameConversationDialog';
 import { ConversationPropertiesDialog } from './components/ConversationPropertiesDialog';
 import { SettingsDialog } from './components/SettingsDialog';
-import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
-import { attachmentName, fileExtension, fileNameFromPath, imageMimeType, messageText } from './lib/fileUtils';
+import { clamp, formatModel, statusUsageTotals } from './lib/format';
+import { attachmentName, fileExtension, fileNameFromPath, messageText } from './lib/fileUtils';
 import { addUsageTotals, firstMessageId, hasOlderMessages, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText } from './lib/messageUtils';
 import {
   applyStreamErrorToMessages,
@@ -68,21 +66,14 @@ import {
   summarizePayload
 } from './lib/chatProtocolDiagnostics';
 import { chatSessionStateIsActive, chatSnapshotState, isActiveSessionState, mergeProgressActivity, normalizeProgressFeedback, recentMessagePageParams } from './lib/chatSessionState';
-import { localCacheKey, readLocalCache, removeLocalCache, writeLocalCache } from './lib/localCache';
+import { getChatRuntimeSnapshot, setChatRuntimeMessages, setChatRuntimeMessagesReady, setChatRuntimeSending } from './lib/chatRuntimeStore';
+import { layoutSnapshotFromValues, useAppLayout } from './hooks/useAppLayout';
+import { revokeFilePreviewUrls, useWorkspaceState } from './hooks/useWorkspaceState';
+import { useWorkspaceWorkflow, workspaceFileImageDataUrl } from './hooks/useWorkspaceWorkflow';
+import { useWorkspaceTransfers } from './hooks/useWorkspaceTransfers';
 import { effectiveThemeMode, themeCssVariables } from './lib/theme';
-import { collectDroppedFiles, packFilesToTarGz, uploadPayloadStats } from './lib/uploadArchive';
-import { normalizeWorkspacePath, parentWorkspacePath, workspaceDisplayRoot, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
+import { normalizeWorkspacePath, workspaceDisplayRoot, workspaceFileKind } from './lib/workspaceUtils';
 
-const SIDEBAR_EXPANDED = 286;
-const SIDEBAR_COLLAPSED = 0;
-const WORKSPACE_PANEL_MIN = 340;
-const WORKSPACE_PANEL_MAX = 620;
-const TERMINAL_HEIGHT_MIN = 160;
-const TERMINAL_HEIGHT_MAX = 620;
-const TERMINAL_LIST_MIN = 180;
-const TERMINAL_LIST_MAX = 360;
-const MAX_UPLOAD_COMPRESSED_BYTES = 10 * 1024 * 1024;
-const PDF_PREVIEW_MAX_BYTES = 50 * 1024 * 1024;
 const MESSAGE_IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
 const MIN_DISPLAY_FONT_SIZE = 11;
 const MAX_DISPLAY_FONT_SIZE = 18;
@@ -91,38 +82,6 @@ const MAX_UI_SCALE = 1.4;
 function setPxVariable(element, name, value) {
   if (!Number.isFinite(value)) return;
   element.style.setProperty(name, `${value}px`);
-}
-
-function workspaceFileImageDataUrl(path, file) {
-  const mime = imageMimeType(path);
-  const data = file?.data || file?.content || '';
-  if (!data) return '';
-  if (file?.encoding === 'base64') {
-    return `data:${mime};base64,${String(data).replace(/\s/g, '')}`;
-  }
-  if (file?.encoding === 'utf8' && mime === 'image/svg+xml') {
-    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(data)}`;
-  }
-  return '';
-}
-
-function resolveWorkspaceAssetPath(markdownPath, rawSrc) {
-  const value = String(rawSrc || '').trim();
-  if (!value || /^(?:[a-z][a-z0-9+.-]*:|#)/i.test(value)) return '';
-  const pathPart = value.split(/[?#]/, 1)[0];
-  const decoded = safeDecodeUriComponent(pathPart);
-  const parts = decoded.startsWith('/')
-    ? []
-    : parentWorkspacePath(markdownPath).split('/').filter(Boolean);
-  decoded.split('/').forEach((part) => {
-    if (!part || part === '.') return;
-    if (part === '..') {
-      parts.pop();
-      return;
-    }
-    parts.push(part);
-  });
-  return normalizeWorkspacePath(parts.join('/'));
 }
 
 function safeDecodeUriComponent(value) {
@@ -257,6 +216,22 @@ function attachmentCacheKey(serverId, conversationId, path, attachment, rawUrl =
   ].map((value) => String(value || '')).join('|');
 }
 
+function workspaceFileAttachmentDataUrl(path, file) {
+  const imageUrl = workspaceFileImageDataUrl(path, file);
+  if (imageUrl) return imageUrl;
+  const ext = fileExtension(path);
+  if (!['html', 'htm'].includes(ext)) return '';
+  const data = file?.data || file?.content || '';
+  if (!data) return '';
+  if (file?.encoding === 'base64') {
+    return `data:text/html;base64,${String(data).replace(/\s/g, '')}`;
+  }
+  if (file?.encoding === 'utf8') {
+    return `data:text/html;charset=utf-8,${encodeURIComponent(String(data))}`;
+  }
+  return '';
+}
+
 function applyChromeMetrics(metrics) {
   if (!metrics || typeof document === 'undefined') return;
   const root = document.documentElement;
@@ -288,29 +263,6 @@ function composerModeInfo(status) {
     label: '本地',
     tone: 'local',
     title: '工具在当前 Stellaclaw 工作区执行'
-  };
-}
-
-function measuredTerminalListMin(root) {
-  const header = root?.querySelector('.terminal-list-header');
-  const title = header?.querySelector('.terminal-title');
-  const actions = header?.querySelector('.terminal-actions');
-  if (!header || !title || !actions) return TERMINAL_LIST_MIN;
-  const headerStyle = window.getComputedStyle(header);
-  const padding = Number.parseFloat(headerStyle.paddingLeft || '0')
-    + Number.parseFloat(headerStyle.paddingRight || '0');
-  const gap = Number.parseFloat(headerStyle.columnGap || headerStyle.gap || '0');
-  const measured = Math.ceil(title.scrollWidth + actions.scrollWidth + padding + gap + 8);
-  return clamp(measured, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX);
-}
-
-function layoutSnapshotFromValues(values = {}) {
-  return {
-    inspector: clamp(values.inspector, 320, 760) || 420,
-    file: clamp(values.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360,
-    preview: clamp(values.preview, 320, 820) || 480,
-    terminal: clamp(values.terminal, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX) || 240,
-    terminalList: clamp(values.terminalList, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX) || 210
   };
 }
 
@@ -352,14 +304,6 @@ class AppErrorBoundary extends React.Component {
     }
     return this.props.children;
   }
-}
-
-function revokeFilePreviewUrls(files = []) {
-  files.forEach((file) => {
-    if (typeof file?.pdf_url === 'string' && file.pdf_url.startsWith('blob:')) {
-      URL.revokeObjectURL(file.pdf_url);
-    }
-  });
 }
 
 function maxMessageId(...values) {
@@ -711,32 +655,18 @@ function App() {
     if (typeof window === 'undefined' || !window.matchMedia) return 'dark';
     return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   });
-  const [sidebarMode, setSidebarMode] = useState('expanded');
   const [activeServerId, setActiveServerId] = useState('');
   const [conversations, setConversations] = useState([]);
   const [statuses, setStatuses] = useState(new Map());
   const [selected, setSelected] = useState(null);
-  const [messages, setMessages] = useState([]);
-  const [messagesReady, setMessagesReady] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [sending, setSending] = useState(false);
   const [sessionActivity, setSessionActivity] = useState('');
   const [chatSessionState, setChatSessionState] = useState({ state: 'idle' });
   const [runningActivities, setRunningActivities] = useState([]);
-  const [overviewPanelOpen, setOverviewPanelOpen] = useState(false);
-  const [workspacePanelOpen, setWorkspacePanelOpen] = useState(false);
-  const [previewPanelOpen, setPreviewPanelOpen] = useState(false);
   const [statusDeltas, setStatusDeltas] = useState(() => new Map());
-  const [workspaceListings, setWorkspaceListings] = useState(() => new Map());
-  const [workspaceExpanded, setWorkspaceExpanded] = useState(() => new Set(['']));
-  const [workspaceLoading, setWorkspaceLoading] = useState(() => new Set());
-  const [workspaceError, setWorkspaceError] = useState('');
-  const [transfers, setTransfers] = useState([]);
   const [updaterStatus, setUpdaterStatus] = useState({ state: 'idle' });
-  const [terminalOpen, setTerminalOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
-  const [conversationLayout, setConversationLayout] = useState(null);
   const [newConversationOpen, setNewConversationOpen] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [renamingConversation, setRenamingConversation] = useState(null);
@@ -748,18 +678,16 @@ function App() {
   const [propertiesModelsLoading, setPropertiesModelsLoading] = useState(false);
   const [propertiesModelsError, setPropertiesModelsError] = useState('');
   const [propertiesApplying, setPropertiesApplying] = useState(false);
-  const [openFiles, setOpenFiles] = useState([]);
-  const [activeFilePath, setActiveFilePath] = useState('');
   const [selectionReferences, setSelectionReferences] = useState([]);
   const [appForeground, setAppForeground] = useState(() => (
     typeof document === 'undefined'
       ? true
       : document.visibilityState === 'visible' && document.hasFocus()
   ));
-  const messagesRef = useRef([]);
+  const messagesRef = useRef(getChatRuntimeSnapshot().messages);
+  const sendingRef = useRef(getChatRuntimeSnapshot().sending);
   const chatSessionStateRef = useRef({ state: 'idle' });
   const conversationsRef = useRef([]);
-  const openFilesRef = useRef([]);
   const appForegroundRef = useRef(appForeground);
   const settingsRef = useRef(null);
   const settingsSaveSeqRef = useRef(0);
@@ -767,9 +695,7 @@ function App() {
   const websocketKeyRef = useRef('');
   const seenUsageMessagesRef = useRef(new Map());
   const attachmentImageUrlCacheRef = useRef(new Map());
-  const workspaceResourceCacheRef = useRef(new Map());
   const loadingOlderRef = useRef(false);
-  const layoutDraftRef = useRef(null);
   const restoringUiRef = useRef(false);
   const uiSaveTimerRef = useRef(null);
   const readSaveTimersRef = useRef(new Map());
@@ -777,9 +703,21 @@ function App() {
   const selectedServerId = selected?.serverId || '';
   const selectedConversationId = selected?.conversationId || '';
 
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
+  const setMessages = useCallback((updater) => {
+    const next = setChatRuntimeMessages(updater);
+    messagesRef.current = next;
+    return next;
+  }, []);
+
+  const setMessagesReady = useCallback((value) => {
+    setChatRuntimeMessagesReady(value);
+  }, []);
+
+  const setSending = useCallback((value) => {
+    const next = setChatRuntimeSending(value);
+    sendingRef.current = next;
+    return next;
+  }, []);
 
   useEffect(() => {
     chatSessionStateRef.current = chatSessionState;
@@ -883,16 +821,8 @@ function App() {
   }, [selected]);
 
   useEffect(() => {
-    openFilesRef.current = openFiles;
-  }, [openFiles]);
-
-  useEffect(() => {
     setSelectionReferences([]);
   }, [selected?.serverId, selected?.conversationId, selectedSessionId]);
-
-  useEffect(() => () => {
-    revokeFilePreviewUrls(openFilesRef.current);
-  }, []);
 
   useEffect(() => {
     const updater = window.stellacode2?.updater;
@@ -911,17 +841,6 @@ function App() {
     };
   }, []);
 
-  const globalLayoutValues = settings?.layout || {};
-  const conversationLayoutValues = conversationLayout || globalLayoutValues;
-  const sidebarWidth = sidebarMode === 'collapsed' ? SIDEBAR_COLLAPSED : clamp(globalLayoutValues.sidebar, 220, 520) || SIDEBAR_EXPANDED;
-  const overviewPanelWidth = clamp(conversationLayoutValues.inspector, 320, 760) || 420;
-  const workspacePanelWidth = clamp(conversationLayoutValues.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360;
-  const previewPanelWidth = clamp(conversationLayoutValues.preview, 320, 820) || 480;
-  const terminalHeight = clamp(conversationLayoutValues.terminal, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX) || 240;
-  const terminalListWidth = clamp(conversationLayoutValues.terminalList, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX) || 210;
-  const previewPanelRight = workspacePanelOpen ? workspacePanelWidth : 0;
-  const overviewPanelRight = previewPanelRight + (previewPanelOpen ? previewPanelWidth : 0);
-  const rightContentInset = (overviewPanelOpen ? overviewPanelWidth : 0) + (workspacePanelOpen ? workspacePanelWidth : 0) + (previewPanelOpen ? previewPanelWidth : 0);
   const activeConversation = useMemo(
     () => conversations.find((item) => item.conversation_id === selected?.conversationId) || null,
     [conversations, selected]
@@ -975,6 +894,26 @@ function App() {
     () => composerModeInfo(selectedConversationStatus),
     [selectedConversationStatus]
   );
+  const {
+    workspaceListings,
+    setWorkspaceListings,
+    workspaceExpanded,
+    setWorkspaceExpanded,
+    workspaceLoading,
+    setWorkspaceLoading,
+    workspaceError,
+    setWorkspaceError,
+    openFiles,
+    setOpenFiles,
+    activeFilePath,
+    setActiveFilePath,
+    resetWorkspaceState,
+    restoreOpenFileTabs,
+    readWorkspaceResourceCache,
+    writeWorkspaceResourceCache,
+    removeWorkspaceResourceCache,
+    loadWorkspaceFileCached
+  } = useWorkspaceState();
   const messageAttachmentWorkspaceRoots = useMemo(() => {
     const rootListing = workspaceListings.get('');
     return Array.from(new Set([
@@ -985,41 +924,6 @@ function App() {
       activeConversation?.workspace
     ].map(normalizeAbsolutePath).filter(Boolean)));
   }, [workspaceListings, selectedConversationStatus, activeConversation?.workspace]);
-  const readWorkspaceResourceCache = useCallback((kind, parts) => {
-    const key = localCacheKey(kind, parts);
-    if (workspaceResourceCacheRef.current.has(key)) {
-      return workspaceResourceCacheRef.current.get(key);
-    }
-    const cached = readLocalCache(kind, parts);
-    if (cached !== null) {
-      workspaceResourceCacheRef.current.set(key, cached);
-    }
-    return cached;
-  }, []);
-  const writeWorkspaceResourceCache = useCallback((kind, parts, value) => {
-    const key = localCacheKey(kind, parts);
-    workspaceResourceCacheRef.current.set(key, value);
-    writeLocalCache(kind, parts, value);
-  }, []);
-  const removeWorkspaceResourceCache = useCallback((kind, parts) => {
-    const key = localCacheKey(kind, parts);
-    workspaceResourceCacheRef.current.delete(key);
-    removeLocalCache(kind, parts);
-  }, []);
-  const loadWorkspaceFileCached = useCallback(async (serverId, conversationId, path, limitBytes, options = {}) => {
-    const normalized = normalizeWorkspacePath(path);
-    const parts = [serverId, conversationId, normalized, limitBytes || 'full'];
-    const useCache = options.cache !== false;
-    if (useCache && !options.force) {
-      const cached = readWorkspaceResourceCache('workspace-file', parts);
-      if (cached) return cached;
-    }
-    const loaded = await loadWorkspaceFile(serverId, conversationId, normalized, limitBytes);
-    if (useCache) {
-      writeWorkspaceResourceCache('workspace-file', parts, loaded);
-    }
-    return loaded;
-  }, [readWorkspaceResourceCache, writeWorkspaceResourceCache]);
   const resolveMessageAttachmentUrl = useCallback(async (attachment, rawUrl = '') => {
     const serverId = selected?.serverId || '';
     const conversationId = selected?.conversationId || '';
@@ -1032,7 +936,7 @@ function App() {
     }
     try {
       const file = await loadWorkspaceFileCached(serverId, target.conversationId, target.path, MESSAGE_IMAGE_PREVIEW_MAX_BYTES);
-      const dataUrl = workspaceFileImageDataUrl(target.path || attachmentName(attachment), file);
+      const dataUrl = workspaceFileAttachmentDataUrl(target.path || attachmentName(attachment), file);
       if (dataUrl) {
         attachmentImageUrlCacheRef.current.set(key, dataUrl);
         return dataUrl;
@@ -1057,22 +961,6 @@ function App() {
   const selectedProcessing = Boolean(selectedConversationStatus?.running)
     || isActiveSessionState(selectedProcessingState);
   const updateReady = updaterStatus?.state === 'downloaded';
-
-  const upsertTransfer = useCallback((id, patch) => {
-    setTransfers((current) => {
-      const existing = current.find((item) => item.id === id);
-      const nextItem = { ...(existing || { id, createdAt: Date.now() }), ...patch };
-      if (!existing) return [nextItem, ...current].slice(0, 5);
-      return current.map((item) => (item.id === id ? nextItem : item));
-    });
-  }, []);
-
-  const finishTransfer = useCallback((id, patch) => {
-    upsertTransfer(id, { ...patch, done: true });
-    window.setTimeout(() => {
-      setTransfers((current) => current.filter((item) => item.id !== id));
-    }, 3200);
-  }, [upsertTransfer]);
 
   const updateRunningActivities = useCallback((updater) => {
     setRunningActivities((current) => {
@@ -1110,6 +998,31 @@ function App() {
     settingsRef.current = merged;
     return merged;
   }, []);
+
+  const {
+    sidebarMode,
+    setSidebarMode,
+    overviewPanelOpen,
+    setOverviewPanelOpen,
+    workspacePanelOpen,
+    setWorkspacePanelOpen,
+    previewPanelOpen,
+    setPreviewPanelOpen,
+    terminalOpen,
+    setTerminalOpen,
+    setConversationLayout,
+    sidebarWidth,
+    overviewPanelWidth,
+    workspacePanelWidth,
+    previewPanelWidth,
+    terminalHeight,
+    terminalListWidth,
+    previewPanelRight,
+    overviewPanelRight,
+    rightContentInset,
+    toggleSidebar,
+    resizeLayout
+  } = useAppLayout({ settings, setSettings, saveSettings, selectedKey });
 
   const queueConversationUiSave = useCallback((key, snapshot) => {
     if (!key || !snapshot) return;
@@ -1494,127 +1407,34 @@ function App() {
     }
   }, [activeServerId, selected?.conversationId, selectedSessionId]);
 
-  const fetchWorkspacePath = useCallback(async (path = '', options = {}) => {
-    if (!selected) return null;
-    const normalized = normalizeWorkspacePath(path);
-    if (!options.force && workspaceListings.has(normalized)) {
-      return workspaceListings.get(normalized);
-    }
-    const cacheParts = [selected.serverId, selected.conversationId, normalized, 500];
-    if (!options.force) {
-      const cached = readWorkspaceResourceCache('workspace-listing', cacheParts);
-      if (cached) {
-        setWorkspaceListings((current) => (
-          current.has(normalized) ? current : new Map(current).set(normalized, cached)
-        ));
-        return cached;
-      }
-    }
-    setWorkspaceError('');
-    setWorkspaceLoading((current) => new Set(current).add(normalized));
-    try {
-      const listing = await loadWorkspace(selected.serverId, selected.conversationId, normalized, 500);
-      writeWorkspaceResourceCache('workspace-listing', cacheParts, listing);
-      setWorkspaceListings((current) => new Map(current).set(normalized, listing));
-      return listing;
-    } catch (error) {
-      setWorkspaceError(error?.message || '读取工作区失败');
-      throw error;
-    } finally {
-      setWorkspaceLoading((current) => {
-        const next = new Set(current);
-        next.delete(normalized);
-        return next;
-      });
-    }
-  }, [selected, workspaceListings, readWorkspaceResourceCache, writeWorkspaceResourceCache]);
-
-  const loadPdfPreviewIntoTab = useCallback(async (entry, options = {}) => {
-    if (!selected || !entry) return;
-    const path = normalizeWorkspacePath(entry.path);
-    const serverId = selected.serverId;
-    const selectedConversationId = selected.conversationId;
-    const conversationId = String(entry.conversationId || entry.conversation_id || selectedConversationId || '').trim();
-    if (!conversationId) return;
-    if (!options.keepExistingPreview) {
-      setOpenFiles((current) => current.map((item) => (
-        item.path === path ? { ...item, loading: true, error: '' } : item
-      )));
-    }
-    try {
-      const preview = await window.stellacode2.previewWorkspace({
-        serverId,
-        conversationId,
-        path,
-        kind: 'file',
-        mediaType: 'application/pdf',
-        maxBytes: PDF_PREVIEW_MAX_BYTES,
-        suggestedName: entry.name || fileNameFromPath(path)
-      });
-      const blob = new Blob([preview.data], { type: preview.mediaType || 'application/pdf' });
-      const pdfUrl = URL.createObjectURL(blob);
-      if (
-        selectedRef.current?.serverId !== serverId
-        || selectedRef.current?.conversationId !== selectedConversationId
-      ) {
-        URL.revokeObjectURL(pdfUrl);
-        return;
-      }
-      setOpenFiles((current) => {
-        const existing = current.find((item) => item.path === path);
-        if (!existing) {
-          URL.revokeObjectURL(pdfUrl);
-          return current;
-        }
-        revokeFilePreviewUrls([existing]);
-        return current.map((item) => (
-          item.path === path
-            ? {
-              ...item,
-              ...entry,
-              path,
-              kind: 'pdf',
-              language: 'pdf',
-              content: '',
-              data_url: '',
-              pdf_url: pdfUrl,
-              pdf_buffer: preview.data,
-              preview_size: preview.size,
-              loaded_at: Date.now(),
-              scroll_hint: options.scrollHint || item.scroll_hint,
-              loading: false,
-              error: ''
-            }
-            : item
-        ));
-      });
-    } catch (error) {
-      if (
-        selectedRef.current?.serverId !== serverId
-        || selectedRef.current?.conversationId !== selectedConversationId
-      ) {
-        return;
-      }
-      setOpenFiles((current) => current.map((item) => (
-        item.path === path ? { ...item, loading: false, error: error?.message || '读取 PDF 失败' } : item
-      )));
-    }
-  }, [selected]);
-
-  const refreshPdfPreview = useCallback((entry, scrollHint) => {
-    return loadPdfPreviewIntoTab(entry, { keepExistingPreview: true, scrollHint });
-  }, [loadPdfPreviewIntoTab]);
+  const {
+    fetchWorkspacePath,
+    loadPdfPreviewIntoTab,
+    refreshPdfPreview,
+    toggleWorkspaceDirectory,
+    openWorkspaceFile,
+    openWorkspacePathTarget,
+    refreshWorkspacePreviewFile,
+    resolveMarkdownAsset
+  } = useWorkspaceWorkflow({
+    selected,
+    selectedRef,
+    workspaceListings,
+    setWorkspaceListings,
+    setWorkspaceExpanded,
+    setWorkspaceLoading,
+    setWorkspaceError,
+    setOpenFiles,
+    setActiveFilePath,
+    setPreviewPanelOpen,
+    loadWorkspaceFileCached,
+    readWorkspaceResourceCache,
+    writeWorkspaceResourceCache
+  });
 
   useEffect(() => {
     if (!selected || !settings) {
-      setWorkspaceListings(new Map());
-      setWorkspaceExpanded(new Set(['']));
-      setWorkspaceError('');
-      setOpenFiles((current) => {
-        revokeFilePreviewUrls(current);
-        return [];
-      });
-      setActiveFilePath('');
+      resetWorkspaceState();
       setConversationLayout(null);
       return undefined;
     }
@@ -1640,17 +1460,7 @@ function App() {
     setWorkspaceListings(new Map());
     setWorkspaceExpanded(new Set(['']));
     setWorkspaceError('');
-    setOpenFiles((current) => {
-      revokeFilePreviewUrls(current);
-      return savedFiles.map((file) => {
-        const savedKind = workspaceFileKind(file.path);
-        return {
-          ...file,
-          kind: savedKind,
-          loading: savedKind !== 'presentation'
-        };
-      });
-    });
+    restoreOpenFileTabs(savedFiles);
     setActiveFilePath(savedActivePath);
     queueMicrotask(() => {
       restoringUiRef.current = false;
@@ -1660,24 +1470,7 @@ function App() {
     if (cachedRootListing) {
       setWorkspaceListings((current) => new Map(current).set('', cachedRootListing));
     }
-    setWorkspaceLoading((current) => new Set(current).add(''));
-    loadWorkspace(selected.serverId, selected.conversationId, '', 500)
-      .then((listing) => {
-        if (disposed) return;
-        writeWorkspaceResourceCache('workspace-listing', rootCacheParts, listing);
-        setWorkspaceListings((current) => new Map(current).set('', listing));
-      })
-      .catch((error) => {
-        if (!disposed) setWorkspaceError(error?.message || '读取工作区失败');
-      })
-      .finally(() => {
-        if (disposed) return;
-        setWorkspaceLoading((current) => {
-          const next = new Set(current);
-          next.delete('');
-          return next;
-        });
-    });
+    fetchWorkspacePath('', { force: true }).catch(() => {});
     savedFiles.forEach((file) => {
       const savedKind = workspaceFileKind(file.path);
       if (savedKind === 'presentation') {
@@ -1719,7 +1512,7 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [selected?.serverId, selected?.conversationId, selectedSessionId, selectedConversationUiKey, legacyConversationUiKey, settingsReady, loadPdfPreviewIntoTab, readWorkspaceResourceCache, writeWorkspaceResourceCache, loadWorkspaceFileCached]);
+  }, [selected?.serverId, selected?.conversationId, selectedSessionId, selectedConversationUiKey, legacyConversationUiKey, settingsReady, fetchWorkspacePath, loadPdfPreviewIntoTab, readWorkspaceResourceCache, loadWorkspaceFileCached, resetWorkspaceState, restoreOpenFileTabs]);
 
   useEffect(() => {
     if (!selectedConversationUiKey || !settings || restoringUiRef.current) return;
@@ -1759,145 +1552,6 @@ function App() {
     queueConversationUiSave
   ]);
 
-  const toggleWorkspaceDirectory = useCallback((path) => {
-    const normalized = normalizeWorkspacePath(path);
-    setWorkspaceExpanded((current) => {
-      const next = new Set(current);
-      if (next.has(normalized)) {
-        next.delete(normalized);
-      } else {
-        next.add(normalized);
-        fetchWorkspacePath(normalized).catch(() => {});
-      }
-      return next;
-    });
-  }, [fetchWorkspacePath]);
-
-  const openWorkspaceFile = useCallback(async (entry, options = {}) => {
-    if (!selected || !entry) return;
-    const path = normalizeWorkspacePath(entry.path);
-    const conversationId = String(entry.conversationId || entry.conversation_id || selected.conversationId || '').trim();
-    if (!conversationId) return;
-    setPreviewPanelOpen(true);
-    setActiveFilePath(path);
-    const entryKind = workspaceEntryKind(entry);
-    if (entryKind === 'directory') {
-      setOpenFiles((current) => {
-        if (current.some((item) => item.path === path)) {
-          return current.map((item) => (
-            item.path === path && !options.keepExistingPreview
-              ? { ...item, loading: true, error: '' }
-              : item
-          ));
-        }
-        return [...current, {
-          ...entry,
-          path,
-          name: entry.name || fileNameFromPath(path) || 'workspace',
-          kind: 'directory',
-          loading: true,
-          error: ''
-        }];
-      });
-      try {
-        const listing = await loadWorkspace(selected.serverId, conversationId, path, 500);
-        setWorkspaceListings((current) => new Map(current).set(path, listing));
-        setOpenFiles((current) => current.map((item) => (
-          item.path === path
-            ? {
-              ...item,
-              ...entry,
-              path,
-              name: entry.name || fileNameFromPath(path) || 'workspace',
-              kind: 'directory',
-              listing,
-              entries: Array.isArray(listing?.entries) ? listing.entries : [],
-              loaded_at: Date.now(),
-              loading: false,
-              error: ''
-            }
-            : item
-        )));
-      } catch (error) {
-        setOpenFiles((current) => current.map((item) => (
-          item.path === path ? { ...item, loading: false, error: error?.message || '读取目录失败' } : item
-        )));
-        if (options.throwOnError) throw error;
-      }
-      return;
-    }
-    setOpenFiles((current) => {
-      if (current.some((item) => item.path === path)) return current;
-      return [...current, { ...entry, path, kind: workspaceFileKind(entry), loading: true }];
-    });
-    const initialKind = workspaceFileKind(path);
-    if (initialKind === 'pdf') {
-      await loadPdfPreviewIntoTab({ ...entry, path }, { keepExistingPreview: options.keepExistingPreview });
-      return;
-    }
-    if (initialKind === 'presentation') {
-      setOpenFiles((current) => current.map((item) => (
-        item.path === path
-          ? {
-            ...item,
-            ...entry,
-            path,
-            kind: initialKind,
-            language: fileExtension(path),
-            content: '',
-            data: '',
-            loading: false
-          }
-          : item
-      )));
-      return;
-    }
-    try {
-      const file = await loadWorkspaceFileCached(selected.serverId, conversationId, path, undefined, { force: true, cache: false });
-      const kind = workspaceFileKind(path);
-      const data = kind === 'image'
-        ? workspaceFileImageDataUrl(path, file)
-        : file?.data || '';
-      setOpenFiles((current) => current.map((item) => (
-        item.path === path
-          ? {
-            ...item,
-            ...file,
-            kind,
-            language: fileExtension(path),
-            content: file?.encoding === 'utf8' ? file.data || '' : '',
-            data_url: kind === 'image' ? data : '',
-            loaded_at: Date.now(),
-            loading: false
-          }
-          : item
-      )));
-    } catch (error) {
-      setOpenFiles((current) => current.map((item) => (
-        item.path === path ? { ...item, loading: false, error: error?.message || '读取文件失败' } : item
-      )));
-      if (options.throwOnError) throw error;
-    }
-  }, [selected, loadPdfPreviewIntoTab, loadWorkspaceFileCached]);
-
-  const openWorkspacePathTarget = useCallback(async (target) => {
-    if (!selected || target?.path === undefined || target?.path === null) return;
-    const path = normalizeWorkspacePath(target.path);
-    const conversationId = String(target.conversationId || selected.conversationId || '').trim();
-    if (!conversationId) return;
-    const name = fileNameFromPath(path) || 'workspace';
-    const shouldTryDirectory = Boolean(target.explicitDirectory) || !fileExtension(path);
-    if (shouldTryDirectory) {
-      try {
-        await openWorkspaceFile({ path, name, kind: 'directory', conversationId }, { throwOnError: true });
-        return;
-      } catch (error) {
-        if (target.explicitDirectory) throw error;
-      }
-    }
-    await openWorkspaceFile({ path, name, conversationId }, { throwOnError: true });
-  }, [selected, openWorkspaceFile]);
-
   const openChatLocalLink = useCallback((href) => {
     if (!selected) return false;
     const target = workspaceTargetFromLocalLink(href, selected.conversationId, messageAttachmentWorkspaceRoots);
@@ -1908,85 +1562,16 @@ function App() {
     return true;
   }, [selected, messageAttachmentWorkspaceRoots, openWorkspacePathTarget]);
 
-  const refreshWorkspacePreviewFile = useCallback((file) => {
-    if (!file || file.path === undefined || file.path === null) return Promise.resolve();
-    return openWorkspaceFile(file, { keepExistingPreview: true });
-  }, [openWorkspaceFile]);
-
-  const resolveMarkdownAsset = useCallback(async (markdownPath, rawSrc) => {
-    const source = String(rawSrc || '').trim();
-    if (!source || /^(?:https?:|data:|blob:|file:)/i.test(source)) return source;
-    const path = resolveWorkspaceAssetPath(markdownPath, source);
-    if (!selected || !path || workspaceFileKind(path) !== 'image') return source;
-    const file = await loadWorkspaceFileCached(selected.serverId, selected.conversationId, path, undefined, { force: true, cache: false });
-    return workspaceFileImageDataUrl(path, file) || source;
-  }, [selected, loadWorkspaceFileCached]);
-
-  const uploadWorkspaceItems = useCallback(async (targetPath, dataTransferItems) => {
-    if (!selected || !dataTransferItems?.length) return;
-    const id = `upload-${Date.now()}`;
-    const target = normalizeWorkspacePath(targetPath);
-    try {
-      upsertTransfer(id, { type: 'upload', title: '上传工作区文件', detail: '正在读取拖入文件', state: 'running' });
-      const files = await collectDroppedFiles(dataTransferItems);
-      if (!files.length) {
-        finishTransfer(id, { state: 'done', detail: '没有可上传文件' });
-        return;
-      }
-      const stats = uploadPayloadStats(files);
-      upsertTransfer(id, { detail: `正在压缩 ${stats.fileCount} 个文件 · ${formatBytes(stats.bytes)}` });
-      const archive = await packFilesToTarGz(files);
-      if (archive.byteLength > MAX_UPLOAD_COMPRESSED_BYTES) {
-        throw new Error(`上传文件过大（压缩后超过 ${formatBytes(MAX_UPLOAD_COMPRESSED_BYTES)}）`);
-      }
-      upsertTransfer(id, { detail: `正在上传 ${formatBytes(archive.byteLength)}` });
-      await window.stellacode2.uploadWorkspace({
-        serverId: selected.serverId,
-        conversationId: selected.conversationId,
-        path: target,
-        data: archive
-      });
-      removeWorkspaceResourceCache('workspace-listing', [selected.serverId, selected.conversationId, target, 500]);
-      removeWorkspaceResourceCache('workspace-listing', [selected.serverId, selected.conversationId, parentWorkspacePath(target), 500]);
-      removeWorkspaceResourceCache('workspace-file', [selected.serverId, selected.conversationId, target, 'full']);
-      removeWorkspaceResourceCache('workspace-file', [selected.serverId, selected.conversationId, target, MESSAGE_IMAGE_PREVIEW_MAX_BYTES]);
-      setWorkspaceListings((current) => {
-        const next = new Map(current);
-        next.delete(target);
-        next.delete(parentWorkspacePath(target));
-        return next;
-      });
-      await fetchWorkspacePath(target, { force: true }).catch(() => fetchWorkspacePath(parentWorkspacePath(target), { force: true }));
-      finishTransfer(id, { state: 'done', detail: `上传完成 · ${stats.fileCount} 个文件` });
-    } catch (error) {
-      finishTransfer(id, { state: 'failed', detail: error?.message || '上传失败' });
-    }
-  }, [selected, upsertTransfer, finishTransfer, fetchWorkspacePath, removeWorkspaceResourceCache]);
-
-  const downloadWorkspaceEntry = useCallback(async (entry) => {
-    if (!selected || !entry) return;
-    const id = `download-${Date.now()}`;
-    const path = normalizeWorkspacePath(entry.path);
-    const conversationId = String(entry.conversationId || entry.conversation_id || selected.conversationId || '').trim();
-    if (!conversationId) return;
-    const kind = workspaceEntryKind(entry) === 'directory' ? 'directory' : 'file';
-    try {
-      upsertTransfer(id, { type: 'download', title: kind === 'file' ? '下载文件' : '下载文件夹', detail: entry.name || path, state: 'running' });
-      const result = await window.stellacode2.downloadWorkspace({
-        serverId: selected.serverId,
-        conversationId,
-        path,
-        kind,
-        suggestedName: entry.name || fileNameFromPath(path)
-      });
-      finishTransfer(id, {
-        state: result?.saved ? 'done' : 'cancelled',
-        detail: result?.saved ? `已保存 ${formatBytes(result.size)}` : '已取消'
-      });
-    } catch (error) {
-      finishTransfer(id, { state: 'failed', detail: error?.message || '下载失败' });
-    }
-  }, [selected, upsertTransfer, finishTransfer]);
+  const {
+    transfers,
+    uploadWorkspaceItems,
+    downloadWorkspaceEntry
+  } = useWorkspaceTransfers({
+    selected,
+    fetchWorkspacePath,
+    removeWorkspaceResourceCache,
+    setWorkspaceListings
+  });
 
   const openMessageAttachment = useCallback((attachment) => {
     const target = messageAttachmentWorkspaceTarget(attachment);
@@ -2554,145 +2139,6 @@ function App() {
     };
   }, [selectedServerId, selectedConversationId, selectedSessionId, markConversationRead]);
 
-  const toggleSidebar = () => {
-    const nextMode = sidebarMode === 'collapsed' ? 'expanded' : 'collapsed';
-    setSidebarMode(nextMode);
-    if (settings) {
-      saveSettings({ ...settings, sidebarMode: nextMode }).catch(() => {});
-    }
-  };
-
-  const resizeLayout = (kind, event) => {
-    if (!settings) return;
-    event.preventDefault();
-    const handle = event.currentTarget;
-    try {
-      handle.setPointerCapture?.(event.pointerId);
-    } catch {}
-    const root = event.currentTarget.closest('.app-root');
-    root?.classList.add('layout-resizing');
-    const scroll = root?.querySelector('.message-scroll');
-    const bottomOffset = scroll ? scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight : 0;
-    const startX = event.clientX;
-    const startY = event.clientY;
-    const terminalListMin = kind === 'terminalList'
-      ? measuredTerminalListMin(root)
-      : TERMINAL_LIST_MIN;
-    const startLayout = {
-      ...(settings.layout || {}),
-      sidebar: sidebarWidth,
-      inspector: overviewPanelWidth,
-      file: workspacePanelWidth,
-      preview: previewPanelWidth,
-      terminal: terminalHeight,
-      terminalList: terminalListWidth
-    };
-    let latestLayout = startLayout;
-    layoutDraftRef.current = startLayout;
-    let raf = 0;
-    const applyLayoutVars = () => {
-      if (!root) return;
-      const sidebar = sidebarMode === 'collapsed' ? SIDEBAR_COLLAPSED : latestLayout.sidebar;
-      const previewRight = workspacePanelOpen ? latestLayout.file : 0;
-      const overviewRight = previewRight + (previewPanelOpen ? latestLayout.preview : 0);
-      const contentRight = (overviewPanelOpen ? latestLayout.inspector : 0)
-        + (workspacePanelOpen ? latestLayout.file : 0)
-        + (previewPanelOpen ? latestLayout.preview : 0);
-      root.style.setProperty('--sidebar-width', `${sidebar}px`);
-      root.style.setProperty('--overview-panel-width', `${latestLayout.inspector}px`);
-      root.style.setProperty('--overview-panel-right', `${overviewRight}px`);
-      root.style.setProperty('--workspace-panel-width', `${latestLayout.file}px`);
-      root.style.setProperty('--preview-panel-width', `${latestLayout.preview}px`);
-      root.style.setProperty('--preview-panel-right', `${previewRight}px`);
-      root.style.setProperty('--terminal-height-live', `${latestLayout.terminal}px`);
-      root.style.setProperty('--terminal-list-width-live', `${latestLayout.terminalList}px`);
-      root.style.setProperty('--content-right', `${contentRight}px`);
-      if (scroll) {
-        scroll.scrollTop = scroll.scrollHeight - scroll.clientHeight - bottomOffset;
-      }
-    };
-    const move = (moveEvent) => {
-      const delta = moveEvent.clientX - startX;
-      if (kind === 'sidebar' && sidebarMode !== 'collapsed') {
-        latestLayout = {
-          ...latestLayout,
-          sidebar: clamp(startLayout.sidebar + delta, 220, 520)
-        };
-      } else if (kind === 'terminal' && terminalOpen) {
-        const deltaY = moveEvent.clientY - startY;
-        latestLayout = {
-          ...latestLayout,
-          terminal: clamp(startLayout.terminal - deltaY, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX)
-        };
-      } else if (kind === 'terminalList' && terminalOpen) {
-        latestLayout = {
-          ...latestLayout,
-          terminalList: clamp(startLayout.terminalList + delta, terminalListMin, TERMINAL_LIST_MAX)
-        };
-      } else if (kind === 'workspace' && workspacePanelOpen) {
-        latestLayout = {
-          ...latestLayout,
-          file: clamp(startLayout.file - delta, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX)
-        };
-      } else if (kind === 'preview' && previewPanelOpen) {
-        latestLayout = {
-          ...latestLayout,
-          preview: clamp(startLayout.preview - delta, 320, 820)
-        };
-      } else if (kind === 'overview' && overviewPanelOpen) {
-        latestLayout = {
-          ...latestLayout,
-          inspector: clamp(startLayout.inspector - delta, 320, 760)
-        };
-      }
-      if (!raf) {
-        raf = window.requestAnimationFrame(() => {
-          raf = 0;
-          layoutDraftRef.current = latestLayout;
-          applyLayoutVars();
-        });
-      }
-    };
-    const finish = () => {
-      if (raf) {
-        window.cancelAnimationFrame(raf);
-        raf = 0;
-      }
-      applyLayoutVars();
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', finish);
-      window.removeEventListener('pointercancel', finish);
-      try {
-        handle.releasePointerCapture?.(event.pointerId);
-      } catch {}
-      if (selectedKey && kind !== 'sidebar') {
-        setConversationLayout(latestLayout);
-      } else {
-        setSettings((prev) => prev ? { ...prev, layout: { ...(prev.layout || {}), ...latestLayout } } : prev);
-      }
-      const finalPreviewRight = workspacePanelOpen ? latestLayout.file : 0;
-      const finalOverviewRight = finalPreviewRight + (previewPanelOpen ? latestLayout.preview : 0);
-      const finalContentRight = (overviewPanelOpen ? latestLayout.inspector : 0)
-        + (workspacePanelOpen ? latestLayout.file : 0)
-        + (previewPanelOpen ? latestLayout.preview : 0);
-      root?.style.setProperty('--preview-panel-right', `${finalPreviewRight}px`);
-      root?.style.setProperty('--overview-panel-right', `${finalOverviewRight}px`);
-      root?.style.setProperty('--content-right', `${finalContentRight}px`);
-      layoutDraftRef.current = null;
-      window.requestAnimationFrame(() => {
-        root?.style.removeProperty('--terminal-height-live');
-        root?.style.removeProperty('--terminal-list-width-live');
-        root?.classList.remove('layout-resizing');
-      });
-      if (!selectedKey || kind === 'sidebar') {
-        saveSettings({ ...settings, layout: { ...(settings.layout || {}), ...latestLayout } }).catch(() => {});
-      }
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', finish);
-    window.addEventListener('pointercancel', finish);
-  };
-
   const loadOlderMessages = useCallback(async () => {
     if (!selected || loadingOlderRef.current || !hasOlderMessages(messagesRef.current)) return false;
     const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
@@ -2786,7 +2232,7 @@ function App() {
     const value = String(text || '').trim();
     const outgoingFiles = Array.isArray(files) ? files : [];
     const outgoingSelections = Array.isArray(selections) ? selections : [];
-    if ((!value && outgoingFiles.length === 0 && outgoingSelections.length === 0) || !selected || sending) return false;
+    if ((!value && outgoingFiles.length === 0 && outgoingSelections.length === 0) || !selected || sendingRef.current) return false;
     const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
     const commandState = outgoingFiles.length > 0
       ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
@@ -2882,7 +2328,7 @@ function App() {
     } finally {
       if (websocketKeyRef.current === key) setSending(false);
     }
-  }, [selected, selectedSessionId, sending, activeUserName]);
+  }, [selected, selectedSessionId, activeUserName]);
 
   const addSelectionReference = useCallback((selection) => {
     if (!selection?.file_path || !selection?.selected_text) return;
@@ -2932,7 +2378,6 @@ function App() {
         overviewPanelOpen={overviewPanelOpen}
         workspacePanelOpen={workspacePanelOpen}
         previewPanelOpen={previewPanelOpen}
-        rawRenderMessages={messages}
         updateReady={updateReady}
         onToggleOverview={() => setOverviewPanelOpen((value) => !value)}
         onToggleWorkspace={() => setWorkspacePanelOpen((value) => !value)}
@@ -2973,18 +2418,14 @@ function App() {
         />
       )}
       <main className="content-area">
-        <ChatWorkspace
+        <ChatSessionPane
           title={title}
           conversationKey={selectedKey}
           modelSelectionPending={Boolean(activeConversation?.model_selection_pending ?? selectedConversationStatus?.model_selection_pending)}
-          messages={messages}
-          messagesReady={messagesReady}
           mode={composerMode}
-          hasOlder={hasOlderMessages(messages)}
           onLoadOlder={loadOlderMessages}
           onSend={sendMessage}
           onLoadModels={loadAvailableModels}
-          sending={sending}
           processing={selectedProcessing}
           runningActivities={runningActivities}
           selectionReferences={selectionReferences}

@@ -1657,7 +1657,7 @@ mod tests {
             .get("attachment_make_visible")
             .unwrap()
             .description
-            .contains("Before referencing a file with <attachment>"));
+            .contains("Before referencing a remote-only file with [name](path) or ![alt](path)"));
     }
 
     #[test]

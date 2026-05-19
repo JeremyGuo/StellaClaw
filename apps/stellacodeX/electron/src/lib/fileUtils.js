@@ -1,5 +1,16 @@
+const messageTextCache = new WeakMap();
+
 export function messageText(message) {
   if (typeof message === 'string') return message;
+  if (!message || typeof message !== 'object') return '';
+  const cached = messageTextCache.get(message);
+  if (cached !== undefined) return cached;
+  const text = computeMessageText(message);
+  messageTextCache.set(message, text);
+  return text;
+}
+
+function computeMessageText(message) {
   if (typeof message?.text_with_attachment_markers === 'string' && message.text_with_attachment_markers.trim()) return message.text_with_attachment_markers;
   if (typeof message?.rendered_text === 'string' && message.rendered_text.trim()) return message.rendered_text;
   if (typeof message?.text === 'string' && message.text.trim()) return message.text;

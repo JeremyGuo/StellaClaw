@@ -2,44 +2,46 @@ import { messageIndex, messageItems } from './messageUtils';
 import { messageText } from './fileUtils';
 
 const STORAGE_KEY = 'stellacode.chatProtocolDiagnostics.v3';
-const VERBOSE_KEY = 'stellacode.chatProtocolDiagnostics.verbose';
 const MAX_RECORDS = 300;
 
 export function recordChatProtocolDiagnostic(kind, details = {}) {
+  const critical = isCriticalDiagnostic(kind, details?.category);
   if (!shouldRecordChatProtocolDiagnostic(kind, details?.category)) return;
   const record = {
     time: new Date().toISOString(),
     kind,
     ...sanitize(details)
   };
-  writeLocalRecord(record);
+  if (critical || isProtocolLogOpen()) {
+    writeLocalRecord(record);
+  }
   emitDiagnosticsEvent(record);
   if (typeof window !== 'undefined' && window.stellacode2?.appendProtocolLog) {
     window.stellacode2.appendProtocolLog(record).catch(() => {});
   }
-  if (kind.includes('mismatch') || kind.includes('warning') || kind.includes('gap')) {
+  if (critical) {
     console.warn(`[chat-protocol] ${kind}`, record);
   }
 }
 
 export function shouldRecordChatProtocolDiagnostic(kind, category = '') {
+  if (isCriticalDiagnostic(kind, category)) return true;
+  return isProtocolLogOpen();
+}
+
+function isCriticalDiagnostic(kind, category = '') {
   const value = String(kind || '');
-  if (
+  return (
     value.includes('mismatch')
     || value.includes('warning')
     || value.includes('gap')
     || value.includes('error')
     || String(category || '').includes('error')
-  ) {
-    return true;
-  }
-  if (typeof window === 'undefined') return false;
-  if (window.__stellacodeProtocolLogOpen) return true;
-  try {
-    return window.localStorage?.getItem(VERBOSE_KEY) === '1';
-  } catch {
-    return false;
-  }
+  );
+}
+
+function isProtocolLogOpen() {
+  return typeof window !== 'undefined' && Boolean(window.__stellacodeProtocolLogOpen);
 }
 
 export function readChatProtocolDiagnostics() {

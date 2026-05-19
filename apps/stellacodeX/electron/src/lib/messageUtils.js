@@ -1,5 +1,9 @@
 import { messageText } from './fileUtils';
 
+const messageItemsCache = new WeakMap();
+const splitMessageForDisplayCache = new WeakMap();
+const tokenUsageCache = new WeakMap();
+
 export function markerIndexes(value) {
   const indexes = new Set();
   String(value || '').replace(/\[\[attachment:(\d+)]]/g, (_, index) => {
@@ -20,21 +24,30 @@ export function isAuxiliaryUserMessage(message) {
 }
 
 export function messageItems(message) {
+  if (message && typeof message === 'object') {
+    const cached = messageItemsCache.get(message);
+    if (cached !== undefined) return cached;
+  }
   const renderedItems = Array.isArray(message?.items) ? message.items : [];
   const rawItems = Array.isArray(message?.data) ? message.data : [];
+  let result;
   if (!rawItems.length) {
-    return renderedItems
+    result = renderedItems
       .map((item, index) => normalizeRenderedMessageItem(item, index))
       .filter(Boolean);
+    if (message && typeof message === 'object') messageItemsCache.set(message, result);
+    return result;
   }
   const renderedByIndex = new Map(
     renderedItems
       .filter((item) => item?.index !== undefined)
       .map((item) => [Number(item.index), item])
   );
-  return rawItems
+  result = rawItems
     .map((item, index) => normalizeChatMessageItem(item, index, renderedByIndex))
     .filter(Boolean);
+  if (message && typeof message === 'object') messageItemsCache.set(message, result);
+  return result;
 }
 
 function normalizeRenderedMessageItem(item, index) {
@@ -220,8 +233,13 @@ export function firstToolNameForMessage(message) {
 }
 
 export function splitMessageForDisplay(message) {
+  if (message && typeof message === 'object') {
+    const cached = splitMessageForDisplayCache.get(message);
+    if (cached !== undefined) return cached;
+  }
   const usage = tokenUsage(message);
   const items = streamingAssistantDisplayItems(message, messageItems(message));
+  let result;
   if (items.length > 0) {
     const segments = [];
     let pendingNotes = [];
@@ -280,18 +298,24 @@ export function splitMessageForDisplay(message) {
           content: ''
         }
       : null;
-    return { textMessage, toolCards, segments };
+    result = { textMessage, toolCards, segments };
+    if (message && typeof message === 'object') splitMessageForDisplayCache.set(message, result);
+    return result;
   }
   const text = messageText(message);
   const toolCards = parseToolTextBlocks(text).map((card) => ({ ...card, usage }));
   if (!toolCards.length) {
-    return { textMessage: message, toolCards: [], segments: [] };
+    result = { textMessage: message, toolCards: [], segments: [] };
+    if (message && typeof message === 'object') splitMessageForDisplayCache.set(message, result);
+    return result;
   }
   const cleanedText = stripToolTextBlocks(text);
   const textMessage = cleanedText
     ? { ...message, text_with_attachment_markers: cleanedText, text: cleanedText, preview: cleanedText, content: cleanedText }
     : null;
-  return { textMessage, toolCards, segments: [{ notes: [], cards: toolCards }] };
+  result = { textMessage, toolCards, segments: [{ notes: [], cards: toolCards }] };
+  if (message && typeof message === 'object') splitMessageForDisplayCache.set(message, result);
+  return result;
 }
 
 function streamingAssistantDisplayItems(message, items) {
@@ -368,6 +392,10 @@ function topLevelMessageText(message) {
 }
 
 export function tokenUsage(message) {
+  if (message && typeof message === 'object') {
+    const cached = tokenUsageCache.get(message);
+    if (cached !== undefined) return cached;
+  }
   const usage = message?.token_usage || message?.usage || message?.response_usage || {};
   const input = Number(usage.uncache_input || usage.input || usage.input_tokens || usage.prompt_tokens || 0);
   const output = Number(usage.output || usage.output_tokens || usage.completion_tokens || 0);
@@ -380,7 +408,9 @@ export function tokenUsage(message) {
     + Number(cost.cache_write || 0)
     + Number(cost.uncache_input || cost.input || 0)
     + Number(cost.output || 0);
-  return { input, output, cacheRead, cacheWrite, total, cost: costTotal };
+  const result = { input, output, cacheRead, cacheWrite, total, cost: costTotal };
+  if (message && typeof message === 'object') tokenUsageCache.set(message, result);
+  return result;
 }
 
 export function formatTokens(value) {

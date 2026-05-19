@@ -1,4 +1,5 @@
 import { displayMessages, isFinalAssistantMessage, messageKey } from '../../lib/messageUtils';
+import { measureChatPerf } from '../../lib/chatPerfMetrics';
 
 export function buildChatRenderModel({
   messages,
@@ -7,11 +8,11 @@ export function buildChatRenderModel({
   processing = false,
   modelSelectionPending = false
 } = {}) {
-  const renderedMessages = displayMessages(messages || []);
-  const renderEntries = assistantTurnEntries(renderedMessages);
-  const entryKeys = renderEntries.map((entry, index) => chatRenderEntryKey(entry, index));
+  const renderedMessages = measureChatPerf('chat.render_model.display_messages', () => displayMessages(messages || []), { messages: messages?.length || 0 });
+  const renderEntries = measureChatPerf('chat.render_model.assistant_turn_entries', () => assistantTurnEntries(renderedMessages), { renderedMessages: renderedMessages.length });
+  const entryKeys = measureChatPerf('chat.render_model.entry_keys', () => renderEntries.map((entry, index) => chatRenderEntryKey(entry, index)), { entries: renderEntries.length });
   const latestAssistantTurnIndex = latestAssistantTurnEntryIndex(renderEntries);
-  const pendingAssistantVisible = shouldShowPendingAssistant(renderEntries, currentActivity, sending, processing);
+  const pendingAssistantVisible = measureChatPerf('chat.render_model.pending_assistant', () => shouldShowPendingAssistant(renderEntries, currentActivity, sending, processing), { entries: renderEntries.length });
   const responseSpacerVisible = Boolean(pendingAssistantVisible && renderedMessages.length > 0 && !modelSelectionPending);
   return {
     renderedMessages,

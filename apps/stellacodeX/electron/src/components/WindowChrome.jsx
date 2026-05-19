@@ -3,6 +3,7 @@ import { Copy, Download, FileSearch, Folder, MessageSquarePlus, Monitor, PanelLe
 import * as Popover from '@radix-ui/react-popover';
 import { clearChatProtocolDiagnostics, readChatProtocolDiagnostics } from '../lib/chatProtocolDiagnostics';
 import { chatRawRenderSnapshot, chatRenderOverviewText } from '../lib/chatRenderDiagnostics';
+import { getChatRuntimeSnapshot, subscribeChatRuntime } from '../lib/chatRuntimeStore';
 
 export function WindowChrome({
   title,
@@ -14,7 +15,6 @@ export function WindowChrome({
   overviewPanelOpen,
   workspacePanelOpen,
   previewPanelOpen,
-  rawRenderMessages = [],
   updateReady = false,
   onToggleOverview,
   onToggleWorkspace,
@@ -47,7 +47,7 @@ export function WindowChrome({
             Update
           </button>
         )}
-        <ProtocolLogButton rawRenderMessages={rawRenderMessages} />
+        <ProtocolLogButton />
         <TransferButton transfers={transfers} />
         <button className="chrome-button" type="button" onClick={onToggleTerminal} title="终端">
           <TerminalSquare size={18} />
@@ -66,10 +66,11 @@ export function WindowChrome({
   );
 }
 
-function ProtocolLogButton({ rawRenderMessages = [] }) {
+function ProtocolLogButton() {
   const [open, setOpen] = useState(false);
   const [records, setRecords] = useState(() => readChatProtocolDiagnostics());
   const [panel, setPanel] = useState('logs');
+  const [rawRenderMessages, setRawRenderMessages] = useState(() => getChatRuntimeSnapshot().messages);
   const [filters, setFilters] = useState(() => ({
     stream: false,
     append_stream_to_ui: true,
@@ -78,20 +79,25 @@ function ProtocolLogButton({ rawRenderMessages = [] }) {
   const [copyState, setCopyState] = useState('');
   const latest = records.at(-1);
   const visibleRecords = useMemo(() => records.filter((record) => logRecordVisible(record, filters)).slice(-220).reverse(), [records, filters]);
-  const rawRenderSnapshot = useMemo(() => chatRawRenderSnapshot(rawRenderMessages), [rawRenderMessages]);
+  const rawRenderSnapshot = useMemo(
+    () => chatRawRenderSnapshot(open && panel === 'raw' ? rawRenderMessages : []),
+    [open, panel, rawRenderMessages]
+  );
 
   useEffect(() => {
+    if (!open) return undefined;
     const onRecord = (event) => {
       setRecords((current) => [...current, event.detail].slice(-600));
     };
     const onClear = () => setRecords([]);
+    setRecords(readChatProtocolDiagnostics());
     window.addEventListener('stellacode:protocol-log', onRecord);
     window.addEventListener('stellacode:protocol-log-cleared', onClear);
     return () => {
       window.removeEventListener('stellacode:protocol-log', onRecord);
       window.removeEventListener('stellacode:protocol-log-cleared', onClear);
     };
-  }, []);
+  }, [open]);
 
   useEffect(() => {
     window.__stellacodeProtocolLogOpen = open;
@@ -99,6 +105,13 @@ function ProtocolLogButton({ rawRenderMessages = [] }) {
       window.__stellacodeProtocolLogOpen = false;
     };
   }, [open]);
+
+  useEffect(() => {
+    if (!open || panel !== 'raw') return undefined;
+    const refresh = () => setRawRenderMessages(getChatRuntimeSnapshot().messages);
+    refresh();
+    return subscribeChatRuntime(refresh);
+  }, [open, panel]);
 
   const copyLogs = async () => {
     try {

@@ -109,6 +109,10 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
   const [selectionMenu, setSelectionMenu] = useState(null);
 
   useEffect(() => {
+    if (!open && selectionMenu) setSelectionMenu(null);
+  }, [open, selectionMenu]);
+
+  useEffect(() => {
     if (!selectionMenu) return undefined;
     const close = () => setSelectionMenu(null);
     const closeOnEscape = (event) => {
@@ -148,6 +152,7 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
 
   return (
     <aside className={`right-panel preview-panel${open ? ' open' : ''}`} aria-hidden={!open}>
+      {open && (
       <section className="file-preview detached">
         <div className="editor-tabs">
           {openFiles.map((file) => (
@@ -226,6 +231,7 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
           document.body
         )}
       </section>
+      )}
     </aside>
   );
 }
@@ -438,6 +444,8 @@ function BinaryPreview({ file, icon, title, message, actionLabel, onDownloadFile
 
 function HtmlPreview({ file, name, source, language, onSelectionContextMenu }) {
   const [mode, setMode] = useState('render');
+  const renderUrl = htmlRenderableUrl(file);
+  const hasSource = String(source || '').trim().length > 0;
 
   useEffect(() => {
     setMode('render');
@@ -472,19 +480,33 @@ function HtmlPreview({ file, name, source, language, onSelectionContextMenu }) {
       </div>
       <div className="html-preview-body">
         {mode === 'render' ? (
-          <iframe
-            className="html-render-frame"
-            title={name}
-            sandbox=""
-            referrerPolicy="no-referrer"
-            srcDoc={source}
-          />
+          hasSource || renderUrl ? (
+            <iframe
+              className="html-render-frame"
+              title={name}
+              sandbox="allow-scripts allow-forms"
+              referrerPolicy="no-referrer"
+              src={hasSource ? undefined : renderUrl}
+              srcDoc={hasSource ? source : undefined}
+            />
+          ) : (
+            <div className="panel-placeholder">没有可渲染的 HTML 内容</div>
+          )
         ) : (
-          <CodePreview file={file} code={source} language={language || 'html'} sourceKind="html" onSelectionContextMenu={onSelectionContextMenu} />
+          hasSource ? (
+            <CodePreview file={file} code={source} language={language || 'html'} sourceKind="html" onSelectionContextMenu={onSelectionContextMenu} />
+          ) : (
+            <div className="panel-placeholder">当前预览只有渲染 URL，没有源码内容</div>
+          )
         )}
       </div>
     </div>
   );
+}
+
+function htmlRenderableUrl(file) {
+  const raw = file?.url || file?.data_url || file?.uri || file?.file_uri || '';
+  return /^(https?:|data:text\/html|blob:)/i.test(raw) ? raw : '';
 }
 
 function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelectionContextMenu }) {

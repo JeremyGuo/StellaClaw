@@ -99,12 +99,14 @@ fn common_prompt() -> &'static str {
 fn foreground_prompt() -> &'static str {
     "Session kind: foreground. You are interacting with the user directly. Prefer clear progress, \
      concrete code changes, and a short final summary with verification. In final assistant \
-     messages, place <attachment>relative/path/from/workspace_root</attachment> exactly where a \
-     produced file, image, HTML page, or other artifact should be embedded in the rendered reply. \
-     To embed artifacts, append one or more tags using exactly this format: \
-     <attachment>relative/path/from/workspace_root</attachment>. Attachment paths must be relative \
-     to the current workspace root, must not be absolute paths or file:// URIs, and must refer to \
-     files visible in the conversation workspace when the message is sent."
+     messages, reference produced artifacts with normal Markdown syntax: use \
+     ![alt text](relative/path/from/workspace_root.png) for images that should render inline, and \
+     [file name](relative/path/from/workspace_root.ext) for files, directories, or HTML pages the \
+     user can open from the message. For HTML preview, prefer a self-contained HTML file with inline \
+     CSS and link to it with Markdown. Artifact paths must be relative to the current workspace root, \
+     must not be absolute paths or file:// URIs, and must refer to files visible in the conversation \
+     workspace when the message is sent. Markdown math is supported with $...$, $$...$$, \\(...\\), \
+     and \\[...\\]."
 }
 
 fn background_prompt() -> &'static str {
@@ -250,15 +252,19 @@ mod tests {
         );
 
         assert!(foreground.contains("Session kind: foreground"));
-        assert!(foreground.contains("exactly where a"));
-        assert!(foreground.contains("<attachment>relative/path/from/workspace_root</attachment>"));
-        assert!(foreground.contains("Attachment paths must be relative"));
+        assert!(foreground.contains("normal Markdown syntax"));
+        assert!(foreground.contains("![alt text](relative/path/from/workspace_root.png)"));
+        assert!(foreground.contains("[file name](relative/path/from/workspace_root.ext)"));
+        assert!(foreground.contains("Artifact paths must be relative"));
+        assert!(foreground.contains("Markdown math is supported"));
         assert!(background.contains("Session kind: background"));
         assert!(subagent.contains("Session kind: subagent"));
-        assert!(!background.contains("exactly where a"));
-        assert!(!subagent.contains("exactly where a"));
-        assert!(!background.contains("Attachment paths must be relative"));
-        assert!(!subagent.contains("Attachment paths must be relative"));
+        assert!(!background.contains("normal Markdown syntax"));
+        assert!(!subagent.contains("normal Markdown syntax"));
+        assert!(!background.contains("Artifact paths must be relative"));
+        assert!(!subagent.contains("Artifact paths must be relative"));
+        assert!(!background.contains("Markdown math is supported"));
+        assert!(!subagent.contains("Markdown math is supported"));
     }
 
     #[test]
@@ -324,8 +330,11 @@ mod tests {
         );
 
         assert!(prompt.contains("For repository exploration"));
-        assert!(prompt.contains("<attachment>relative/path/from/workspace_root</attachment>"));
-        assert!(prompt.contains("Attachment paths must be relative"));
+        assert!(prompt.contains("normal Markdown syntax"));
+        assert!(prompt.contains("![alt text](relative/path/from/workspace_root.png)"));
+        assert!(prompt.contains("[file name](relative/path/from/workspace_root.ext)"));
+        assert!(prompt.contains("Artifact paths must be relative"));
+        assert!(prompt.contains("Markdown math is supported"));
         assert!(prompt.contains(".stellaclaw/shared/"));
         assert!(prompt.contains("STELLACLAW_SOFTWARE_DIR"));
         assert!(prompt.contains("Broad directory listings hide .stellaclaw/"));
@@ -339,7 +348,6 @@ mod tests {
         assert!(prompt.contains("When using shell for commands"));
         assert!(prompt.contains("shell_write_stdin with process_id only"));
         assert!(!prompt.contains("only after shell_make_visible"));
-        assert!(!prompt.contains("Before referencing a file with <attachment>"));
         assert!(!prompt.contains("prefer subagent_start"));
     }
 

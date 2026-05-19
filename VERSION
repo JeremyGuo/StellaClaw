@@ -3,11 +3,35 @@ version: 1.29.6
 
 # 1.29.6
 
-- 将 attachment 语法收敛到 foreground kind prompt：
-  `<attachment>relative/path/from/workspace_root</attachment>` 的完整格式和相对路径约束不再放在可能被 provider common prompt override 覆盖的 common prompt 中，而是放在 foreground session kind prompt 中，确保前台 final 消息始终保留附件嵌入规则。本次不改变 `config` schema，不改变 `workdir` schema。
+- 改用标准 Markdown artifact 渲染提示：
+  foreground system prompt 不再要求 final assistant 消息使用旧 artifact tag，改为用 `![alt](relative/path.png)` 内联渲染图片、用 `[name](relative/path.ext)` 链接文件/目录/HTML；Electron chat 会把本地 Markdown 图片路径按 workspace artifact 解析并用现有附件预览渲染，文件链接继续打开右侧预览。本次不改变 `config` schema，不改变 `workdir` schema。
 
-- 补充 foreground session 的 attachment 渲染提示：
-  foreground system prompt 现在明确说明 final assistant 消息中可以把 `<attachment>relative/path/from/workspace_root</attachment>` 放在希望嵌入文件、图片、HTML 或其它 artifact 的具体位置，便于前端按 final 文本位置渲染附件。本次不改变 `config` schema，不改变 `workdir` schema。
+- 改进 StellaCodeX Electron HTML 预览：
+  右侧文件预览和 chat 内联 HTML artifact 默认以内嵌 iframe 渲染页面，并提供“预览 / 源码”两个 tab；有源码时用 `srcDoc` 渲染并保留源码查看，没有源码但有可访问 URL 时仍可渲染页面。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 拆分 StellaCodeX Electron 高频 chat runtime 状态：
+  `messages` / `messagesReady` / `sending` 从 `App` 顶层 React state 移入独立 runtime store，由 `ChatSessionPane` / `ChatWorkspace` 单独订阅；右上角 Raw Render 诊断改为打开 Raw 面板时才订阅消息并构建 snapshot，避免普通 stream delta 重渲染顶栏、Conversation Bar、文件预览和其它全局面板。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 拆分 StellaCodeX Electron 窗口布局状态：
+  sidebar、右侧面板、Terminal 开关和尺寸、拖拽 resize 逻辑迁入 `useAppLayout`，`App` 仅保留 session UI restore/save 的协调职责，减少顶层状态和布局事件处理代码堆叠。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 拆分 StellaCodeX Electron workspace / preview 状态：
+  workspace 文件树、展开/加载/错误状态、打开文件列表、当前文件路径、本地 workspace resource cache 和 cached file loader 迁入 `useWorkspaceState`，`App` 继续负责具体后端 API workflow 和面板协调，降低顶层 state/ref 数量并把文件预览 URL 清理收敛到 workspace 状态模块。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 拆分 StellaCodeX Electron workspace workflow：
+  workspace 路径加载、目录展开、打开文件/目录、PDF preview、文件刷新和 Markdown 本地图片解析迁入 `useWorkspaceWorkflow`；`App` 保留上传下载、消息附件入口和 session restore/save 协调，进一步降低顶层文件预览工作流复杂度。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 拆分 StellaCodeX Electron workspace transfer workflow：
+  上传/下载传输状态、上传压缩流程、下载保存流程和传输提示生命周期迁入 `useWorkspaceTransfers`，`App` 只传入当前 session、workspace cache invalidation 和刷新入口，继续减少顶层 transfer 状态与文件操作流程耦合。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 StellaCodeX Electron 空闲后台 CPU 占用：
+  文件预览面板关闭时不再继续挂载 active file 的实际预览内容，避免 PDF/大文件预览的 worker、ResizeObserver、scroll listener 和渲染队列在不可见状态下继续运行；全局 LOG 关闭时也不再订阅普通协议事件或写入高频 stream 诊断，只保留 mismatch / gap / warning / error 等关键诊断。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 StellaCodeX Electron streaming tool 渲染性能：
+  折叠的工具详情不再提前构建和解析大 payload；streaming tool 的展开详情避免对半截工具参数反复 JSON / diff 解析；历史消息的文本、结构化 item、token usage 和工具展示拆分结果增加对象级缓存，减少工具参数流式增长时的全量派生计算。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增加 StellaCodeX Electron Chat 性能诊断面板：
+  Chat 左下角新增 `(i)` 性能面板，按需展示 render model、virtual window、tool group、tool card、Markdown commit、workspace commit 和 frame gap 等聚合耗时及慢事件；平时仅记录轻量 `performance.now()` 聚合，打开面板时才刷新 UI 和采样 frame gap，便于定位 streaming tool 卡顿热点。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 修复 turn 中插入用户消息后 provider worker 复用已取消进程：
   forkserver 收到 provider request cancel 时会 kill 并移除正在执行的 worker；ProviderSession 现在会在 Abort 活跃请求后同步清空本地 cached worker binding，并在 forkserver 返回 `unknown provider worker` 时清空 stale binding、用同一 request_id 重建 worker 重试一次，避免下一条请求复用已经不存在的 `provider_worker_*` 导致插队消息后后端卡住。本次不改变 `config` schema，不改变 `workdir` schema。
