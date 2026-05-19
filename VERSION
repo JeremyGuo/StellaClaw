@@ -3,6 +3,9 @@ version: 1.29.6
 
 # 1.29.6
 
+- 补充 foreground session 的 attachment 渲染提示：
+  foreground system prompt 现在明确说明 final assistant 消息中可以把 `<attachment>relative/path/from/workspace_root</attachment>` 放在希望嵌入文件、图片、HTML 或其它 artifact 的具体位置，便于前端按 final 文本位置渲染附件。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 turn 中插入用户消息后 provider worker 复用已取消进程：
   forkserver 收到 provider request cancel 时会 kill 并移除正在执行的 worker；ProviderSession 现在会在 Abort 活跃请求后同步清空本地 cached worker binding，并在 forkserver 返回 `unknown provider worker` 时清空 stale binding、用同一 request_id 重建 worker 重试一次，避免下一条请求复用已经不存在的 `provider_worker_*` 导致插队消息后后端卡住。本次不改变 `config` schema，不改变 `workdir` schema。
 

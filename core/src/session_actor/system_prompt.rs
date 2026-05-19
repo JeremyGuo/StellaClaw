@@ -102,7 +102,9 @@ fn common_prompt() -> &'static str {
 
 fn foreground_prompt() -> &'static str {
     "Session kind: foreground. You are interacting with the user directly. Prefer clear progress, \
-     concrete code changes, and a short final summary with verification."
+     concrete code changes, and a short final summary with verification. In final assistant \
+     messages, place <attachment>relative/path/from/workspace_root</attachment> exactly where a \
+     produced file, image, HTML page, or other artifact should be embedded in the rendered reply."
 }
 
 fn background_prompt() -> &'static str {
@@ -248,8 +250,12 @@ mod tests {
         );
 
         assert!(foreground.contains("Session kind: foreground"));
+        assert!(foreground.contains("exactly where a"));
+        assert!(foreground.contains("<attachment>relative/path/from/workspace_root</attachment>"));
         assert!(background.contains("Session kind: background"));
         assert!(subagent.contains("Session kind: subagent"));
+        assert!(!background.contains("exactly where a"));
+        assert!(!subagent.contains("exactly where a"));
     }
 
     #[test]
