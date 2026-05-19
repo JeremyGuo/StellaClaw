@@ -939,7 +939,40 @@ fn fork_server_provider_session_loop(
                         {
                             continue;
                         }
-                        active = None;
+                        let mut completed_active = active
+                            .take()
+                            .expect("active fork-server request should exist");
+                        if is_unknown_provider_worker_result(&result)
+                            && completed_active.unknown_worker_retries_remaining > 0
+                        {
+                            worker = None;
+                            completed_active.unknown_worker_retries_remaining = completed_active
+                                .unknown_worker_retries_remaining
+                                .saturating_sub(1);
+                            if let Some(request) = completed_active.retry_request.clone() {
+                                match start_fork_server_request(
+                                    &model_config,
+                                    &fork_server,
+                                    &mut worker,
+                                    &completed_active.request_id,
+                                    request,
+                                    fork_server_event_tx.clone(),
+                                ) {
+                                    Ok(abort_handle) => {
+                                        completed_active.abort_handle = Some(abort_handle);
+                                        active = Some(completed_active);
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let _ = event_tx.send(ProviderEvent::Result {
+                                            request_id,
+                                            result: Err(error),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         if should_recreate_provider_worker(&result) {
                             worker = None;
                         }
@@ -966,6 +999,18 @@ fn compact_on_fork_server_worker(
     {
         return Ok(None);
     }
+    let worker_id = ensure_fork_server_worker(model_config, fork_server, worker)?;
+    let first_result = fork_server
+        .compact_on_worker(worker_id, request.clone())
+        .and_then(|handle| handle.wait().map(Some));
+    if !first_result
+        .as_ref()
+        .is_err_and(is_unknown_provider_worker_error)
+    {
+        return first_result;
+    }
+
+    *worker = None;
     let worker_id = ensure_fork_server_worker(model_config, fork_server, worker)?;
     fork_server
         .compact_on_worker(worker_id, request)
@@ -1002,13 +1047,15 @@ fn start_fork_server_session_request(
         fork_server,
         worker,
         &request_id,
-        request,
+        request.clone(),
         event_tx,
     )?;
     Ok(ProviderActiveRequest {
         request_id,
         cancelled: Arc::new(AtomicBool::new(false)),
         abort_handle: Some(abort_handle),
+        retry_request: Some(request),
+        unknown_worker_retries_remaining: 1,
     })
 }
 
@@ -1077,16 +1124,33 @@ fn should_recreate_provider_worker(result: &Result<ChatMessage, ProviderError>) 
     matches!(
         result,
         Err(ProviderError::Subprocess(message))
-            if message.contains("unknown provider worker")
+            if is_unknown_provider_worker_message(message)
                 || message.contains("provider worker")
                     && message.contains("exited before completing request")
     )
+}
+
+fn is_unknown_provider_worker_result(result: &Result<ChatMessage, ProviderError>) -> bool {
+    result.as_ref().is_err_and(is_unknown_provider_worker_error)
+}
+
+fn is_unknown_provider_worker_error(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::Subprocess(message) if is_unknown_provider_worker_message(message)
+    )
+}
+
+fn is_unknown_provider_worker_message(message: &str) -> bool {
+    message.contains("unknown provider worker")
 }
 
 struct ProviderActiveRequest {
     request_id: String,
     cancelled: Arc<AtomicBool>,
     abort_handle: Option<ProviderRequestAbortHandle>,
+    retry_request: Option<ProviderRequestOwned>,
+    unknown_worker_retries_remaining: u8,
 }
 
 impl ProviderActiveRequest {
@@ -1119,6 +1183,8 @@ fn start_provider_session_request(
             request_id,
             cancelled: Arc::new(AtomicBool::new(false)),
             abort_handle: Some(abort_handle),
+            retry_request: None,
+            unknown_worker_retries_remaining: 0,
         });
     }
 
@@ -1158,6 +1224,8 @@ fn start_provider_session_request(
         request_id,
         cancelled,
         abort_handle: None,
+        retry_request: None,
+        unknown_worker_retries_remaining: 0,
     })
 }
 

@@ -4,7 +4,7 @@ version: 1.29.6
 # 1.29.6
 
 - 修复 turn 中插入用户消息后 provider worker 复用已取消进程：
-  forkserver 收到 provider request cancel 时会 kill 并移除正在执行的 worker；ProviderSession 现在会在 Abort 活跃请求后同步清空本地 cached worker binding，避免下一条请求复用已经不存在的 `provider_worker_*` 并返回 `unknown provider worker`，导致插队消息后后端卡住。本次不改变 `config` schema，不改变 `workdir` schema。
+  forkserver 收到 provider request cancel 时会 kill 并移除正在执行的 worker；ProviderSession 现在会在 Abort 活跃请求后同步清空本地 cached worker binding，并在 forkserver 返回 `unknown provider worker` 时清空 stale binding、用同一 request_id 重建 worker 重试一次，避免下一条请求复用已经不存在的 `provider_worker_*` 导致插队消息后后端卡住。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 修复 Web Terminal 响应路由和 Session 级前端布局状态：
   Terminal summary 的 `created_ms` / `updated_ms` 改为 JSON 可往返的 `u64` 毫秒，避免 TerminalService 已通过 ServiceChannel 返回 `terminal` / `terminals` payload 后，ChannelService 因 `serde_json` 不支持反序列化 `u128` 而记录 `bad_terminal_payload` 并让 Web 请求等到 30s 超时。ChannelService 向 TerminalService 转发请求时会携带 `request_id`，并优先按 Terminal `response_id` 精确匹配响应；Kernel 返回的 terminal 请求错误也会回到对应 Web Terminal 请求。StellaCodeX Electron 的右侧面板开关、面板宽度、打开文件和当前预览文件改为按 foreground session 持久化，避免同一 Conversation 下不同 Session 互相覆盖窗口状态。本次不改变 `config` schema，不改变 `workdir` schema。
