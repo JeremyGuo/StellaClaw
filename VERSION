@@ -3,6 +3,9 @@ version: 1.29.6
 
 # 1.29.6
 
+- 修复 interrupt 后 provider forkserver worker 生命周期不一致：
+  forkserver `StartWorker` 现在必须返回 worker 启动 ack 后父侧才缓存 `provider_worker_*` 并发送请求；pipe/fork 失败会返回真实错误，不再静默吞掉并导致后续 `StartOnWorker` 报 `unknown provider worker`。同时 provider worker 在 cancel、shutdown 和 forkserver 退出时会回收子进程，避免 Turn 中插入用户消息反复 kill worker 后积累 zombie/进程资源。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 改用标准 Markdown artifact 渲染提示：
   foreground system prompt 不再要求 final assistant 消息使用旧 artifact tag，改为用 `![alt](relative/path.png)` 内联渲染图片、用 `[name](relative/path.ext)` 链接文件/目录/HTML；Electron chat 会把本地 Markdown 图片路径按 workspace artifact 解析并用现有附件预览渲染，文件链接继续打开右侧预览。本次不改变 `config` schema，不改变 `workdir` schema。
 
