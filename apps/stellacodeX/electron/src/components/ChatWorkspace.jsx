@@ -98,6 +98,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const loadingOlderRef = useRef(false);
   const prependAdjustRef = useRef(null);
   const stickToBottomRef = useRef(true);
+  const stickyScrollPausedUntilRef = useRef(0);
+  const stickyAnchorRestoreTimerRef = useRef(0);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
@@ -119,6 +121,28 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     return isExecutionMessage(lastMessage);
   }, [messages, messagesReady, sending, processing, currentActivity]);
   const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
+
+  const stickyAutoScrollEnabled = useCallback(() => (
+    stickToBottomRef.current && Date.now() >= stickyScrollPausedUntilRef.current
+  ), []);
+
+  const pauseStickyAutoScroll = useCallback((durationMs = 420) => {
+    stickyScrollPausedUntilRef.current = Math.max(
+      stickyScrollPausedUntilRef.current,
+      Date.now() + durationMs
+    );
+    const list = scrollRef.current;
+    if (list) {
+      list.style.setProperty('overflow-anchor', 'none');
+      if (stickyAnchorRestoreTimerRef.current) {
+        window.clearTimeout(stickyAnchorRestoreTimerRef.current);
+      }
+      stickyAnchorRestoreTimerRef.current = window.setTimeout(() => {
+        stickyAnchorRestoreTimerRef.current = 0;
+        list.style.removeProperty('overflow-anchor');
+      }, durationMs);
+    }
+  }, []);
 
   useRenderCommitPerf('chat.workspace.render_commit', renderStartedAt, () => ({
       messages: messages?.length || 0,
@@ -189,7 +213,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
 
   useLayoutEffect(() => {
     updateResponseSpacerMetrics();
-    if (stickToBottomRef.current) {
+    if (stickyAutoScrollEnabled()) {
       requestAnimationFrame(scrollToBottom);
     }
   }, [responseSpacerVisible, activeMessageScope, renderedMessages.length, messages.length, newestMessageKey, messagesReady, activitySignature, pendingAssistantVisible]);
@@ -203,7 +227,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       measureChatPerf('chat.resize_observer.message_scroll', () => {
         updateResponseSpacerMetrics();
         syncViewport();
-        if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
+        if (stickyAutoScrollEnabled()) requestAnimationFrame(scrollToBottom);
       });
     });
     observer.observe(list);
@@ -234,7 +258,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       }, { visible: virtualWindow.items.length });
       if (changed) {
         setVirtualHeightVersion((value) => value + 1);
-        if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
+        if (stickyAutoScrollEnabled()) requestAnimationFrame(scrollToBottom);
       }
     };
     const scheduleMeasure = () => {
@@ -259,7 +283,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
     updateComposerMetrics();
-    if (stickToBottomRef.current) {
+    if (stickyAutoScrollEnabled()) {
       requestAnimationFrame(scrollToBottom);
     }
   }, [draft, composerAttachments.length, selectionReferences.length]);
@@ -270,7 +294,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     }
   }, [modelSelectionPending, activeMessageScope]);
 
-  const scrollToBottom = () => {
+  const scrollToBottom = (options) => {
+    const force = Boolean(options && typeof options === 'object' && options.force);
+    if (!force && !stickyAutoScrollEnabled()) return;
     const list = scrollRef.current;
     if (!list) return;
     list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
@@ -297,7 +323,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       const { previousScrollHeight, previousScrollTop } = prependAdjustRef.current;
       prependAdjustRef.current = null;
       list.scrollTop = previousScrollTop + (list.scrollHeight - previousScrollHeight);
-    } else if ((previousCountRef.current === 0 && renderedMessages.length > 0) || stickToBottomRef.current) {
+    } else if ((previousCountRef.current === 0 && renderedMessages.length > 0) || stickyAutoScrollEnabled()) {
       scrollToBottom();
       requestAnimationFrame(() => {
         scrollToBottom();
@@ -312,8 +338,14 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     loadingOlderRef.current = false;
     prependAdjustRef.current = null;
     stickToBottomRef.current = true;
+    stickyScrollPausedUntilRef.current = 0;
+    if (stickyAnchorRestoreTimerRef.current) {
+      window.clearTimeout(stickyAnchorRestoreTimerRef.current);
+      stickyAnchorRestoreTimerRef.current = 0;
+    }
+    scrollRef.current?.style.removeProperty('overflow-anchor');
     setViewport({ scrollTop: 0, clientHeight: scrollRef.current?.clientHeight || 0 });
-    requestAnimationFrame(scrollToBottom);
+    requestAnimationFrame(() => scrollToBottom({ force: true }));
     setDraft('');
     setComposerAttachments((current) => {
       current.forEach((attachment) => {
@@ -328,6 +360,10 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   }, [composerAttachments]);
 
   useEffect(() => () => {
+    if (stickyAnchorRestoreTimerRef.current) {
+      window.clearTimeout(stickyAnchorRestoreTimerRef.current);
+      stickyAnchorRestoreTimerRef.current = 0;
+    }
     composerAttachmentsRef.current.forEach((attachment) => {
       if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
     });
@@ -514,6 +550,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           onDownloadAttachment={onDownloadAttachment}
           onResolveAttachmentUrl={onResolveAttachmentUrl}
           onOpenLocalLink={onOpenLocalLink}
+          onToolToggleInteraction={pauseStickyAutoScroll}
         />
       </div>
       <ChatPerfPopover />
@@ -738,7 +775,8 @@ function MessageStreamView({
   onOpenAttachment,
   onDownloadAttachment,
   onResolveAttachmentUrl,
-  onOpenLocalLink
+  onOpenLocalLink,
+  onToolToggleInteraction
 }) {
   if (modelSelectionPending) {
     return (
@@ -778,6 +816,7 @@ function MessageStreamView({
                 onDownloadAttachment={onDownloadAttachment}
                 onResolveAttachmentUrl={onResolveAttachmentUrl}
                 onOpenLocalLink={onOpenLocalLink}
+                onToolToggleInteraction={onToolToggleInteraction}
               />
             )
             : (
@@ -832,7 +871,8 @@ const MemoMessageStreamView = memo(MessageStreamView, (previous, next) => {
     && previous.onOpenAttachment === next.onOpenAttachment
     && previous.onDownloadAttachment === next.onDownloadAttachment
     && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
-    && previous.onOpenLocalLink === next.onOpenLocalLink;
+    && previous.onOpenLocalLink === next.onOpenLocalLink
+    && previous.onToolToggleInteraction === next.onToolToggleInteraction;
 });
 
 function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }) {
@@ -1112,12 +1152,17 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-export function AssistantTurn({ entry, active = false, elapsedNowMs, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+export function AssistantTurn({ entry, active = false, elapsedNowMs, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, onToolToggleInteraction }) {
   const finalMessage = entry.finalMessage;
   const complete = isFinalAssistantMessage(finalMessage);
   return (
     <section className={`assistant-turn${active ? ' active' : ''}${complete ? ' complete' : ''}`}>
-      <MemoToolProcessGroup group={entry.processGroup} active={active} elapsedNowMs={elapsedNowMs} />
+      <MemoToolProcessGroup
+        group={entry.processGroup}
+        active={active}
+        elapsedNowMs={elapsedNowMs}
+        onToggleInteraction={onToolToggleInteraction}
+      />
       {finalMessage && (
         <MemoMessageArticle
           message={finalMessage}
@@ -1138,6 +1183,7 @@ const MemoAssistantTurn = memo(AssistantTurn, (previous, next) => (
   && previous.onDownloadAttachment === next.onDownloadAttachment
   && previous.onResolveAttachmentUrl === next.onResolveAttachmentUrl
   && previous.onOpenLocalLink === next.onOpenLocalLink
+  && previous.onToolToggleInteraction === next.onToolToggleInteraction
   && sameAssistantTurnEntry(previous.entry, next.entry)
 ));
 
@@ -1181,7 +1227,7 @@ function sameToolGroup(left, right) {
   return true;
 }
 
-export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
+export function ToolProcessGroup({ group, active = false, elapsedNowMs, onToggleInteraction }) {
   const renderStartedAt = renderCommitStart();
   const messages = group.messages || [];
   const expandedRows = useMemo(() => measureChatPerf('chat.tool_group.expand_rows', () => messages.map((message, index) => {
@@ -1210,7 +1256,8 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
   const waitingForNextItem = activeTail && toolsComplete && !hasFinalMessage;
   const complete = !activeTail && (hasFinalMessage || toolsComplete);
   const [open, setOpen] = useState(() => !hasFinalMessage);
-  const bodyPresent = useDeferredPresence(open, 180);
+  const bodyPresence = useCollapsePresence(open, 190);
+  const captureToggleAnchor = useStableToggleAnchor(open);
   const wasActiveTailRef = useRef(activeTail);
   const hadFinalMessageRef = useRef(hasFinalMessage);
   useEffect(() => {
@@ -1227,6 +1274,7 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
   }, [hasFinalMessage]);
   const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete, active ? elapsedNowMs : undefined);
   const summary = useMemo(() => measureChatPerf('chat.tool_group.summary', () => toolRoundSummary(blocks), { blocks: blocks.length }), [blocks]);
+  const compactPresence = useCollapsePresence(!open && summary.total > 0, 150);
   const title = toolRoundTitle(elapsed, complete, summary);
   useRenderCommitPerf('chat.tool_group.render_commit', renderStartedAt, () => ({
     messages: messages.length,
@@ -1235,24 +1283,38 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
     open
   }));
   return (
-    <section className={`tool-process-group${open ? ' open' : ''}${complete ? ' complete' : ''}${activeTail ? ' active' : ''}`}>
-      <button className="tool-round-toggle" type="button" onClick={() => setOpen((value) => !value)}>
+    <section className={`tool-process-group${open ? ' open' : ''}${bodyPresence.present || compactPresence.present ? ' layout-active' : ''}${complete ? ' complete' : ''}${activeTail ? ' active' : ''}`}>
+      <button
+        className="tool-round-toggle"
+        type="button"
+        onClick={(event) => {
+          captureToggleAnchor(event.currentTarget);
+          onToggleInteraction?.();
+          setOpen((value) => !value);
+        }}
+      >
         <span>{title}</span>
         {summary.total > 0 && <em>{summary.label}</em>}
         <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
       </button>
-      {!open && summary.total > 0 && (
-        <div className="tool-round-compact" aria-hidden="true">
-          {summary.names.slice(0, 4).map((name, index) => (
-            <code key={`${name}-${index}`}>{name}</code>
-          ))}
-          {summary.extra > 0 && <code>+{summary.extra}</code>}
+      {summary.total > 0 && (
+        <div className={`tool-round-compact-shell${compactPresence.visible ? ' body-open' : ''}`} aria-hidden={open}>
+          <div className="tool-round-compact-clip">
+            {compactPresence.present && (
+              <div className="tool-round-compact">
+                {summary.names.slice(0, 4).map((name, index) => (
+                  <code key={`${name}-${index}`}>{name}</code>
+                ))}
+                {summary.extra > 0 && <code>+{summary.extra}</code>}
+              </div>
+            )}
+          </div>
         </div>
       )}
       <div className="tool-round-separator" aria-hidden="true" />
-      <div className="tool-round-body-shell" aria-hidden={!open}>
+      <div className={`tool-round-body-shell${bodyPresence.visible ? ' body-open' : ''}`} aria-hidden={!open}>
         <div className="tool-round-body-clip">
-          {bodyPresent && (
+          {bodyPresence.present && (
             <div className="tool-process-round-body">
               {blocks.map((block, index) => {
                 if (block.type === 'tools') {
@@ -1263,6 +1325,7 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
                       block={block}
                       complete={complete || cardsComplete}
                       running={!cardsComplete && index === lastToolBlockIndex && activeTail}
+                      onToggleInteraction={onToggleInteraction}
                     />
                   );
                 }
@@ -1282,20 +1345,83 @@ export function ToolProcessGroup({ group, active = false, elapsedNowMs }) {
 const MemoToolProcessGroup = memo(ToolProcessGroup, (previous, next) => (
   previous.active === next.active
   && previous.elapsedNowMs === next.elapsedNowMs
+  && previous.onToggleInteraction === next.onToggleInteraction
   && sameToolGroup(previous.group, next.group)
 ));
 
-function useDeferredPresence(present, delayMs) {
-  const [mounted, setMounted] = useState(present);
-  useEffect(() => {
-    if (present) {
-      setMounted(true);
-      return undefined;
+function useCollapsePresence(open, durationMs) {
+  const [present, setPresent] = useState(open);
+  const [visible, setVisible] = useState(open);
+  const frameRef = useRef(0);
+  const timerRef = useRef(0);
+
+  useLayoutEffect(() => {
+    if (frameRef.current) {
+      window.cancelAnimationFrame(frameRef.current);
+      frameRef.current = 0;
     }
-    const timer = window.setTimeout(() => setMounted(false), delayMs);
-    return () => window.clearTimeout(timer);
-  }, [delayMs, present]);
-  return mounted;
+    if (timerRef.current) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = 0;
+    }
+
+    if (open) {
+      setPresent(true);
+      setVisible(false);
+      frameRef.current = window.requestAnimationFrame(() => {
+        frameRef.current = 0;
+        setVisible(true);
+      });
+      return () => {
+        if (frameRef.current) {
+          window.cancelAnimationFrame(frameRef.current);
+          frameRef.current = 0;
+        }
+      };
+    }
+
+    setVisible(false);
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = 0;
+      setPresent(false);
+    }, durationMs);
+    return () => {
+      if (timerRef.current) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = 0;
+      }
+    };
+  }, [durationMs, open]);
+
+  return { present, visible };
+}
+
+function useStableToggleAnchor(open) {
+  const anchorRef = useRef(null);
+
+  const captureToggleAnchor = useCallback((node) => {
+    const scrollParent = node?.closest?.('.message-scroll');
+    if (!node || !scrollParent) return;
+    anchorRef.current = {
+      node,
+      scrollParent,
+      top: node.getBoundingClientRect().top
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const anchor = anchorRef.current;
+    if (!anchor) return;
+    anchorRef.current = null;
+    if (!anchor.node.isConnected || !anchor.scrollParent.isConnected) return;
+    const nextTop = anchor.node.getBoundingClientRect().top;
+    const delta = nextTop - anchor.top;
+    if (Math.abs(delta) > 0.5) {
+      anchor.scrollParent.scrollTop += delta;
+    }
+  }, [open]);
+
+  return captureToggleAnchor;
 }
 
 function useToolRoundElapsed(messages, nextMessage, complete, nowMs) {
@@ -1444,10 +1570,12 @@ function toolProcessBlocks(rows) {
   return blocks;
 }
 
-function ToolProcessSegment({ block, complete, running = false }) {
+function ToolProcessSegment({ block, complete, running = false, onToggleInteraction }) {
   const [open, setOpen] = useState(() => Boolean(running));
   const manualOpenRef = useRef(false);
   const wasRunningRef = useRef(Boolean(running));
+  const bodyPresence = useCollapsePresence(open, 170);
+  const captureToggleAnchor = useStableToggleAnchor(open);
   const toolRows = useMemo(() => mergedToolCards(block.cards), [block.cards]);
   const firstName = useMemo(() => block.cards[0]?.name || 'tool', [block.cards]);
   const summary = useMemo(() => toolGroupSummary(block.cards, firstName), [block.cards, firstName]);
@@ -1466,7 +1594,9 @@ function ToolProcessSegment({ block, complete, running = false }) {
       <button
         className="tool-process-toggle"
         type="button"
-        onClick={() => {
+        onClick={(event) => {
+          captureToggleAnchor(event.currentTarget);
+          onToggleInteraction?.();
           manualOpenRef.current = true;
           setOpen((value) => !value);
         }}
@@ -1475,22 +1605,27 @@ function ToolProcessSegment({ block, complete, running = false }) {
         <span>{title}</span>
         <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
       </button>
-      {open && (
-        <div className="tool-process-body">
-          {toolRows.map((card) => (
-            <MemoToolInlineCard
-              key={card.renderId}
-              kind={card.kind}
-              name={card.name}
-              payload={card.payload}
-              callPayload={card.callPayload}
-              resultPayload={card.resultPayload}
-              usage={card.usage}
-              running={card.running}
-            />
-          ))}
+      <div className={`tool-process-body-shell${bodyPresence.visible ? ' body-open' : ''}`} aria-hidden={!open}>
+        <div className="tool-process-body-clip">
+          {bodyPresence.present && (
+            <div className="tool-process-body">
+              {toolRows.map((card) => (
+                <MemoToolInlineCard
+                  key={card.renderId}
+                  kind={card.kind}
+                  name={card.name}
+                  payload={card.payload}
+                  callPayload={card.callPayload}
+                  resultPayload={card.resultPayload}
+                  usage={card.usage}
+                  running={card.running}
+                  onToggleInteraction={onToggleInteraction}
+                />
+              ))}
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </section>
   );
 }
@@ -1498,6 +1633,7 @@ function ToolProcessSegment({ block, complete, running = false }) {
 const MemoToolProcessSegment = memo(ToolProcessSegment, (previous, next) => (
   previous.complete === next.complete
   && previous.running === next.running
+  && previous.onToggleInteraction === next.onToggleInteraction
   && sameToolBlock(previous.block, next.block)
 ));
 
@@ -2772,9 +2908,11 @@ function diffMarker(type) {
   return ' ';
 }
 
-export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, usage, running = false }) {
+export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, usage, running = false, onToggleInteraction }) {
   const renderStartedAt = renderCommitStart();
   const [open, setOpen] = useState(false);
+  const detailPresence = useCollapsePresence(open, 170);
+  const captureToggleAnchor = useStableToggleAnchor(open);
   const display = useMemo(() => measureChatPerf('chat.tool_card.display', () => toolDisplay(kind, name, payload), {
     kind,
     name,
@@ -2788,25 +2926,40 @@ export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload
       running,
       payloadChars: typeof payload === 'string' ? payload.length : 0
   }));
+  const detail = hasMergedPayload ? (
+    <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} running={running} />
+  ) : (
+    running
+      ? <StreamingToolPayloadDetail title={display.detailTitle} payload={payload} />
+      : <ToolDetail title={display.detailTitle} name={name} payload={payload} />
+  );
   return (
     <details
-      className={`tool-inline-card ${kind}${running ? ' running' : ''}`}
-      open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
+      className={`tool-inline-card ${kind}${running ? ' running' : ''}${detailPresence.visible ? ' card-open' : ''}`}
+      open={open || detailPresence.present}
     >
-      <summary>
+      <summary
+        onClick={(event) => {
+          event.preventDefault();
+          captureToggleAnchor(event.currentTarget);
+          onToggleInteraction?.();
+          setOpen((value) => !value);
+        }}
+      >
         <span>{display.title}</span>
         <code>{display.chip}</code>
         <em>{display.summary}</em>
         <InlineTokenUsage usage={usage} />
       </summary>
-      {open && (hasMergedPayload ? (
-        <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} running={running} />
-      ) : (
-        running
-          ? <StreamingToolPayloadDetail title={display.detailTitle} payload={payload} />
-          : <ToolDetail title={display.detailTitle} name={name} payload={payload} />
-      ))}
+      <div className={`tool-inline-detail-shell${detailPresence.visible ? ' body-open' : ''}`} aria-hidden={!open}>
+        <div className="tool-inline-detail-clip">
+          {detailPresence.present && (
+            <div className="tool-inline-detail-body">
+              {detail}
+            </div>
+          )}
+        </div>
+      </div>
     </details>
   );
 }
@@ -2818,6 +2971,7 @@ const MemoToolInlineCard = memo(ToolInlineCard, (previous, next) => (
   && previous.callPayload === next.callPayload
   && previous.resultPayload === next.resultPayload
   && previous.running === next.running
+  && previous.onToggleInteraction === next.onToggleInteraction
   && sameUsage(previous.usage, next.usage)
 ));
 

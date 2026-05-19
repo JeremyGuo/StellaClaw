@@ -66,7 +66,7 @@ function takeEntryText(entry, maxChars) {
 export function createChatStreamFrameQueue({
   onFlush,
   fallbackIntervalMs = 16,
-  targetCharsPerFrame = 32
+  targetCharsPerFrame = Number.MAX_SAFE_INTEGER
 } = {}) {
   const pending = new Map();
   let scheduled = null;

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Copy, Download, FileSearch, Folder, MessageSquarePlus, Monitor, PanelLeft, ScrollText, TerminalSquare, Trash2, Upload } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { clearChatProtocolDiagnostics, readChatProtocolDiagnostics } from '../lib/chatProtocolDiagnostics';
@@ -84,6 +84,11 @@ function ProtocolLogButton() {
     [open, panel, rawRenderMessages]
   );
 
+  const setProtocolLogOpen = useCallback((nextOpen) => {
+    window.__stellacodeProtocolLogOpen = Boolean(nextOpen);
+    setOpen(Boolean(nextOpen));
+  }, []);
+
   useEffect(() => {
     if (!open) return undefined;
     const onRecord = (event) => {
@@ -128,7 +133,7 @@ function ProtocolLogButton() {
   };
 
   return (
-    <Popover.Root open={open} onOpenChange={setOpen}>
+    <Popover.Root open={open} onOpenChange={setProtocolLogOpen}>
       <Popover.Trigger asChild>
         <button className={`chrome-button protocol-log-button${records.length > 0 ? ' active' : ''}`} type="button" title="全局日志">
           <ScrollText size={17} />

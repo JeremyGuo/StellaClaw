@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import 'highlight.js/styles/github-dark.css';
 import './styles.css';
 import {
   conversationKey,
-  conversationStreamUrl,
   createConversation,
   createForegroundSession,
   deleteConversation,
@@ -33,7 +32,7 @@ import { NewConversationDialog } from './components/NewConversationDialog';
 import { RenameConversationDialog, RenameSessionDialog } from './components/RenameConversationDialog';
 import { ConversationPropertiesDialog } from './components/ConversationPropertiesDialog';
 import { SettingsDialog } from './components/SettingsDialog';
-import { clamp, formatModel, statusUsageTotals } from './lib/format';
+import { clamp, formatModel } from './lib/format';
 import { attachmentName, fileExtension, fileNameFromPath } from './lib/fileUtils';
 import { addUsageTotals, firstMessageId, hasOlderMessages, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText } from './lib/messageUtils';
 import {
@@ -45,6 +44,7 @@ import {
   streamAssistantDeltaPatch,
   streamErrorPatch,
   streamEventIndex,
+  streamEventType,
   streamMessageId,
   streamReasoningDeltaPatch,
   streamReasoningPartPatch,
@@ -64,7 +64,7 @@ import {
   summarizePayload
 } from './lib/chatProtocolDiagnostics';
 import { recordChatPerf } from './lib/chatPerfMetrics';
-import { chatSessionStateIsActive, chatSnapshotState, isActiveSessionState, mergeProgressActivity, normalizeProgressFeedback, recentMessagePageParams } from './lib/chatSessionState';
+import { chatSessionStateIsActive, chatSnapshotState, mergeProgressActivity, normalizeProgressFeedback, recentMessagePageParams } from './lib/chatSessionState';
 import { getChatRuntimeSnapshot, setChatRuntimeMessages, setChatRuntimeMessagesReady, setChatRuntimeSending } from './lib/chatRuntimeStore';
 import {
   compactMessagesSummary,
@@ -75,9 +75,7 @@ import {
 } from './lib/chatDebugSummaries';
 import { composerModeInfo, controlCommandActivity, slashCommandState } from './lib/composerCommands';
 import {
-  applyConversationStreamEvent,
   createLocalForegroundSessionId,
-  hasUnreadConversation,
   nextForegroundSessionName,
   patchConversationForegroundSession
 } from './lib/conversationState';
@@ -87,13 +85,16 @@ import {
   normalizeAbsolutePath,
   workspaceTargetFromLocalLink
 } from './lib/localTargets';
-import { applyChromeMetrics } from './lib/chromeMetrics';
 import { fileTabSnapshot } from './lib/workspaceFileTabs';
 import { layoutSnapshotFromValues, useAppLayout } from './hooks/useAppLayout';
+import { useChromeMetrics } from './hooks/useChromeMetrics';
+import { useHomeConversationStream } from './hooks/useHomeConversationStream';
+import { useSelectedConversationState } from './hooks/useSelectedConversationState';
+import { useThemeApplication } from './hooks/useThemeApplication';
+import { useUpdaterStatus } from './hooks/useUpdaterStatus';
 import { revokeFilePreviewUrls, useWorkspaceState } from './hooks/useWorkspaceState';
 import { useWorkspaceWorkflow, workspaceFileImageDataUrl } from './hooks/useWorkspaceWorkflow';
 import { useWorkspaceTransfers } from './hooks/useWorkspaceTransfers';
-import { effectiveThemeMode, themeCssVariables } from './lib/theme';
 import { workspaceDisplayRoot, workspaceFileKind } from './lib/workspaceUtils';
 
 const MESSAGE_IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
@@ -120,10 +121,6 @@ function workspaceFileAttachmentDataUrl(path, file) {
 
 function App() {
   const [settings, setSettings] = useState(null);
-  const [systemTheme, setSystemTheme] = useState(() => {
-    if (typeof window === 'undefined' || !window.matchMedia) return 'dark';
-    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  });
   const [activeServerId, setActiveServerId] = useState('');
   const [conversations, setConversations] = useState([]);
   const [statuses, setStatuses] = useState(new Map());
@@ -133,7 +130,6 @@ function App() {
   const [chatSessionState, setChatSessionState] = useState({ state: 'idle' });
   const [runningActivities, setRunningActivities] = useState([]);
   const [statusDeltas, setStatusDeltas] = useState(() => new Map());
-  const [updaterStatus, setUpdaterStatus] = useState({ state: 'idle' });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [newConversationOpen, setNewConversationOpen] = useState(false);
@@ -171,6 +167,9 @@ function App() {
   const selectedSessionId = selectedForegroundSessionId(selected);
   const selectedServerId = selected?.serverId || '';
   const selectedConversationId = selected?.conversationId || '';
+  useChromeMetrics();
+  const { activeThemeMode, themeVariables } = useThemeApplication(settings);
+  const updaterStatus = useUpdaterStatus();
 
   const setMessages = useCallback((updater) => {
     const next = setChatRuntimeMessages(updater);
@@ -200,71 +199,10 @@ function App() {
     settingsRef.current = settings;
   }, [settings]);
 
-  useLayoutEffect(() => {
-    applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
-  }, []);
-
-  useEffect(() => {
-    let frame = 0;
-    let resolutionQuery = null;
-    let removeResolutionListener = null;
-    const refreshChromeMetrics = () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => {
-        frame = 0;
-        applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
-      });
-    };
-    const bindResolutionListener = () => {
-      removeResolutionListener?.();
-      if (!window.matchMedia) return;
-      resolutionQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
-      const listener = () => {
-        refreshChromeMetrics();
-        bindResolutionListener();
-      };
-      resolutionQuery.addEventListener?.('change', listener);
-      removeResolutionListener = () => resolutionQuery?.removeEventListener?.('change', listener);
-    };
-    window.addEventListener('resize', refreshChromeMetrics);
-    bindResolutionListener();
-    return () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      window.removeEventListener('resize', refreshChromeMetrics);
-      removeResolutionListener?.();
-    };
-  }, []);
-
   useEffect(() => {
     const scale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
     window.stellacode2?.setZoomFactor?.(scale).catch(() => {});
   }, [settings?.uiScale]);
-
-  useEffect(() => {
-    document.documentElement.dataset.theme = settings?.themeMode || 'system';
-  }, [settings?.themeMode]);
-
-  useEffect(() => {
-    if (!window.matchMedia) return undefined;
-    const query = window.matchMedia('(prefers-color-scheme: light)');
-    const apply = () => setSystemTheme(query.matches ? 'light' : 'dark');
-    apply();
-    query.addEventListener?.('change', apply);
-    return () => query.removeEventListener?.('change', apply);
-  }, []);
-
-  const activeThemeMode = effectiveThemeMode(settings?.themeMode, systemTheme);
-  const themeVariables = useMemo(
-    () => themeCssVariables(settings?.themeColors, activeThemeMode),
-    [activeThemeMode, settings?.themeColors]
-  );
-
-  useEffect(() => {
-    const root = document.documentElement;
-    Object.entries(themeVariables).forEach(([name, value]) => {
-      root.style.setProperty(name, value);
-    });
-  }, [themeVariables]);
 
   useEffect(() => {
     selectedRef.current = selected;
@@ -274,66 +212,29 @@ function App() {
     setSelectionReferences([]);
   }, [selected?.serverId, selected?.conversationId, selectedSessionId]);
 
-  useEffect(() => {
-    const updater = window.stellacode2?.updater;
-    if (!updater) return undefined;
-    let disposed = false;
-    const applyStatus = (status) => {
-      if (!disposed && status) {
-        setUpdaterStatus(status);
-      }
-    };
-    updater.status?.().then(applyStatus).catch(() => {});
-    const unsubscribe = updater.onStatus?.(applyStatus);
-    return () => {
-      disposed = true;
-      unsubscribe?.();
-    };
-  }, []);
-
-  const activeConversation = useMemo(
-    () => conversations.find((item) => item.conversation_id === selected?.conversationId) || null,
-    [conversations, selected]
-  );
-  const propertiesConversationCurrent = useMemo(() => (
-    propertiesConversation
-      ? conversations.find((item) => item.conversation_id === propertiesConversation.conversation_id) || propertiesConversation
-      : null
-  ), [conversations, propertiesConversation]);
-  const activeForegroundSession = useMemo(() => {
-    if (!activeConversation) return null;
-    return foregroundSessions(activeConversation).find((session) => (
-      String(session?.id || 'main') === selectedSessionId
-    )) || foregroundSessions(activeConversation)[0] || null;
-  }, [activeConversation, selectedSessionId]);
   const displayFontSize = clamp(settings?.displayFontSize, MIN_DISPLAY_FONT_SIZE, MAX_DISPLAY_FONT_SIZE) || 12;
   const uiScale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
   const terminalFontSize = clamp(displayFontSize + 1, 11, 22) || 13;
-  const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId, selectedSessionId) : '';
-  const selectedConversationUiKey = selectedKey;
-  const legacyConversationUiKey = selected ? conversationKey(selected.serverId, selected.conversationId, 'main') : '';
-  const selectedStatus = selected ? statuses.get(selectedKey) : null;
-  const selectedChatSessionState = chatSessionState.scopeKey === selectedKey
-    ? chatSessionState
-    : { state: 'idle' };
-  const selectedConversationStatus = useMemo(() => ({
-    ...(selectedStatus || {}),
-    ...(activeConversation ? {
-      model: activeConversation.model,
-      model_selection_pending: activeConversation.model_selection_pending,
-      reasoning: activeConversation.reasoning,
-      sandbox: activeConversation.sandbox,
-      sandbox_source: activeConversation.sandbox_source,
-      remote: activeConversation.remote,
-      workspace: activeConversation.workspace,
-      processing_state: selectedChatSessionState.state || 'idle',
-      running: chatSessionStateIsActive(selectedChatSessionState),
-      running_background: activeConversation.running_background,
-      total_background: activeConversation.total_background,
-      running_subagents: activeConversation.running_subagents,
-      total_subagents: activeConversation.total_subagents
-    } : {})
-  }), [selectedStatus, activeConversation, selectedChatSessionState]);
+  const {
+    activeConversation,
+    propertiesConversationCurrent,
+    activeForegroundSession,
+    selectedKey,
+    selectedConversationUiKey,
+    legacyConversationUiKey,
+    selectedStatus,
+    selectedConversationStatus,
+    selectedUsage,
+    selectedProcessing
+  } = useSelectedConversationState({
+    selected,
+    selectedSessionId,
+    conversations,
+    propertiesConversation,
+    statuses,
+    chatSessionState,
+    statusDeltas
+  });
   const activeServer = useMemo(
     () => (settings?.servers || []).find((server) => server.id === activeServerId) || null,
     [settings?.servers, activeServerId]
@@ -403,13 +304,6 @@ function App() {
     messageAttachmentWorkspaceTarget(attachment)?.path
     || String(attachment?.path || '').trim()
   ), [messageAttachmentWorkspaceTarget]);
-  const selectedUsage = useMemo(
-    () => statusUsageTotals(selectedStatus, selectedKey ? statusDeltas.get(selectedKey) : null),
-    [selectedStatus, selectedKey, statusDeltas]
-  );
-  const selectedProcessingState = String(selectedConversationStatus?.processing_state || '').trim().toLowerCase();
-  const selectedProcessing = Boolean(selectedConversationStatus?.running)
-    || isActiveSessionState(selectedProcessingState);
   const updateReady = updaterStatus?.state === 'downloaded';
 
   const updateRunningActivities = useCallback((updater) => {
@@ -601,79 +495,15 @@ function App() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!activeServerId || !settingsReady) return undefined;
-    let disposed = false;
-    let reconnectTimer = null;
-    let streamSocket = null;
-    const connect = async () => {
-      try {
-        const url = await conversationStreamUrl(activeServerId);
-        if (disposed) return;
-        const socket = new WebSocket(url);
-        streamSocket = socket;
-        socket.addEventListener('message', (event) => {
-          let payload;
-          try {
-            payload = JSON.parse(event.data);
-          } catch {
-            return;
-          }
-          const nextConversations = applyConversationStreamEvent(conversationsRef.current, payload);
-          conversationsRef.current = nextConversations;
-          setConversations(nextConversations);
-          const homeType = String(payload?.type || '').startsWith('home.')
-            ? String(payload.type).slice('home.'.length)
-            : String(payload?.type || '');
-          if (
-            homeType === 'conversation_deleted'
-            && selectedRef.current?.serverId === activeServerId
-            && selectedRef.current?.conversationId === payload.conversation_id
-          ) {
-            const next = nextConversations[0];
-            const sessionId = next ? foregroundSessions(next)[0]?.id || 'main' : 'main';
-            setSelected(next ? { serverId: activeServerId, conversationId: next.conversation_id, foregroundSessionId: sessionId } : null);
-          }
-          if (!selectedRef.current) {
-            const fallbackConversation = (homeType === 'snapshot' || homeType === 'conversation_snapshot')
-              ? (payload.conversations || [])[0]
-              : payload.conversation;
-            if (fallbackConversation?.conversation_id) {
-              const sessionId = foregroundSessions(fallbackConversation)[0]?.id || 'main';
-              setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id, foregroundSessionId: sessionId });
-            }
-          }
-          if (homeType === 'conversation_turn_completed' && payload.conversation_id) {
-            const completed = nextConversations.find((conversation) => conversation.conversation_id === payload.conversation_id);
-            const selectedConversation = selectedRef.current;
-            const isActive = selectedConversation?.serverId === activeServerId
-              && selectedConversation?.conversationId === payload.conversation_id;
-            const isVisibleActive = isActive && appForegroundRef.current;
-            if (selectedConversation && completed && !isVisibleActive && hasUnreadConversation(completed)) {
-              window.stellacode2?.notify?.({
-                title: displayConversationName(completed),
-                body: '新回复已完成'
-              }).catch(() => {});
-            }
-          }
-        });
-        socket.addEventListener('close', () => {
-          if (disposed) return;
-          reconnectTimer = window.setTimeout(connect, 1600);
-        });
-        socket.addEventListener('error', () => {});
-      } catch {
-        if (disposed) return;
-        reconnectTimer = window.setTimeout(connect, 2400);
-      }
-    };
-    connect();
-    return () => {
-      disposed = true;
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
-      if (streamSocket && streamSocket.readyState <= WebSocket.OPEN) streamSocket.close();
-    };
-  }, [activeServerId, settingsReady]);
+  useHomeConversationStream({
+    activeServerId,
+    settingsReady,
+    conversationsRef,
+    selectedRef,
+    appForegroundRef,
+    setConversations,
+    setSelected
+  });
 
   const saveSettingsFromDialog = useCallback(async (next) => {
     setSettingsSaving(true);
@@ -1541,6 +1371,19 @@ function App() {
     const applyChatSocketPayload = (payload) => {
       if (disposed || websocketKeyRef.current !== key) return;
       const payloadType = String(payload?.type || '');
+      const nestedStreamType = streamEventType(normalizedStreamEvent(payload));
+      const streamLikePayload = payloadType.startsWith('chat.stream_')
+        || nestedStreamType.startsWith('stream_')
+        || nestedStreamType === 'turn_started'
+        || nestedStreamType === 'turn_completed';
+      recordProtocol('chat.socket_payload', () => ({
+        category: streamLikePayload ? 'stream' : 'replace_ui_element',
+        action: 'socket payload received',
+        payloadType,
+        nestedType: nestedStreamType,
+        keys: Object.keys(payload || {}).slice(0, 16),
+        payload: summarizePayload(payload)
+      }));
       if (payloadType === 'chat.snapshot') {
         const snapshotState = chatSnapshotState(payload);
         setChatSessionState({ scopeKey: key, ...snapshotState });
@@ -1566,6 +1409,9 @@ function App() {
         applyIncomingMessages(payload.message ? [payload.message] : []);
       } else if (
         payloadType.startsWith('chat.stream_')
+        || nestedStreamType.startsWith('stream_')
+        || nestedStreamType === 'turn_started'
+        || nestedStreamType === 'turn_completed'
         || payloadType === 'chat.plan_updated'
       ) {
         applySessionStream(payload);

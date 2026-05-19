@@ -3,15 +3,19 @@ import { messageText } from './fileUtils';
 
 const STORAGE_KEY = 'stellacode.chatProtocolDiagnostics.v3';
 const MAX_RECORDS = 300;
+const RUNTIME_MAX_RECORDS = 600;
+let runtimeRecords = [];
 
 export function recordChatProtocolDiagnostic(kind, details = {}) {
   const critical = isCriticalDiagnostic(kind, details?.category);
-  if (!shouldRecordChatProtocolDiagnostic(kind, details?.category)) return;
+  const capture = shouldRecordChatProtocolDiagnostic(kind, details?.category);
+  if (!critical && !capture) return;
   const record = {
     time: new Date().toISOString(),
     kind,
     ...sanitize(details)
   };
+  runtimeRecords = [...runtimeRecords, record].slice(-RUNTIME_MAX_RECORDS);
   if (critical || isProtocolLogOpen()) {
     writeLocalRecord(record);
   }
@@ -26,7 +30,23 @@ export function recordChatProtocolDiagnostic(kind, details = {}) {
 
 export function shouldRecordChatProtocolDiagnostic(kind, category = '') {
   if (isCriticalDiagnostic(kind, category)) return true;
+  if (isChatProtocolDiagnostic(kind, category)) return true;
   return isProtocolLogOpen();
+}
+
+function isChatProtocolDiagnostic(kind, category = '') {
+  const value = String(kind || '');
+  const group = String(category || '');
+  return (
+    value === 'chat.stream'
+    || value === 'chat.append_stream_to_ui'
+    || value === 'chat.replace_ui_element'
+    || value === 'chat.message_arrived'
+    || value === 'chat.socket_payload'
+    || group === 'stream'
+    || group === 'append_stream_to_ui'
+    || group === 'replace_ui_element'
+  );
 }
 
 function isCriticalDiagnostic(kind, category = '') {
@@ -45,18 +65,27 @@ function isProtocolLogOpen() {
 }
 
 export function readChatProtocolDiagnostics() {
-  if (typeof window === 'undefined' || !window.localStorage) return [];
+  const runtime = runtimeRecords;
+  if (typeof window === 'undefined' || !window.localStorage) return runtime;
   try {
     const records = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '[]');
-    return Array.isArray(records) ? records : [];
+    const stored = Array.isArray(records) ? records : [];
+    const seen = new Set();
+    return [...stored, ...runtime].filter((record) => {
+      const key = `${record?.time || ''}:${record?.kind || ''}:${record?.scopeKey || ''}:${record?.in_message_index ?? ''}:${record?.action || ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(-RUNTIME_MAX_RECORDS);
   } catch {
-    return [];
+    return runtime;
   }
 }
 
 export function clearChatProtocolDiagnostics() {
   if (typeof window === 'undefined' || !window.localStorage) return;
   try {
+    runtimeRecords = [];
     window.localStorage.removeItem(STORAGE_KEY);
     window.dispatchEvent(new CustomEvent('stellacode:protocol-log-cleared'));
   } catch {
